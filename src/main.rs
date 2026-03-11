@@ -27,6 +27,7 @@ use heapless::{String, Vec};
 use panic_halt as _;
 use static_cell::StaticCell;
 
+
 type WizSpiDevice = ExclusiveDevice<spi::Spi<'static, SPI0, Async>, Output<'static>, Delay>;
 type WizRunner = embassy_net_wiznet::Runner<
     'static,

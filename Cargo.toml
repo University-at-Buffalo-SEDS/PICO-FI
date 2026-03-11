@@ -3,6 +3,12 @@ name = "pico-fi"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "pico-fi"
+path = "src/main.rs"
+test = false
+bench = false
+
 [dependencies]
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.5"
