@@ -6,7 +6,7 @@ mod config;
 use config::{
     AddressMode, BridgeConfig, BridgeMode, Command, apply_command, parse_command, render_config,
 };
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{
@@ -37,10 +37,6 @@ type WizRunner = embassy_net_wiznet::Runner<
     Output<'static>,
 >;
 
-#[unsafe(link_section = ".boot2")]
-#[used]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_GENERIC_03H;
-
 bind_interrupts!(struct Irqs {
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
 });
@@ -49,6 +45,7 @@ static UART_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 static UART_RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 static WIZNET_STATE: StaticCell<embassy_net_wiznet::State<2, 2>> = StaticCell::new();
+static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, embassy_net_wiznet::Device<'static>>) {
@@ -60,8 +57,8 @@ async fn wiz_task(runner: WizRunner) {
     runner.run().await;
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
+#[embassy_executor::task]
+async fn app(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut uart_config = uart::Config::default();
@@ -116,6 +113,14 @@ async fn main(spawner: Spawner) {
     loop {
         Timer::after_secs(1).await;
     }
+}
+
+#[cortex_m_rt::entry]
+fn main() -> ! {
+    let executor = EXECUTOR.init(Executor::new());
+    executor.run(|spawner| {
+        spawner.must_spawn(app(spawner));
+    })
 }
 
 async fn write_banner(uart: &mut BufferedUart) -> Result<(), ()> {

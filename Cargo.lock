@@ -904,7 +904,6 @@ dependencies = [
  "heapless",
  "panic-halt",
  "portable-atomic",
- "rp2040-boot2",
  "static_cell",
 ]
 
