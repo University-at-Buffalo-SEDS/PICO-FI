@@ -4,7 +4,8 @@
 mod config;
 
 use config::{
-    AddressMode, BridgeConfig, BridgeMode, Command, apply_command, parse_command, render_config,
+    AddressMode, BridgeConfig, BridgeMode, Command, UpstreamMode, apply_command, parse_command,
+    render_config,
 };
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::select::{Either, select};
@@ -16,9 +17,10 @@ use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{
-    DMA_CH0, DMA_CH1, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, SPI0, UART0,
+    DMA_CH0, DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20,
+    PIN_21, SPI0, SPI1, UART0,
 };
-use embassy_rp::spi::{self, Async};
+use embassy_rp::spi::{self, Async, Blocking};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -29,6 +31,12 @@ use static_cell::StaticCell;
 
 
 type WizSpiDevice = ExclusiveDevice<spi::Spi<'static, SPI0, Async>, Output<'static>, Delay>;
+type UpstreamSpi = spi::Spi<'static, SPI1, Blocking>;
+struct UpstreamSpiDevice {
+    spi: UpstreamSpi,
+    cs: Output<'static>,
+}
+
 type WizRunner = embassy_net_wiznet::Runner<
     'static,
     embassy_net_wiznet::chip::W5500,
@@ -60,6 +68,7 @@ async fn wiz_task(runner: WizRunner) {
 #[embassy_executor::task]
 async fn app(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let _status_led = Output::new(p.PIN_25, Level::High);
 
     let mut uart_config = uart::Config::default();
     uart_config.baudrate = 115_200;
@@ -75,6 +84,13 @@ async fn app(spawner: Spawner) {
 
     let _ = write_banner(&mut uart).await;
     let bridge_config = configuration_shell(&mut uart).await;
+    let mut upstream_spi = if matches!(bridge_config.upstream_mode, UpstreamMode::Spi) {
+        let mut spi = init_upstream_spi(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.PIN_13);
+        let _ = report_spi_probe(&mut uart, &mut spi).await;
+        Some(spi)
+    } else {
+        None
+    };
 
     let stack = match bring_up_network(
         spawner,
@@ -99,11 +115,21 @@ async fn app(spawner: Spawner) {
     };
 
     let _ = writeln_line(&mut uart, "network ready").await;
-    let result = match bridge_config.bridge_mode {
-        BridgeMode::TcpClient { host, port } => {
-            run_client_bridge(&mut uart, stack, host, port).await
+    let result = match (bridge_config.bridge_mode, bridge_config.upstream_mode) {
+        (BridgeMode::TcpClient { host, port }, UpstreamMode::Uart) => {
+            run_client_uart_bridge(&mut uart, stack, host, port).await
         }
-        BridgeMode::TcpServer { port } => run_server_bridge(&mut uart, stack, port).await,
+        (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
+            run_server_uart_bridge(&mut uart, stack, port).await
+        }
+        (BridgeMode::TcpClient { host, port }, UpstreamMode::Spi) => match upstream_spi.as_mut() {
+            Some(spi) => run_client_spi_bridge(&mut uart, stack, host, port, spi).await,
+            None => Err(()),
+        },
+        (BridgeMode::TcpServer { port }, UpstreamMode::Spi) => match upstream_spi.as_mut() {
+            Some(spi) => run_server_spi_bridge(&mut uart, stack, port, spi).await,
+            None => Err(()),
+        },
     };
 
     if result.is_err() {
@@ -137,7 +163,9 @@ async fn write_banner(uart: &mut BufferedUart) -> Result<(), ()> {
 
 async fn configuration_shell(uart: &mut BufferedUart) -> BridgeConfig {
     let mut config = BridgeConfig::default();
-    let _ = writeln_line(uart, "default: ip=dhcp mode=server listen=5000").await;
+    let rendered = render_config(&config);
+    let _ = writeln_line(uart, "default:").await;
+    let _ = writeln_line(uart, rendered.as_str()).await;
 
     loop {
         let _ = write_str(uart, "> ").await;
@@ -268,7 +296,7 @@ async fn bring_up_network(
     Ok(stack)
 }
 
-async fn run_client_bridge(
+async fn run_client_uart_bridge(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
     host: [u8; 4],
@@ -284,10 +312,10 @@ async fn run_client_bridge(
     socket.connect((remote, port)).await.map_err(|_| ())?;
     let _ = writeln_line(uart, "connected").await;
 
-    bridge_session(uart, &mut socket).await
+    uart_bridge_session(uart, &mut socket).await
 }
 
-async fn run_server_bridge(
+async fn run_server_uart_bridge(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
     port: u16,
@@ -301,10 +329,10 @@ async fn run_server_bridge(
     socket.accept(port).await.map_err(|_| ())?;
     let _ = writeln_line(uart, "client connected").await;
 
-    bridge_session(uart, &mut socket).await
+    uart_bridge_session(uart, &mut socket).await
 }
 
-async fn bridge_session(uart: &mut BufferedUart, socket: &mut TcpSocket<'_>) -> Result<(), ()> {
+async fn uart_bridge_session(uart: &mut BufferedUart, socket: &mut TcpSocket<'_>) -> Result<(), ()> {
     let mut uart_buf = [0u8; 256];
     let mut net_buf = [0u8; 256];
 
@@ -327,6 +355,120 @@ async fn bridge_session(uart: &mut BufferedUart, socket: &mut TcpSocket<'_>) -> 
             }
             Either::Second(Err(_)) => return Err(()),
         }
+    }
+}
+
+fn init_upstream_spi(
+    spi1: Peri<'static, SPI1>,
+    sclk: Peri<'static, PIN_10>,
+    mosi: Peri<'static, PIN_11>,
+    miso: Peri<'static, PIN_12>,
+    cs: Peri<'static, PIN_13>,
+) -> UpstreamSpiDevice {
+    let mut spi_config = spi::Config::default();
+    spi_config.frequency = 1_000_000;
+    UpstreamSpiDevice {
+        spi: spi::Spi::new_blocking(spi1, sclk, mosi, miso, spi_config),
+        cs: Output::new(cs, Level::High),
+    }
+}
+
+async fn report_spi_probe(
+    uart: &mut BufferedUart,
+    spi: &mut UpstreamSpiDevice,
+) -> Result<(), ()> {
+    let bytes = spi_probe(spi)?;
+    let line = render_hex_probe(&bytes);
+    writeln_line(uart, line.as_str()).await
+}
+
+fn spi_probe(spi: &mut UpstreamSpiDevice) -> Result<[u8; 8], ()> {
+    let mut probe = [0u8; 8];
+    spi.cs.set_low();
+    let result = spi.spi.blocking_transfer_in_place(&mut probe).map_err(|_| ());
+    spi.cs.set_high();
+    result.map(|_| probe)
+}
+
+fn render_hex_probe(bytes: &[u8; 8]) -> String<48> {
+    let mut out = String::<48>::new();
+    let _ = out.push_str("spi probe=");
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx != 0 {
+            let _ = out.push(' ');
+        }
+        push_hex_byte(&mut out, *byte);
+    }
+    out
+}
+
+fn push_hex_byte(out: &mut String<48>, value: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let _ = out.push(HEX[(value >> 4) as usize] as char);
+    let _ = out.push(HEX[(value & 0x0f) as usize] as char);
+}
+
+async fn run_client_spi_bridge(
+    uart: &mut BufferedUart,
+    stack: Stack<'static>,
+    host: [u8; 4],
+    port: u16,
+    spi: &mut UpstreamSpiDevice,
+) -> Result<(), ()> {
+    let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
+    let mut rx_buf = [0u8; 2048];
+    let mut tx_buf = [0u8; 2048];
+    let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+    socket.set_timeout(Some(Duration::from_secs(30)));
+
+    let _ = writeln_line(uart, "connecting").await;
+    socket.connect((remote, port)).await.map_err(|_| ())?;
+    let _ = writeln_line(uart, "connected").await;
+
+    spi_bridge_session(uart, &mut socket, spi).await
+}
+
+async fn run_server_spi_bridge(
+    uart: &mut BufferedUart,
+    stack: Stack<'static>,
+    port: u16,
+    spi: &mut UpstreamSpiDevice,
+) -> Result<(), ()> {
+    let mut rx_buf = [0u8; 2048];
+    let mut tx_buf = [0u8; 2048];
+    let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+    socket.set_timeout(None);
+
+    let _ = writeln_line(uart, "waiting for tcp client").await;
+    socket.accept(port).await.map_err(|_| ())?;
+    let _ = writeln_line(uart, "client connected").await;
+
+    spi_bridge_session(uart, &mut socket, spi).await
+}
+
+async fn spi_bridge_session(
+    uart: &mut BufferedUart,
+    socket: &mut TcpSocket<'_>,
+    spi: &mut UpstreamSpiDevice,
+) -> Result<(), ()> {
+    let _ = writeln_line(
+        uart,
+        "spi upstream enabled on SPI1 pins: sck=10 mosi=11 miso=12 cs=13",
+    )
+    .await;
+    let mut net_buf = [0u8; 256];
+
+    loop {
+        let net_n = socket.read(&mut net_buf).await.map_err(|_| ())?;
+        if net_n == 0 {
+            return Ok(());
+        }
+
+        spi.cs.set_low();
+        let transfer = spi.spi.blocking_transfer_in_place(&mut net_buf[..net_n]);
+        spi.cs.set_high();
+        transfer.map_err(|_| ())?;
+        write_socket(socket, &net_buf[..net_n]).await?;
     }
 }
 

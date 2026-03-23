@@ -20,20 +20,27 @@ pub enum BridgeMode {
     TcpServer { port: u16 },
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamMode {
+    Uart,
+    Spi,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
     pub address_mode: AddressMode,
     pub bridge_mode: BridgeMode,
+    pub upstream_mode: UpstreamMode,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
-        Self {
-            address_mode: AddressMode::Dhcp,
-            bridge_mode: BridgeMode::TcpServer { port: 5000 },
-        }
+        COMPILED_CONFIG
     }
 }
+
+include!(concat!(env!("OUT_DIR"), "/generated_config.rs"));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -131,6 +138,15 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
     }
 
+    match config.upstream_mode {
+        UpstreamMode::Uart => {
+            let _ = out.push_str(" upstream=uart");
+        }
+        UpstreamMode::Spi => {
+            let _ = out.push_str(" upstream=spi");
+        }
+    }
+
     out
 }
 
@@ -152,6 +168,7 @@ fn parse_static(cidr: &str, gateway: &str, dns: &str) -> Result<Ipv4Config, &'st
 }
 
 fn parse_port(value: &str) -> Result<u16, &'static str> {
+
     value.parse::<u16>().map_err(|_| "invalid port")
 }
 
