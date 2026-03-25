@@ -61,6 +61,8 @@ static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 static WIZNET_STATE: StaticCell<embassy_net_wiznet::State<2, 2>> = StaticCell::new();
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static LINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+const CLIENT_STARTUP_DELAY_MS: u64 = 3_000;
+const CLIENT_RECONNECT_DELAY_MS: u64 = 3_000;
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, embassy_net_wiznet::Device<'static>>) {
@@ -354,6 +356,8 @@ async fn run_client_uart_bridge(
     port: u16,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
+    let _ = writeln_line(uart, "stabilizing before first connect").await;
+    Timer::after_millis(CLIENT_STARTUP_DELAY_MS).await;
     loop {
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
@@ -376,7 +380,8 @@ async fn run_client_uart_bridge(
         let _ = socket.flush().await;
         LINK_ACTIVE.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "server disconnected").await;
-        Timer::after_secs(1).await;
+        let _ = writeln_line(uart, "cooling down before reconnect").await;
+        Timer::after_millis(CLIENT_RECONNECT_DELAY_MS).await;
     }
 }
 
@@ -534,6 +539,8 @@ async fn run_client_spi_bridge(
     spi: &mut UpstreamSpiDevice,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
+    let _ = writeln_line(uart, "stabilizing before first connect").await;
+    Timer::after_millis(CLIENT_STARTUP_DELAY_MS).await;
     loop {
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
@@ -556,7 +563,8 @@ async fn run_client_spi_bridge(
         let _ = socket.flush().await;
         LINK_ACTIVE.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "server disconnected").await;
-        Timer::after_secs(1).await;
+        let _ = writeln_line(uart, "cooling down before reconnect").await;
+        Timer::after_millis(CLIENT_RECONNECT_DELAY_MS).await;
     }
 }
 
