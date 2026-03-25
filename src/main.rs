@@ -11,11 +11,13 @@ mod shell;
 mod storage;
 
 use bridge::spi::{init_upstream_spi, report_spi_probe};
+use bridge::runtime::BridgeRuntime;
 use config::{BridgeConfig, BridgeMode, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
+use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::UART0;
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, UART0};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_time::Timer;
 #[allow(unused_imports)]
@@ -27,6 +29,7 @@ use storage::ConfigStorage;
 
 // Interrupt bindings required by the buffered UART driver.
 bind_interrupts!(struct Irqs {
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
 });
 
@@ -77,9 +80,15 @@ async fn app(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let mut status_led = Some(Output::new(p.PIN_25, Level::Low));
     for _ in 0..3 {
-        status_led.as_mut().unwrap().toggle();
+        status_led
+            .as_mut()
+            .expect("status LED must exist during startup blink")
+            .toggle();
         Timer::after_millis(100).await;
-        status_led.as_mut().unwrap().toggle();
+        status_led
+            .as_mut()
+            .expect("status LED must exist during startup blink")
+            .toggle();
         Timer::after_millis(100).await;
     }
 
@@ -100,11 +109,26 @@ async fn app(spawner: Spawner) {
     let _ = write_banner(&mut uart).await;
     let bridge_config = configuration_shell(&mut uart, &mut config_storage, initial_config).await;
     if !matches!(bridge_config.upstream_mode, UpstreamMode::Test) {
-        spawner.must_spawn(heartbeat_task(status_led.take().unwrap()));
+        spawner.spawn(
+            heartbeat_task(
+                status_led
+                    .take()
+                    .expect("heartbeat mode requires ownership of the status LED"),
+            )
+            .expect("heartbeat task token allocation failed"),
+        );
     }
 
     let mut upstream_spi = if matches!(bridge_config.upstream_mode, UpstreamMode::Spi) {
-        let mut spi = init_upstream_spi(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.PIN_13);
+        let mut spi = init_upstream_spi(
+            p.SPI1,
+            p.PIN_10,
+            p.PIN_11,
+            p.PIN_12,
+            p.PIN_13,
+            p.DMA_CH2,
+            p.DMA_CH3,
+        );
         let _ = report_spi_probe(&mut uart, &mut spi).await;
         Some(spi)
     } else {
@@ -160,68 +184,31 @@ async fn run_bridge_mode(
     upstream_spi: Option<&mut bridge::spi::UpstreamSpiDevice>,
     status_led: Option<&mut Output<'static>>,
 ) -> Result<(), ()> {
+    let runtime = BridgeRuntime {
+        link_active: &LINK_ACTIVE,
+        startup_delay_ms: CLIENT_STARTUP_DELAY_MS,
+        reconnect_delay_ms: CLIENT_RECONNECT_DELAY_MS,
+        connect_timeout_ms: LINK_CONNECT_TIMEOUT_MS,
+        handshake_timeout_ms: LINK_HANDSHAKE_TIMEOUT_MS,
+        handshake_magic: LINK_HANDSHAKE_MAGIC,
+    };
+
     match (bridge_config.bridge_mode, bridge_config.upstream_mode) {
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Uart) => {
-            bridge::uart::run_client(
-                uart,
-                stack,
-                host,
-                port,
-                bridge_config,
-                &LINK_ACTIVE,
-                CLIENT_STARTUP_DELAY_MS,
-                CLIENT_RECONNECT_DELAY_MS,
-                LINK_CONNECT_TIMEOUT_MS,
-                LINK_HANDSHAKE_TIMEOUT_MS,
-                LINK_HANDSHAKE_MAGIC,
-            )
-            .await
+            bridge::uart::run_client(uart, stack, host, port, bridge_config, runtime).await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
-            bridge::uart::run_server(
-                uart,
-                stack,
-                port,
-                bridge_config,
-                &LINK_ACTIVE,
-                LINK_HANDSHAKE_TIMEOUT_MS,
-                LINK_HANDSHAKE_MAGIC,
-            )
-            .await
+            bridge::uart::run_server(uart, stack, port, bridge_config, runtime).await
         }
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Spi) => match upstream_spi {
             Some(spi) => {
-                bridge::spi::run_client(
-                    uart,
-                    stack,
-                    host,
-                    port,
-                    spi,
-                    bridge_config,
-                    &LINK_ACTIVE,
-                    CLIENT_STARTUP_DELAY_MS,
-                    CLIENT_RECONNECT_DELAY_MS,
-                    LINK_CONNECT_TIMEOUT_MS,
-                    LINK_HANDSHAKE_TIMEOUT_MS,
-                    LINK_HANDSHAKE_MAGIC,
-                )
-                .await
+                bridge::spi::run_client(uart, stack, host, port, spi, bridge_config, runtime).await
             }
             None => Err(()),
         },
         (BridgeMode::TcpServer { port }, UpstreamMode::Spi) => match upstream_spi {
             Some(spi) => {
-                bridge::spi::run_server(
-                    uart,
-                    stack,
-                    port,
-                    spi,
-                    bridge_config,
-                    &LINK_ACTIVE,
-                    LINK_HANDSHAKE_TIMEOUT_MS,
-                    LINK_HANDSHAKE_MAGIC,
-                )
-                .await
+                bridge::spi::run_server(uart, stack, port, spi, bridge_config, runtime).await
             }
             None => Err(()),
         },
@@ -231,12 +218,18 @@ async fn run_bridge_mode(
                 stack,
                 host,
                 port,
-                status_led.unwrap(),
+                status_led.expect("test client mode requires a status LED"),
             )
             .await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Test) => {
-            bridge::test::run_server(uart, stack, port, status_led.unwrap()).await
+            bridge::test::run_server(
+                uart,
+                stack,
+                port,
+                status_led.expect("test server mode requires a status LED"),
+            )
+            .await
         }
     }
 }
@@ -246,6 +239,6 @@ async fn run_bridge_mode(
 fn main() -> ! {
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
-        spawner.must_spawn(app(spawner));
+        spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }

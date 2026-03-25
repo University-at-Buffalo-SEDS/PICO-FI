@@ -1,6 +1,7 @@
 //! Ethernet bring-up and TCP transport helpers.
 
 use crate::config::{AddressMode, BridgeConfig};
+use crate::Irqs;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
@@ -64,7 +65,7 @@ pub async fn bring_up_network(
     let mut spi_config = spi::Config::default();
     spi_config.frequency = 30_000_000;
 
-    let spi = spi::Spi::new(spi0, sclk, mosi, miso, tx_dma, rx_dma, spi_config);
+    let spi = spi::Spi::new(spi0, sclk, mosi, miso, tx_dma, rx_dma, Irqs, spi_config);
     let cs = Output::new(cs, Level::High);
     let reset = Output::new(reset, Level::High);
     let int = Input::new(int, Pull::Up);
@@ -123,12 +124,8 @@ pub async fn bring_up_network(
         seed,
     );
 
-    spawner
-        .spawn(wiz_task(wiz_runner))
-        .map_err(|_| "wiz task spawn failed")?;
-    spawner
-        .spawn(net_task(net_runner))
-        .map_err(|_| "net task spawn failed")?;
+    spawner.spawn(wiz_task(wiz_runner).map_err(|_| "wiz task spawn failed")?);
+    spawner.spawn(net_task(net_runner).map_err(|_| "net task spawn failed")?);
 
     while !stack.is_link_up() {
         Timer::after_millis(250).await;

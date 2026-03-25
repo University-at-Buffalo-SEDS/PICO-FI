@@ -324,7 +324,8 @@ mod tests {
     /// Verifies the static-IP shell command parser.
     #[test]
     fn parses_static() {
-        let cmd = parse_command("set static 192.168.10.50/24 192.168.10.1 1.1.1.1").unwrap();
+        let cmd = parse_command("set static 192.168.10.50/24 192.168.10.1 1.1.1.1")
+            .expect("static config command should parse");
         assert_eq!(
             cmd,
             Command::SetStatic(Ipv4Config {
@@ -339,7 +340,8 @@ mod tests {
     /// Verifies the client-mode shell command parser.
     #[test]
     fn parses_client() {
-        let cmd = parse_command("set client 10.0.0.5 7000").unwrap();
+        let cmd = parse_command("set client 10.0.0.5 7000")
+            .expect("client config command should parse");
         assert_eq!(
             cmd,
             Command::SetClient {
@@ -352,7 +354,8 @@ mod tests {
     /// Verifies the upstream-mode shell command parser.
     #[test]
     fn parses_upstream_test() {
-        let cmd = parse_command("set upstream test").unwrap();
+        let cmd = parse_command("set upstream test")
+            .expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Test));
     }
 }

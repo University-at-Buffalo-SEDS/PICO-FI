@@ -1,12 +1,17 @@
 //! SPI upstream bridge implementation and SPI slave framing state.
 
+use core::sync::atomic::{Ordering as MemoryOrdering, compiler_fence};
+
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
 use crate::protocol::spi::{
     FRAME_SIZE, PAYLOAD_MAX, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, parse_request_frame,
 };
 use crate::shell::writeln_line;
+use embassy_futures::yield_now;
+use embassy_rp::dma::ChannelInstance;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
@@ -16,33 +21,38 @@ use embassy_rp::spi::{self, Blocking};
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
 use heapless::String;
+use rp_pac::dma::vals::{DataSize, TreqSel};
 use portable_atomic::{AtomicBool, Ordering};
 
 /// Stateful SPI slave transport that buffers one request and one response frame.
 pub struct UpstreamSpiDevice {
     /// Keeps the Embassy SPI peripheral configured for the lifetime of the slave device.
     _configured: spi::Spi<'static, SPI1, Blocking>,
+    /// DMA channel number used to feed response bytes into the SPI TX FIFO.
+    tx_dma_ch: u8,
+    /// DMA channel number used to drain request bytes from the SPI RX FIFO.
+    rx_dma_ch: u8,
     /// Contains the next response frame to transmit back to the SPI master.
     tx_frame: [u8; FRAME_SIZE],
     /// Captures the most recent request frame received from the SPI master.
     rx_frame: [u8; FRAME_SIZE],
-    /// Tracks how many response bytes have been queued into the SPI TX FIFO.
-    tx_idx: usize,
-    /// Tracks how many request bytes have been received in the active transaction.
-    rx_idx: usize,
     /// Indicates whether chip-select is currently asserted.
     cs_active: bool,
+    /// Tracks whether the current transaction's frame has already been surfaced to the caller.
+    frame_reported: bool,
     /// Clears a one-shot response payload after the master finishes reading it.
     clear_after_transaction: bool,
 }
 
 /// Configures `SPI1` as the framed upstream slave transport.
-pub fn init_upstream_spi(
+pub fn init_upstream_spi<TX: ChannelInstance, RX: ChannelInstance>(
     spi1: Peri<'static, SPI1>,
     sclk: Peri<'static, PIN_10>,
     mosi: Peri<'static, PIN_11>,
     miso: Peri<'static, PIN_12>,
     cs: Peri<'static, PIN_13>,
+    _tx_dma: Peri<'static, TX>,
+    _rx_dma: Peri<'static, RX>,
 ) -> UpstreamSpiDevice {
     let mut spi_config = spi::Config::default();
     spi_config.frequency = 1_000_000;
@@ -100,13 +110,14 @@ pub fn init_upstream_spi(
         w
     });
 
-    let mut device = UpstreamSpiDevice {
-        _configured: configured,
+        let mut device = UpstreamSpiDevice {
+            _configured: configured,
+        tx_dma_ch: TX::number(),
+        rx_dma_ch: RX::number(),
         tx_frame: [0; FRAME_SIZE],
         rx_frame: [0; FRAME_SIZE],
-        tx_idx: 0,
-        rx_idx: 0,
         cs_active: false,
+        frame_reported: false,
         clear_after_transaction: false,
     };
     device.prepare_response_frame(RESP_DATA_MAGIC, &[]);
@@ -131,16 +142,11 @@ pub async fn run_client(
     port: u16,
     spi: &mut UpstreamSpiDevice,
     bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
-    startup_delay_ms: u64,
-    reconnect_delay_ms: u64,
-    connect_timeout_ms: u64,
-    handshake_timeout_ms: u64,
-    handshake_magic: &[u8],
+    runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     let _ = writeln_line(uart, "stabilizing before first connect").await;
-    Timer::after_millis(startup_delay_ms).await;
+    Timer::after_millis(runtime.startup_delay_ms).await;
 
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -148,37 +154,42 @@ pub async fn run_client(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        link_active.store(false, Ordering::Relaxed);
+        runtime.link_active.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "connecting").await;
-        if connect_with_timeout(&mut socket, remote, port, connect_timeout_ms)
+        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
             .await
             .is_err()
         {
             let _ = writeln_line(uart, "connect failed").await;
-            Timer::after_millis(reconnect_delay_ms).await;
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
         let _ = writeln_line(uart, "tcp connected").await;
-        if exchange_link_handshake(&mut socket, true, handshake_magic, handshake_timeout_ms)
+        if exchange_link_handshake(
+            &mut socket,
+            true,
+            runtime.handshake_magic,
+            runtime.handshake_timeout_ms,
+        )
             .await
             .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
             let _ = writeln_line(uart, "handshake failed").await;
-            Timer::after_millis(reconnect_delay_ms).await;
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        link_active.store(true, Ordering::Relaxed);
+        runtime.link_active.store(true, Ordering::Relaxed);
         let _ = writeln_line(uart, "link active").await;
 
-        let _ = session(uart, &mut socket, spi, bridge_config, link_active).await;
+        let _ = session(uart, &mut socket, spi, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
-        link_active.store(false, Ordering::Relaxed);
+        runtime.link_active.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "server disconnected").await;
         let _ = writeln_line(uart, "cooling down before reconnect").await;
-        Timer::after_millis(reconnect_delay_ms).await;
+        Timer::after_millis(runtime.reconnect_delay_ms).await;
     }
 }
 
@@ -189,9 +200,7 @@ pub async fn run_server(
     port: u16,
     spi: &mut UpstreamSpiDevice,
     bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
-    handshake_timeout_ms: u64,
-    handshake_magic: &[u8],
+    runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -202,23 +211,28 @@ pub async fn run_server(
         let _ = writeln_line(uart, "waiting for tcp client").await;
         socket.accept(port).await.map_err(|_| ())?;
         let _ = writeln_line(uart, "tcp client connected").await;
-        if exchange_link_handshake(&mut socket, false, handshake_magic, handshake_timeout_ms)
+        if exchange_link_handshake(
+            &mut socket,
+            false,
+            runtime.handshake_magic,
+            runtime.handshake_timeout_ms,
+        )
             .await
             .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
             let _ = writeln_line(uart, "handshake failed").await;
-            link_active.store(false, Ordering::Relaxed);
+            runtime.link_active.store(false, Ordering::Relaxed);
             continue;
         }
-        link_active.store(true, Ordering::Relaxed);
+        runtime.link_active.store(true, Ordering::Relaxed);
         let _ = writeln_line(uart, "link active").await;
 
-        let _ = session(uart, &mut socket, spi, bridge_config, link_active).await;
+        let _ = session(uart, &mut socket, spi, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
-        link_active.store(false, Ordering::Relaxed);
+        runtime.link_active.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "client disconnected").await;
     }
 }
@@ -267,7 +281,8 @@ async fn session(
                 _ => {}
             }
         }
-        Timer::after_millis(1).await;
+        // Yield cooperatively without adding a fixed 1 ms service gap to the SPI hot path.
+        yield_now().await;
     }
 }
 
@@ -288,6 +303,7 @@ impl UpstreamSpiDevice {
     /// Reinitializes the RX/TX state for the next CS-bounded transaction.
     fn begin_transaction(&mut self) {
         let p = rp_pac::SPI1;
+        self.abort_dma();
         p.cr1().modify(|w| w.set_sse(false));
         while p.sr().read().rne() {
             let _ = p.dr().read();
@@ -300,9 +316,14 @@ impl UpstreamSpiDevice {
         });
         p.cr1().modify(|w| w.set_sse(true));
         self.rx_frame.fill(0);
-        self.tx_idx = 0;
-        self.rx_idx = 0;
-        self.prime_tx_fifo();
+        self.frame_reported = false;
+        p.dmacr().write_value({
+            let mut w = rp_pac::spi::regs::Dmacr(0);
+            w.set_rxdmae(true);
+            w.set_txdmae(true);
+            w
+        });
+        self.start_dma();
     }
 
     /// Samples the hardware chip-select line to detect transaction edges.
@@ -310,28 +331,43 @@ impl UpstreamSpiDevice {
         !rp_pac::IO_BANK0.gpio(13).status().read().infrompad()
     }
 
-    /// Fills the hardware TX FIFO with as much of the response frame as possible.
-    fn prime_tx_fifo(&mut self) {
-        let p = rp_pac::SPI1;
-        while self.tx_idx < FRAME_SIZE && p.sr().read().tnf() {
-            p.dr().write_value({
-                let mut w = rp_pac::spi::regs::Dr(0);
-                w.set_data(self.tx_frame[self.tx_idx] as u16);
-                w
-            });
-            self.tx_idx += 1;
-        }
+    /// Starts full-frame DMA servicing for the current SPI transaction buffers.
+    fn start_dma(&mut self) {
+        let spi = rp_pac::SPI1;
+        let dr = spi.dr().as_ptr();
+        let tx_dma_ch = self.tx_dma_ch;
+        let rx_dma_ch = self.rx_dma_ch;
+        let tx_frame = self.tx_frame.as_ptr();
+        let rx_frame = self.rx_frame.as_mut_ptr();
+
+        Self::configure_dma_channel(
+            tx_dma_ch,
+            tx_frame,
+            dr as *mut u8,
+            true,
+            false,
+            TreqSel::SPI1_TX,
+        );
+        Self::configure_dma_channel(
+            rx_dma_ch,
+            dr as *const u8,
+            rx_frame,
+            false,
+            true,
+            TreqSel::SPI1_RX,
+        );
     }
 
     /// Polls the active SPI transaction and yields a complete frame once fully received.
     fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
-        let p = rp_pac::SPI1;
         let cs_low = self.cs_is_low();
 
         if cs_low && !self.cs_active {
             self.cs_active = true;
+            self.frame_reported = false;
         } else if !cs_low && self.cs_active {
             self.cs_active = false;
+            self.abort_dma();
             if self.clear_after_transaction {
                 self.clear_after_transaction = false;
                 self.tx_frame.fill(0);
@@ -346,19 +382,58 @@ impl UpstreamSpiDevice {
             return None;
         }
 
-        self.prime_tx_fifo();
-        while p.sr().read().rne() {
-            let byte = p.dr().read().data() as u8;
-            if self.rx_idx < FRAME_SIZE {
-                self.rx_frame[self.rx_idx] = byte;
-                self.rx_idx += 1;
-            }
-            self.prime_tx_fifo();
-            if self.rx_idx == FRAME_SIZE {
-                return Some(&self.rx_frame);
-            }
+        if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
+            self.frame_reported = true;
+            return Some(&self.rx_frame);
         }
         None
+    }
+
+    /// Programs one DMA channel for a single SPI transaction direction.
+    fn configure_dma_channel(
+        channel: u8,
+        read_addr: *const u8,
+        write_addr: *mut u8,
+        incr_read: bool,
+        incr_write: bool,
+        dreq: TreqSel,
+    ) {
+        let ch = rp_pac::DMA.ch(channel as usize);
+        ch.read_addr().write_value(read_addr as u32);
+        ch.write_addr().write_value(write_addr as u32);
+        ch.trans_count().write(|w| {
+            *w = FRAME_SIZE as u32;
+        });
+
+        compiler_fence(MemoryOrdering::SeqCst);
+        ch.ctrl_trig().write(|w| {
+            w.set_treq_sel(dreq);
+            w.set_data_size(DataSize::SIZE_BYTE);
+            w.set_incr_read(incr_read);
+            w.set_incr_write(incr_write);
+            w.set_chain_to(channel);
+            w.set_en(true);
+        });
+        compiler_fence(MemoryOrdering::SeqCst);
+    }
+
+    /// Returns whether the selected DMA channel is still active.
+    fn dma_channel_busy(&self, channel: u8) -> bool {
+        rp_pac::DMA.ch(channel as usize).ctrl_trig().read().busy()
+    }
+
+    /// Aborts any in-flight SPI DMA transfers and disables SPI DMA requests.
+    fn abort_dma(&self) {
+        rp_pac::SPI1.dmacr().write_value({
+            let mut w = rp_pac::spi::regs::Dmacr(0);
+            w.set_rxdmae(false);
+            w.set_txdmae(false);
+            w
+        });
+        rp_pac::DMA.chan_abort().modify(|m| {
+            m.set_chan_abort((1 << self.tx_dma_ch) | (1 << self.rx_dma_ch));
+        });
+        while self.dma_channel_busy(self.tx_dma_ch) || self.dma_channel_busy(self.rx_dma_ch) {}
     }
 }
 
