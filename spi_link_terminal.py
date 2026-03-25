@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import queue
 import select
+import shutil
 import socket
 import sys
 import termios
@@ -24,23 +26,25 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
 REQ_MAGIC = 0xA5
+REQ_COMMAND_MAGIC = 0xA6
 RESP_MAGIC = 0x5A
+RESP_COMMAND_MAGIC = 0x5B
 
 
-def build_frame(payload: bytes) -> list[int]:
+def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
     payload = payload[:PAYLOAD_MAX]
     frame = [0] * FRAME_SIZE
-    frame[0] = REQ_MAGIC
+    frame[0] = magic
     frame[1] = len(payload)
     frame[2 : 2 + len(payload)] = payload
     return frame
 
 
-def parse_frame(frame: list[int]) -> bytes:
-    if len(frame) != FRAME_SIZE or frame[0] != RESP_MAGIC:
-        return b""
+def parse_frame(frame: list[int]) -> tuple[int, bytes]:
+    if len(frame) != FRAME_SIZE or frame[0] not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+        return 0, b""
     length = min(frame[1], PAYLOAD_MAX)
-    return bytes(frame[2 : 2 + length])
+    return frame[0], bytes(frame[2 : 2 + length])
 
 
 def print_help() -> list[str]:
@@ -79,13 +83,27 @@ class PromptState:
     buffer: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
+    def _rows_for(self, text: str) -> int:
+        cols = max(shutil.get_terminal_size(fallback=(80, 24)).columns, 1)
+        width = max(len(text), 1)
+        return (width - 1) // cols + 1
+
+    def _clear_prompt(self) -> None:
+        rows = self._rows_for(self.prompt + self.buffer)
+        for idx in range(rows):
+            if idx:
+                sys.stdout.write("\x1b[1A")
+            sys.stdout.write("\r\033[2K")
+
     def redraw(self) -> None:
-        sys.stdout.write("\r\033[2K" + self.prompt + self.buffer)
+        self._clear_prompt()
+        sys.stdout.write(self.prompt + self.buffer)
         sys.stdout.flush()
 
     def print_line(self, line: str) -> None:
         with self.lock:
-            sys.stdout.write("\r\033[2K" + line + "\n")
+            self._clear_prompt()
+            sys.stdout.write(line + "\n")
             self.redraw()
 
     def handle_key(self, ch: str) -> str | None:
@@ -93,7 +111,7 @@ class PromptState:
             if ch in ("\r", "\n"):
                 line = self.buffer
                 self.buffer = ""
-                sys.stdout.write("\r\033[2K")
+                self._clear_prompt()
                 sys.stdout.flush()
                 return line
             if ch in ("\x7f", "\b"):
@@ -150,7 +168,7 @@ def main() -> int:
     )
 
     try:
-        pending = b""
+        pending: collections.deque[tuple[int, bytes]] = collections.deque()
         while True:
             try:
                 while True:
@@ -166,16 +184,19 @@ def main() -> int:
                         continue
                     prompt.print_line(f"[{sender}] {line}")
                     if stripped.startswith("/") and not stripped.startswith("//"):
-                        pending += (stripped + "\n").encode("utf-8")
+                        pending.append((REQ_COMMAND_MAGIC, (stripped + "\n").encode("utf-8")))
                     else:
-                        pending += f"[{sender}] {line}\n".encode("utf-8")
+                        pending.append((REQ_MAGIC, f"[{sender}] {line}\n".encode("utf-8")))
             except queue.Empty:
                 pass
 
-            tx = build_frame(pending)
-            pending = pending[PAYLOAD_MAX:]
+            if pending:
+                magic, payload = pending.popleft()
+                tx = build_frame(payload, magic)
+            else:
+                tx = build_frame(b"")
             rx = spi.xfer2(tx)
-            payload = parse_frame(rx)
+            _, payload = parse_frame(rx)
             if payload:
                 text = payload.decode("utf-8", errors="replace").replace("\r", "")
                 for line in text.split("\n"):

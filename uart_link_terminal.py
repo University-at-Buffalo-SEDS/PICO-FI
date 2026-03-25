@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import select
+import shutil
 import socket
 import sys
 import termios
@@ -56,13 +57,27 @@ class PromptState:
     buffer: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
+    def _rows_for(self, text: str) -> int:
+        cols = max(shutil.get_terminal_size(fallback=(80, 24)).columns, 1)
+        width = max(len(text), 1)
+        return (width - 1) // cols + 1
+
+    def _clear_prompt(self) -> None:
+        rows = self._rows_for(self.prompt + self.buffer)
+        for idx in range(rows):
+            if idx:
+                sys.stdout.write("\x1b[1A")
+            sys.stdout.write("\r\033[2K")
+
     def redraw(self) -> None:
-        sys.stdout.write("\r\033[2K" + self.prompt + self.buffer)
+        self._clear_prompt()
+        sys.stdout.write(self.prompt + self.buffer)
         sys.stdout.flush()
 
     def print_line(self, line: str) -> None:
         with self.lock:
-            sys.stdout.write("\r\033[2K" + line + "\n")
+            self._clear_prompt()
+            sys.stdout.write(line + "\n")
             self.redraw()
 
     def replace_buffer(self, value: str) -> None:
@@ -75,7 +90,7 @@ class PromptState:
             if ch in ("\r", "\n"):
                 line = self.buffer
                 self.buffer = ""
-                sys.stdout.write("\r\033[2K")
+                self._clear_prompt()
                 sys.stdout.flush()
                 return line
             if ch in ("\x7f", "\b"):

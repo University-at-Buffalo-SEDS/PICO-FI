@@ -52,12 +52,6 @@ fn main() {
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rustc-link-arg=-Tlink.x");
     println!("cargo:rustc-link-arg=-Tlink-rp.x");
-
-    if env::var("TARGET").as_deref() == Ok("thumbv6m-none-eabi") {
-        println!(
-            "cargo:warning=UF2 generation is handled by scripts/build-uf2.sh after linking."
-        );
-    }
 }
 
 fn load_json_config() -> JsonConfig {
