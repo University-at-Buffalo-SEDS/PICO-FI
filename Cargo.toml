@@ -24,6 +24,7 @@ embedded-io-async = "0.6.1"
 heapless = "0.8.0"
 panic-halt = "1.0.0"
 portable-atomic = { version = "1.13.1", features = ["critical-section"] }
+rp-pac = "7.0.0"
 static_cell = "2.1.1"
 
 [build-dependencies]

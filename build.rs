@@ -13,6 +13,7 @@ struct JsonConfig {
 
 #[derive(Deserialize)]
 struct JsonNetworkConfig {
+    mac: Option<String>,
     mode: String,
     ip: Option<String>,
     prefix_len: Option<u8>,
@@ -37,7 +38,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=pico-fi.json");
+    println!("cargo:rerun-if-changed=pico-fi-server.json");
+    println!("cargo:rerun-if-changed=pico-fi-client.json");
     println!("cargo:rerun-if-changed=scripts/build-uf2.sh");
+    println!("cargo:rerun-if-env-changed=PICO_FI_CONFIG");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
     fs::copy("memory.x", out_dir.join("memory.x")).expect("failed to copy memory.x to OUT_DIR");
@@ -57,17 +61,39 @@ fn main() {
 }
 
 fn load_json_config() -> JsonConfig {
-    let text = fs::read_to_string("pico-fi.json").expect("failed to read pico-fi.json");
-    serde_json::from_str(&text).expect("failed to parse pico-fi.json")
+    let config_path = env::var("PICO_FI_CONFIG").unwrap_or_else(|_| "pico-fi.json".to_owned());
+    let text = fs::read_to_string(&config_path)
+        .unwrap_or_else(|_| panic!("failed to read {config_path}"));
+    serde_json::from_str(&text).unwrap_or_else(|_| panic!("failed to parse {config_path}"))
 }
 
 fn render_generated_config(config: JsonConfig) -> String {
+    let mac_address = render_mac_address(&config.network);
     let address_mode = render_address_mode(&config.network);
     let bridge_mode = render_bridge_mode(&config.bridge);
     let upstream = render_upstream_mode(&config.upstream);
 
     format!(
-        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n}};\n"
+        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n}};\n"
+    )
+}
+
+fn render_mac_address(network: &JsonNetworkConfig) -> String {
+    let value = network.mac.as_deref().unwrap_or("02:00:00:12:34:56");
+    let mut octets = [0u8; 6];
+    let mut count = 0usize;
+
+    for (idx, chunk) in value.split(':').enumerate() {
+        assert!(idx < 6, "invalid mac address");
+        octets[idx] =
+            u8::from_str_radix(chunk, 16).unwrap_or_else(|_| panic!("invalid mac address"));
+        count += 1;
+    }
+
+    assert!(count == 6, "invalid mac address");
+    format!(
+        "[{}, {}, {}, {}, {}, {}]",
+        octets[0], octets[1], octets[2], octets[3], octets[4], octets[5]
     )
 }
 
@@ -113,6 +139,7 @@ fn render_upstream_mode(upstream: &JsonUpstreamConfig) -> String {
     match upstream.transport.as_str() {
         "uart" => "UpstreamMode::Uart".to_owned(),
         "spi" => "UpstreamMode::Spi".to_owned(),
+        "test" => "UpstreamMode::Test".to_owned(),
         other => panic!("unsupported upstream.transport: {other}"),
     }
 }

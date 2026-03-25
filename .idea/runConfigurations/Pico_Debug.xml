@@ -1,7 +1,7 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="Pico Debug" type="RsRemoteRunConfiguration" focusToolWindowBeforeRun="true" debuggerKind="USER_GDB" userDebuggerPath="$PROJECT_DIR$/rustrover-gdb.sh" remoteCommand="localhost:3333" symbolFile="$PROJECT_DIR$/target/thumbv6m-none-eabi/debug/pico-fi" sysroot="">
     <method v="2">
-      <option name="RunConfigurationTask" enabled="false" run_configuration_name="Run" run_configuration_type="CargoCommandRunConfiguration" run_configuration_target="RsBuildProfile:dev" />
+      <option name="RunConfigurationTask" enabled="true" run_configuration_name="Build Firmware" run_configuration_type="CargoCommandRunConfiguration" />
     </method>
   </configuration>
 </component>

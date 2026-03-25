@@ -5,9 +5,3 @@ set print asm-demangle on
 set remotetimeout 60
 set tcp auto-retry on
 set tcp connect-timeout 15
-
-define target remote
-  target extended-remote $arg0
-  monitor reset halt
-  thbreak __cortex_m_rt_main
-end

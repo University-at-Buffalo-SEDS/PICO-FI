@@ -910,6 +910,7 @@ dependencies = [
  "heapless",
  "panic-halt",
  "portable-atomic",
+ "rp-pac",
  "serde",
  "serde_json",
  "static_cell",

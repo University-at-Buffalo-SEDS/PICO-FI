@@ -25,10 +25,12 @@ pub enum BridgeMode {
 pub enum UpstreamMode {
     Uart,
     Spi,
+    Test,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
+    pub mac_address: [u8; 6],
     pub address_mode: AddressMode,
     pub bridge_mode: BridgeMode,
     pub upstream_mode: UpstreamMode,
@@ -51,6 +53,7 @@ pub enum Command {
     SetStatic(Ipv4Config),
     SetClient { host: [u8; 4], port: u16 },
     SetServer { port: u16 },
+    SetUpstream(UpstreamMode),
 }
 
 pub fn parse_command(line: &str) -> Result<Command, &'static str> {
@@ -78,6 +81,9 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
         ["set", "server", port] => Ok(Command::SetServer {
             port: parse_port(port)?,
         }),
+        ["set", "upstream", "uart"] => Ok(Command::SetUpstream(UpstreamMode::Uart)),
+        ["set", "upstream", "spi"] => Ok(Command::SetUpstream(UpstreamMode::Spi)),
+        ["set", "upstream", "test"] => Ok(Command::SetUpstream(UpstreamMode::Test)),
         _ => Err("unknown command"),
     }
 }
@@ -102,11 +108,18 @@ pub fn apply_command(config: &mut BridgeConfig, cmd: Command) -> bool {
             config.bridge_mode = BridgeMode::TcpServer { port };
             false
         }
+        Command::SetUpstream(mode) => {
+            config.upstream_mode = mode;
+            false
+        }
     }
 }
 
 pub fn render_config(config: &BridgeConfig) -> String<160> {
     let mut out = String::<160>::new();
+    let _ = out.push_str("mac=");
+    push_mac(&mut out, config.mac_address);
+    let _ = out.push(' ');
 
     match config.address_mode {
         AddressMode::Dhcp => {
@@ -144,6 +157,9 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
         UpstreamMode::Spi => {
             let _ = out.push_str(" upstream=spi");
+        }
+        UpstreamMode::Test => {
+            let _ = out.push_str(" upstream=test");
         }
     }
 
@@ -238,6 +254,21 @@ fn push_u16(out: &mut String<160>, value: u16) {
     }
 }
 
+fn push_mac(out: &mut String<160>, mac: [u8; 6]) {
+    for (idx, byte) in mac.iter().enumerate() {
+        if idx != 0 {
+            let _ = out.push(':');
+        }
+        push_hex_byte(out, *byte);
+    }
+}
+
+fn push_hex_byte(out: &mut String<160>, value: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let _ = out.push(HEX[(value >> 4) as usize] as char);
+    let _ = out.push(HEX[(value & 0x0f) as usize] as char);
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -268,5 +299,11 @@ mod tests {
                 port: 7000,
             }
         );
+    }
+
+    #[test]
+    fn parses_upstream_test() {
+        let cmd = parse_command("set upstream test").unwrap();
+        assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Test));
     }
 }
