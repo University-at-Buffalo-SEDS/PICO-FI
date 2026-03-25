@@ -4,7 +4,6 @@ use crate::bridge::commands::render_local_bridge_command;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
-use crate::shell::writeln_line;
 use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
@@ -26,7 +25,6 @@ pub async fn run_client(
     runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
-    let _ = writeln_line(uart, "stabilizing before first connect").await;
     Timer::after_millis(runtime.startup_delay_ms).await;
 
     loop {
@@ -36,16 +34,13 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "connecting").await;
         if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
             .await
             .is_err()
         {
-            let _ = writeln_line(uart, "connect failed").await;
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        let _ = writeln_line(uart, "tcp connected").await;
         if exchange_link_handshake(
             &mut socket,
             true,
@@ -57,19 +52,15 @@ pub async fn run_client(
         {
             socket.abort();
             let _ = socket.flush().await;
-            let _ = writeln_line(uart, "handshake failed").await;
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
         runtime.link_active.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "link active").await;
 
         let _ = session(uart, &mut socket, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "server disconnected").await;
-        let _ = writeln_line(uart, "cooling down before reconnect").await;
         Timer::after_millis(runtime.reconnect_delay_ms).await;
     }
 }
@@ -88,9 +79,7 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        let _ = writeln_line(uart, "waiting for tcp client").await;
         socket.accept(port).await.map_err(|_| ())?;
-        let _ = writeln_line(uart, "tcp client connected").await;
         if exchange_link_handshake(
             &mut socket,
             false,
@@ -102,18 +91,15 @@ pub async fn run_server(
         {
             socket.abort();
             let _ = socket.flush().await;
-            let _ = writeln_line(uart, "handshake failed").await;
             runtime.link_active.store(false, Ordering::Relaxed);
             continue;
         }
         runtime.link_active.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "link active").await;
 
         let _ = session(uart, &mut socket, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "client disconnected").await;
     }
 }
 
@@ -181,6 +167,6 @@ async fn handle_local_command(
     }
 
     let response = render_local_bridge_command(bridge_config, link_active, line);
-    writeln_line(uart, response.as_str()).await?;
+    crate::shell::writeln_line(uart, response.as_str()).await?;
     Ok(true)
 }

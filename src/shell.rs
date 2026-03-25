@@ -31,17 +31,8 @@ pub async fn configuration_shell(
     initial_config: BridgeConfig,
 ) -> BridgeConfig {
     let mut config = initial_config;
-    let rendered = render_config(&config);
-    let _ = writeln_line(uart, "default:").await;
-    let _ = writeln_line(uart, rendered.as_str()).await;
-    let _ = writeln_line(
-        uart,
-        "auto-starting in 3 seconds; type commands to override or `start` now",
-    )
-    .await;
 
     for _ in 0..30 {
-        let _ = write_str(uart, "> ").await;
         let mut line = String::<128>::new();
         match read_line_with_timeout(uart, &mut line, 100).await {
             Ok(true) => {}
@@ -86,7 +77,6 @@ pub async fn configuration_shell(
         }
     }
 
-    let _ = writeln_line(uart, "starting compiled config").await;
     config
 }
 
@@ -124,12 +114,6 @@ pub async fn read_line_with_timeout(
             }
         }
     }
-}
-
-/// Writes a string to UART without appending a newline.
-pub async fn write_str(uart: &mut BufferedUart, value: &str) -> Result<(), ()> {
-    uart.write_all(value.as_bytes()).await.map_err(|_| ())?;
-    uart.flush().await.map_err(|_| ())
 }
 
 /// Writes a string to UART followed by CRLF.

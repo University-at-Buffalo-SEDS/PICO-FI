@@ -1,7 +1,6 @@
 //! TCP test mode used for quick LED and connectivity checks.
 
 use crate::bridge::commands::trim_ascii_line;
-use crate::shell::writeln_line;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
@@ -24,9 +23,7 @@ pub async fn run_client(
     let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
     socket.set_timeout(Some(Duration::from_secs(30)));
 
-    let _ = writeln_line(uart, "connecting").await;
     socket.connect((remote, port)).await.map_err(|_| ())?;
-    let _ = writeln_line(uart, "connected").await;
 
     session(uart, &mut socket, led).await
 }
@@ -44,22 +41,18 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_timeout(None);
 
-        let _ = writeln_line(uart, "waiting for tcp client").await;
         socket.accept(port).await.map_err(|_| ())?;
-        let _ = writeln_line(uart, "client connected").await;
 
         let _ = session(uart, &mut socket, led).await;
-        let _ = writeln_line(uart, "client disconnected").await;
     }
 }
 
 /// Serves one active test-mode TCP session.
 async fn session(
-    uart: &mut BufferedUart,
+    _uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
     led: &mut Output<'static>,
 ) -> Result<(), ()> {
-    let _ = writeln_line(uart, "test mode ready").await;
     write_socket(socket, b"pico-fi test mode\r\n").await?;
     write_socket(
         socket,
@@ -80,7 +73,6 @@ async fn session(
         let response = handle_command(line, led, &mut led_on).await;
         write_socket(socket, response.as_bytes()).await?;
         write_socket(socket, b"\r\n").await?;
-        let _ = writeln_line(uart, response).await;
     }
 }
 

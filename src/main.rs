@@ -10,7 +10,7 @@ mod protocol;
 mod shell;
 mod storage;
 
-use bridge::spi::{init_upstream_spi, report_spi_probe};
+use bridge::spi::init_upstream_spi;
 use bridge::runtime::BridgeRuntime;
 use config::{BridgeConfig, BridgeMode, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
@@ -23,7 +23,7 @@ use embassy_time::Timer;
 #[allow(unused_imports)]
 use panic_halt as _;
 use portable_atomic::{AtomicBool, Ordering};
-use shell::{configuration_shell, write_banner, writeln_line};
+use shell::configuration_shell;
 use static_cell::StaticCell;
 use storage::ConfigStorage;
 
@@ -106,7 +106,6 @@ async fn app(spawner: Spawner) {
 
     let mut config_storage = ConfigStorage::new(p.FLASH);
     let initial_config = config_storage.load().unwrap_or_default();
-    let _ = write_banner(&mut uart).await;
     let bridge_config = configuration_shell(&mut uart, &mut config_storage, initial_config).await;
     if !matches!(bridge_config.upstream_mode, UpstreamMode::Test) {
         spawner.spawn(
@@ -120,7 +119,7 @@ async fn app(spawner: Spawner) {
     }
 
     let mut upstream_spi = if matches!(bridge_config.upstream_mode, UpstreamMode::Spi) {
-        let mut spi = init_upstream_spi(
+        let spi = init_upstream_spi(
             p.SPI1,
             p.PIN_10,
             p.PIN_11,
@@ -129,7 +128,6 @@ async fn app(spawner: Spawner) {
             p.DMA_CH2,
             p.DMA_CH3,
         );
-        let _ = report_spi_probe(&mut uart, &mut spi).await;
         Some(spi)
     } else {
         None
@@ -152,12 +150,11 @@ async fn app(spawner: Spawner) {
     {
         Ok(stack) => stack,
         Err(err) => loop {
-            let _ = writeln_line(&mut uart, err).await;
+            let _ = err;
             Timer::after_secs(1).await;
         },
     };
 
-    let _ = writeln_line(&mut uart, "network ready").await;
     let result = run_bridge_mode(
         &mut uart,
         stack,
@@ -167,9 +164,7 @@ async fn app(spawner: Spawner) {
     )
     .await;
 
-    if result.is_err() {
-        let _ = writeln_line(&mut uart, "bridge stopped").await;
-    }
+    let _ = result;
 
     loop {
         Timer::after_secs(1).await;

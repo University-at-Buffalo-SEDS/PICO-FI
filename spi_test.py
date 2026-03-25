@@ -40,14 +40,22 @@ def parse_frame(frame: list[int]) -> tuple[bool, int, bytes]:
     return True, length, bytes(frame[2 : 2 + length])
 
 
-def short_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
+def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
     failures = 0
-    tx = [REQ_MAGIC, 0x00] + [0x00] * 14
     for idx in range(count):
-        rx = spi.xfer2(tx[:])
-        ok = bool(rx) and rx[0] == RESP_MAGIC
+        tx = build_frame(b"", REQ_MAGIC)
+        rx = spi.xfer2(tx)
+        ok, length, body = parse_frame(rx)
         status = "ok" if ok else "bad"
-        print(f"probe {idx + 1:02d}: {status} tx0=0x{tx[0]:02x} rx={format_bytes(rx)}")
+        preview = format_bytes(rx[:16])
+        if ok:
+            print(
+                f"probe {idx + 1:02d}: {status} rx0=0x{rx[0]:02x} len={length} preview={preview}"
+            )
+            if body:
+                print(f"payload: {body.decode('utf-8', errors='replace')!r}")
+        else:
+            print(f"probe {idx + 1:02d}: {status} rx={preview}")
         if not ok:
             failures += 1
         if idx + 1 != count:
@@ -91,7 +99,9 @@ def main() -> int:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    probe_parser = subparsers.add_parser("probe", help="Run repeated short 16-byte probes.")
+    probe_parser = subparsers.add_parser(
+        "probe", help="Run repeated full-frame empty data requests."
+    )
     probe_parser.add_argument("--count", type=int, default=10)
     probe_parser.add_argument("--delay-ms", type=int, default=100)
 
@@ -114,7 +124,7 @@ def main() -> int:
 
     try:
         if args.command == "probe":
-            return short_probe(spi, args.count, args.delay_ms / 1000.0)
+            return framed_probe(spi, args.count, args.delay_ms / 1000.0)
         if args.command == "frame":
             return framed_exchange(spi, args.payload.encode("utf-8"))
         if args.command == "line":

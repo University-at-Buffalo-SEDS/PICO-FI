@@ -131,16 +131,15 @@ Examples:
 
 ## Receiving data from the Pico
 
-UART output from the Pico is plain text.
+UART output from the Pico is quiet by default.
 
 You may see:
 
-- boot banner and configuration-shell prompts before the network starts
 - local command replies such as `pong`
-- bridge status lines such as `connecting`, `tcp connected`, `link active`
+- rendered config output when you explicitly request it
 - application data received from the remote bridged peer
 
-Because all of these share the same UART output, a host application should treat UART RX as human-readable text, not as a framed binary protocol.
+The firmware does not emit boot banners, prompts, or link-state chatter on UART unless you explicitly send a command that asks for information.
 
 ## Minimal examples
 

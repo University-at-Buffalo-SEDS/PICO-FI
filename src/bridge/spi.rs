@@ -9,7 +9,6 @@ use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
 use crate::protocol::spi::{
     FRAME_SIZE, PAYLOAD_MAX, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, parse_request_frame,
 };
-use crate::shell::writeln_line;
 use embassy_futures::yield_now;
 use embassy_rp::dma::ChannelInstance;
 use embassy_net::Ipv4Address;
@@ -20,7 +19,6 @@ use embassy_rp::peripherals::{PIN_10, PIN_11, PIN_12, PIN_13, SPI1};
 use embassy_rp::spi::{self, Blocking};
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
-use heapless::String;
 use rp_pac::dma::vals::{DataSize, TreqSel};
 use portable_atomic::{AtomicBool, Ordering};
 
@@ -124,16 +122,6 @@ pub fn init_upstream_spi<TX: ChannelInstance, RX: ChannelInstance>(
     device
 }
 
-/// Emits a short SPI probe line onto UART for debugging transport health.
-pub async fn report_spi_probe(
-    uart: &mut BufferedUart,
-    spi: &mut UpstreamSpiDevice,
-) -> Result<(), ()> {
-    let bytes = spi_probe(spi)?;
-    let line = render_hex_probe(&bytes);
-    writeln_line(uart, line.as_str()).await
-}
-
 /// Runs the SPI bridge in TCP client mode with reconnect behavior.
 pub async fn run_client(
     uart: &mut BufferedUart,
@@ -145,7 +133,6 @@ pub async fn run_client(
     runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
-    let _ = writeln_line(uart, "stabilizing before first connect").await;
     Timer::after_millis(runtime.startup_delay_ms).await;
 
     loop {
@@ -155,16 +142,13 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "connecting").await;
         if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
             .await
             .is_err()
         {
-            let _ = writeln_line(uart, "connect failed").await;
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        let _ = writeln_line(uart, "tcp connected").await;
         if exchange_link_handshake(
             &mut socket,
             true,
@@ -176,19 +160,15 @@ pub async fn run_client(
         {
             socket.abort();
             let _ = socket.flush().await;
-            let _ = writeln_line(uart, "handshake failed").await;
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
         runtime.link_active.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "link active").await;
 
         let _ = session(uart, &mut socket, spi, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "server disconnected").await;
-        let _ = writeln_line(uart, "cooling down before reconnect").await;
         Timer::after_millis(runtime.reconnect_delay_ms).await;
     }
 }
@@ -208,9 +188,7 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        let _ = writeln_line(uart, "waiting for tcp client").await;
         socket.accept(port).await.map_err(|_| ())?;
-        let _ = writeln_line(uart, "tcp client connected").await;
         if exchange_link_handshake(
             &mut socket,
             false,
@@ -222,34 +200,26 @@ pub async fn run_server(
         {
             socket.abort();
             let _ = socket.flush().await;
-            let _ = writeln_line(uart, "handshake failed").await;
             runtime.link_active.store(false, Ordering::Relaxed);
             continue;
         }
         runtime.link_active.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "link active").await;
 
         let _ = session(uart, &mut socket, spi, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "client disconnected").await;
     }
 }
 
 /// Bridges framed SPI transactions to the TCP socket.
 async fn session(
-    uart: &mut BufferedUart,
+    _uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
     spi: &mut UpstreamSpiDevice,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
 ) -> Result<(), ()> {
-    let _ = writeln_line(
-        uart,
-        "spi slave upstream enabled on SPI1 pins: sck=10 mosi=11 miso=12 cs=13",
-    )
-    .await;
     let mut net_buf = [0u8; PAYLOAD_MAX];
     spi.prepare_response_frame(RESP_DATA_MAGIC, &[]);
 
@@ -367,18 +337,21 @@ impl UpstreamSpiDevice {
             self.frame_reported = false;
         } else if !cs_low && self.cs_active {
             self.cs_active = false;
-            self.abort_dma();
-            if self.clear_after_transaction {
-                self.clear_after_transaction = false;
-                self.tx_frame.fill(0);
-                self.tx_frame[0] = RESP_DATA_MAGIC;
-                self.tx_frame[1] = 0;
-            }
-            self.begin_transaction();
+            self.finish_transaction();
             return None;
         }
 
         if !self.cs_active {
+            if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
+                self.frame_reported = true;
+                return Some(&self.rx_frame);
+            }
+
+            // Short transfers can begin and end entirely between polls, leaving DMA mid-frame
+            // with CS already deasserted. Detect that stale state and rearm immediately.
+            if self.transaction_started() {
+                self.finish_transaction();
+            }
             return None;
         }
 
@@ -422,6 +395,29 @@ impl UpstreamSpiDevice {
         rp_pac::DMA.ch(channel as usize).ctrl_trig().read().busy()
     }
 
+    /// Returns whether the current DMA transaction has consumed any bytes.
+    fn transaction_started(&self) -> bool {
+        self.dma_remaining_count(self.rx_dma_ch) < FRAME_SIZE as u32
+            || self.dma_remaining_count(self.tx_dma_ch) < FRAME_SIZE as u32
+    }
+
+    /// Returns the DMA transfer count remaining for the selected channel.
+    fn dma_remaining_count(&self, channel: u8) -> u32 {
+        rp_pac::DMA.ch(channel as usize).trans_count().read()
+    }
+
+    /// Finalizes the current CS-bounded transaction and rearms the slave for the next one.
+    fn finish_transaction(&mut self) {
+        self.abort_dma();
+        if self.clear_after_transaction {
+            self.clear_after_transaction = false;
+            self.tx_frame.fill(0);
+            self.tx_frame[0] = RESP_DATA_MAGIC;
+            self.tx_frame[1] = 0;
+        }
+        self.begin_transaction();
+    }
+
     /// Aborts any in-flight SPI DMA transfers and disables SPI DMA requests.
     fn abort_dma(&self) {
         rp_pac::SPI1.dmacr().write_value({
@@ -435,29 +431,4 @@ impl UpstreamSpiDevice {
         });
         while self.dma_channel_busy(self.tx_dma_ch) || self.dma_channel_busy(self.rx_dma_ch) {}
     }
-}
-
-/// Reads the last captured SPI bytes for a minimal probe display.
-fn spi_probe(spi: &mut UpstreamSpiDevice) -> Result<[u8; 8], ()> {
-    Ok(spi.rx_frame[..8].try_into().unwrap_or([0; 8]))
-}
-
-/// Formats probe bytes as a compact hexadecimal status line.
-fn render_hex_probe(bytes: &[u8; 8]) -> String<48> {
-    let mut out = String::<48>::new();
-    let _ = out.push_str("spi probe=");
-    for (idx, byte) in bytes.iter().enumerate() {
-        if idx != 0 {
-            let _ = out.push(' ');
-        }
-        push_hex_byte(&mut out, *byte);
-    }
-    out
-}
-
-/// Appends a two-character uppercase hexadecimal byte to a string buffer.
-fn push_hex_byte(out: &mut String<48>, value: u8) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let _ = out.push(HEX[(value >> 4) as usize] as char);
-    let _ = out.push(HEX[(value & 0x0f) as usize] as char);
 }
