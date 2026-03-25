@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import argparse
 import queue
+import select
+import socket
 import sys
+import termios
 import threading
 import time
+import tty
+from dataclasses import dataclass, field
 
 try:
     import spidev
@@ -38,31 +43,83 @@ def parse_frame(frame: list[int]) -> bytes:
     return bytes(frame[2 : 2 + length])
 
 
-def print_help() -> None:
-    print("chat mode:")
-    print("  plain text   send to the remote peer")
-    print("  /help        ask the local Pico for command help")
-    print("  /show        show the local Pico config")
-    print("  /ping        ping the local Pico")
-    print("  /link        show the local Pico link state")
-    print("  //help       show this app help")
-    print("  //quit       exit the app")
+def print_help() -> list[str]:
+    return [
+        "chat mode:",
+        "  plain text   send to the remote peer with sender label",
+        "  /help        ask the local Pico for command help",
+        "  /show        show the local Pico config",
+        "  /ping        ping the local Pico",
+        "  /link        show the local Pico link state",
+        "  //help       show this app help",
+        "  //quit       exit the app",
+    ]
 
 
-def stdin_thread(outbound: "queue.Queue[bytes]") -> None:
-    while True:
-        line = sys.stdin.readline()
-        if line == "":
-            outbound.put(b"")
-            return
-        stripped = line.strip()
-        if stripped == "//help":
-            outbound.put(b"//__local_help__\n")
-            continue
-        if stripped == "//quit":
-            outbound.put(b"")
-            return
-        outbound.put(line.encode("utf-8"))
+def default_sender_label() -> str:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("192.0.2.1", 1))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return "local"
+
+
+@dataclass
+class PromptState:
+    sender: str
+    prompt: str = "> "
+    buffer: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def redraw(self) -> None:
+        sys.stdout.write("\r\033[2K" + self.prompt + self.buffer)
+        sys.stdout.flush()
+
+    def print_line(self, line: str) -> None:
+        with self.lock:
+            sys.stdout.write("\r\033[2K" + line + "\n")
+            self.redraw()
+
+    def handle_key(self, ch: str) -> str | None:
+        with self.lock:
+            if ch in ("\r", "\n"):
+                line = self.buffer
+                self.buffer = ""
+                sys.stdout.write("\r\033[2K")
+                sys.stdout.flush()
+                return line
+            if ch in ("\x7f", "\b"):
+                self.buffer = self.buffer[:-1]
+            elif ch.isprintable():
+                self.buffer += ch
+            self.redraw()
+            return None
+
+
+def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        prompt.redraw()
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if not ready:
+                continue
+            ch = sys.stdin.read(1)
+            line = prompt.handle_key(ch)
+            if line is not None:
+                outbound.put(line)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def main() -> int:
@@ -72,6 +129,7 @@ def main() -> int:
     parser.add_argument("--speed", type=int, default=50_000)
     parser.add_argument("--mode", type=int, default=0)
     parser.add_argument("--poll-ms", type=int, default=50)
+    parser.add_argument("--sender", default="", help="Sender label prepended to outbound chat lines.")
     args = parser.parse_args()
 
     spi = spidev.SpiDev()
@@ -80,8 +138,10 @@ def main() -> int:
     spi.mode = args.mode
     spi.bits_per_word = 8
 
-    outbound: "queue.Queue[bytes]" = queue.Queue()
-    threading.Thread(target=stdin_thread, args=(outbound,), daemon=True).start()
+    sender = args.sender or default_sender_label()
+    prompt = PromptState(sender=sender)
+    outbound: "queue.Queue[str]" = queue.Queue()
+    threading.Thread(target=input_loop, args=(outbound, prompt), daemon=True).start()
 
     print(
         f"connected to /dev/spidev{args.bus}.{args.device} @ {args.speed}Hz mode{args.mode}. "
@@ -94,13 +154,21 @@ def main() -> int:
         while True:
             try:
                 while True:
-                    chunk = outbound.get_nowait()
-                    if chunk == b"":
-                        return 0
-                    if chunk == b"//__local_help__\n":
-                        print_help()
+                    line = outbound.get_nowait()
+                    stripped = line.strip()
+                    if stripped == "//help":
+                        for help_line in print_help():
+                            prompt.print_line(help_line)
                         continue
-                    pending += chunk
+                    if stripped == "//quit":
+                        return 0
+                    if not line:
+                        continue
+                    prompt.print_line(f"[{sender}] {line}")
+                    if stripped.startswith("/") and not stripped.startswith("//"):
+                        pending += (stripped + "\n").encode("utf-8")
+                    else:
+                        pending += f"[{sender}] {line}\n".encode("utf-8")
             except queue.Empty:
                 pass
 
@@ -109,8 +177,10 @@ def main() -> int:
             rx = spi.xfer2(tx)
             payload = parse_frame(rx)
             if payload:
-                sys.stdout.write(payload.decode("utf-8", errors="replace"))
-                sys.stdout.flush()
+                text = payload.decode("utf-8", errors="replace").replace("\r", "")
+                for line in text.split("\n"):
+                    if line:
+                        prompt.print_line(line)
             time.sleep(args.poll_ms / 1000.0)
     except KeyboardInterrupt:
         return 0

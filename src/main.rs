@@ -43,6 +43,7 @@ struct UpstreamSpiDevice {
     tx_idx: usize,
     rx_idx: usize,
     cs_active: bool,
+    clear_after_transaction: bool,
 }
 
 type WizRunner = embassy_net_wiznet::Runner<
@@ -549,6 +550,7 @@ fn init_upstream_spi(
         tx_idx: 0,
         rx_idx: 0,
         cs_active: false,
+        clear_after_transaction: false,
     };
     device.prepare_response_frame(&[]);
     device
@@ -866,6 +868,7 @@ async fn connect_with_timeout(
 
 impl UpstreamSpiDevice {
     fn prepare_response_frame(&mut self, payload: &[u8]) {
+        self.clear_after_transaction = !payload.is_empty();
         self.tx_frame.fill(0);
         self.tx_frame[0] = 0x5a;
         let len = payload.len().min(SPI_PAYLOAD_MAX);
@@ -917,10 +920,16 @@ impl UpstreamSpiDevice {
 
         if cs_low && !self.cs_active {
             self.cs_active = true;
-            self.begin_transaction();
         } else if !cs_low && self.cs_active {
             self.cs_active = false;
-            // Re-arm the canned response for the next CS-bounded transaction.
+            if self.clear_after_transaction {
+                self.clear_after_transaction = false;
+                self.tx_frame.fill(0);
+                self.tx_frame[0] = 0x5a;
+                self.tx_frame[1] = 0;
+            }
+            // Re-arm the next CS-bounded transaction while CS is idle, so the first byte is
+            // already queued before the master asserts CS again.
             self.begin_transaction();
             return None;
         }
