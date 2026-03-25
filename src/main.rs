@@ -26,6 +26,7 @@ use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::{Read, Write};
 use heapless::{String, Vec};
+#[allow(unused_imports)]
 use panic_halt as _;
 use portable_atomic::{AtomicBool, Ordering};
 use static_cell::StaticCell;
@@ -61,8 +62,11 @@ static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 static WIZNET_STATE: StaticCell<embassy_net_wiznet::State<2, 2>> = StaticCell::new();
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static LINK_ACTIVE: AtomicBool = AtomicBool::new(false);
-const CLIENT_STARTUP_DELAY_MS: u64 = 3_000;
-const CLIENT_RECONNECT_DELAY_MS: u64 = 3_000;
+const CLIENT_STARTUP_DELAY_MS: u64 = 250;
+const CLIENT_RECONNECT_DELAY_MS: u64 = 500;
+const LINK_CONNECT_TIMEOUT_MS: u64 = 1_500;
+const LINK_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
+const LINK_HANDSHAKE_MAGIC: &[u8] = b"PICOFI1";
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, embassy_net_wiznet::Device<'static>>) {
@@ -148,17 +152,17 @@ async fn app(spawner: Spawner) {
     let _ = writeln_line(&mut uart, "network ready").await;
     let result = match (bridge_config.bridge_mode, bridge_config.upstream_mode) {
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Uart) => {
-            run_client_uart_bridge(&mut uart, stack, host, port).await
+            run_client_uart_bridge(&mut uart, stack, host, port, bridge_config).await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
-            run_server_uart_bridge(&mut uart, stack, port).await
+            run_server_uart_bridge(&mut uart, stack, port, bridge_config).await
         }
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Spi) => match upstream_spi.as_mut() {
-            Some(spi) => run_client_spi_bridge(&mut uart, stack, host, port, spi).await,
+            Some(spi) => run_client_spi_bridge(&mut uart, stack, host, port, spi, bridge_config).await,
             None => Err(()),
         },
         (BridgeMode::TcpServer { port }, UpstreamMode::Spi) => match upstream_spi.as_mut() {
-            Some(spi) => run_server_spi_bridge(&mut uart, stack, port, spi).await,
+            Some(spi) => run_server_spi_bridge(&mut uart, stack, port, spi, bridge_config).await,
             None => Err(()),
         },
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Test) => {
@@ -354,6 +358,7 @@ async fn run_client_uart_bridge(
     stack: Stack<'static>,
     host: [u8; 4],
     port: u16,
+    bridge_config: BridgeConfig,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     let _ = writeln_line(uart, "stabilizing before first connect").await;
@@ -362,20 +367,27 @@ async fn run_client_uart_bridge(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(3)));
-        socket.set_keep_alive(Some(Duration::from_secs(1)));
+        socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         LINK_ACTIVE.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "connecting").await;
-        if socket.connect((remote, port)).await.is_err() {
+        if connect_with_timeout(&mut socket, remote, port).await.is_err() {
             let _ = writeln_line(uart, "connect failed").await;
-            Timer::after_secs(1).await;
+            Timer::after_millis(CLIENT_RECONNECT_DELAY_MS).await;
+            continue;
+        }
+        let _ = writeln_line(uart, "tcp connected").await;
+        if exchange_link_handshake(&mut socket, true).await.is_err() {
+            socket.abort();
+            let _ = socket.flush().await;
+            let _ = writeln_line(uart, "handshake failed").await;
+            Timer::after_millis(CLIENT_RECONNECT_DELAY_MS).await;
             continue;
         }
         LINK_ACTIVE.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "connected").await;
+        let _ = writeln_line(uart, "link active").await;
 
-        let _ = uart_bridge_session(uart, &mut socket).await;
+        let _ = uart_bridge_session(uart, &mut socket, bridge_config).await;
         socket.abort();
         let _ = socket.flush().await;
         LINK_ACTIVE.store(false, Ordering::Relaxed);
@@ -389,20 +401,28 @@ async fn run_server_uart_bridge(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
     port: u16,
+    bridge_config: BridgeConfig,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(3)));
-        socket.set_keep_alive(Some(Duration::from_secs(1)));
+        socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         let _ = writeln_line(uart, "waiting for tcp client").await;
         socket.accept(port).await.map_err(|_| ())?;
+        let _ = writeln_line(uart, "tcp client connected").await;
+        if exchange_link_handshake(&mut socket, false).await.is_err() {
+            socket.abort();
+            let _ = socket.flush().await;
+            let _ = writeln_line(uart, "handshake failed").await;
+            LINK_ACTIVE.store(false, Ordering::Relaxed);
+            continue;
+        }
         LINK_ACTIVE.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "client connected").await;
+        let _ = writeln_line(uart, "link active").await;
 
-        let _ = uart_bridge_session(uart, &mut socket).await;
+        let _ = uart_bridge_session(uart, &mut socket, bridge_config).await;
         socket.abort();
         let _ = socket.flush().await;
         LINK_ACTIVE.store(false, Ordering::Relaxed);
@@ -410,9 +430,14 @@ async fn run_server_uart_bridge(
     }
 }
 
-async fn uart_bridge_session(uart: &mut BufferedUart, socket: &mut TcpSocket<'_>) -> Result<(), ()> {
+async fn uart_bridge_session(
+    uart: &mut BufferedUart,
+    socket: &mut TcpSocket<'_>,
+    bridge_config: BridgeConfig,
+) -> Result<(), ()> {
     let mut uart_buf = [0u8; 256];
     let mut net_buf = [0u8; 256];
+    let mut line_buf = String::<256>::new();
 
     loop {
         match select(uart.read(&mut uart_buf), socket.read(&mut net_buf)).await {
@@ -421,7 +446,24 @@ async fn uart_bridge_session(uart: &mut BufferedUart, socket: &mut TcpSocket<'_>
                     Timer::after_millis(5).await;
                     continue;
                 }
-                write_socket(socket, &uart_buf[..uart_n]).await?;
+                for &byte in &uart_buf[..uart_n] {
+                    match byte {
+                        b'\r' => {}
+                        b'\n' => {
+                            if handle_local_bridge_command_uart(uart, bridge_config, line_buf.as_str()).await? {
+                                line_buf.clear();
+                                continue;
+                            }
+                            write_socket(socket, line_buf.as_bytes()).await?;
+                            write_socket(socket, b"\n").await?;
+                            line_buf.clear();
+                        }
+                        byte if byte.is_ascii() => {
+                            let _ = line_buf.push(byte as char);
+                        }
+                        _ => {}
+                    }
+                }
             }
             Either::First(Err(_)) => return Err(()),
             Either::Second(Ok(net_n)) => {
@@ -441,11 +483,21 @@ fn init_upstream_spi(
     sclk: Peri<'static, PIN_10>,
     mosi: Peri<'static, PIN_11>,
     miso: Peri<'static, PIN_12>,
-    _cs: Peri<'static, PIN_13>,
+    cs: Peri<'static, PIN_13>,
 ) -> UpstreamSpiDevice {
     let mut spi_config = spi::Config::default();
     spi_config.frequency = 1_000_000;
     let configured = spi::Spi::new_blocking(spi1, sclk, mosi, miso, spi_config);
+    let _cs = cs;
+
+    rp_pac::IO_BANK0.gpio(13).ctrl().write(|w| {
+        w.set_funcsel(rp_pac::io::vals::Gpio13ctrlFuncsel::SPI1_SS_N.to_bits());
+    });
+    rp_pac::PADS_BANK0.gpio(13).modify(|w| {
+        w.set_ie(true);
+        w.set_pue(true);
+        w.set_pde(false);
+    });
 
     let p = rp_pac::SPI1;
     p.cr1().write_value(rp_pac::spi::regs::Cr1(0));
@@ -537,6 +589,7 @@ async fn run_client_spi_bridge(
     host: [u8; 4],
     port: u16,
     spi: &mut UpstreamSpiDevice,
+    bridge_config: BridgeConfig,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     let _ = writeln_line(uart, "stabilizing before first connect").await;
@@ -545,20 +598,27 @@ async fn run_client_spi_bridge(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(3)));
-        socket.set_keep_alive(Some(Duration::from_secs(1)));
+        socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         LINK_ACTIVE.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "connecting").await;
-        if socket.connect((remote, port)).await.is_err() {
+        if connect_with_timeout(&mut socket, remote, port).await.is_err() {
             let _ = writeln_line(uart, "connect failed").await;
-            Timer::after_secs(1).await;
+            Timer::after_millis(CLIENT_RECONNECT_DELAY_MS).await;
+            continue;
+        }
+        let _ = writeln_line(uart, "tcp connected").await;
+        if exchange_link_handshake(&mut socket, true).await.is_err() {
+            socket.abort();
+            let _ = socket.flush().await;
+            let _ = writeln_line(uart, "handshake failed").await;
+            Timer::after_millis(CLIENT_RECONNECT_DELAY_MS).await;
             continue;
         }
         LINK_ACTIVE.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "connected").await;
+        let _ = writeln_line(uart, "link active").await;
 
-        let _ = spi_bridge_session(uart, &mut socket, spi).await;
+        let _ = spi_bridge_session(uart, &mut socket, spi, bridge_config).await;
         socket.abort();
         let _ = socket.flush().await;
         LINK_ACTIVE.store(false, Ordering::Relaxed);
@@ -573,20 +633,28 @@ async fn run_server_spi_bridge(
     stack: Stack<'static>,
     port: u16,
     spi: &mut UpstreamSpiDevice,
+    bridge_config: BridgeConfig,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(3)));
-        socket.set_keep_alive(Some(Duration::from_secs(1)));
+        socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         let _ = writeln_line(uart, "waiting for tcp client").await;
         socket.accept(port).await.map_err(|_| ())?;
+        let _ = writeln_line(uart, "tcp client connected").await;
+        if exchange_link_handshake(&mut socket, false).await.is_err() {
+            socket.abort();
+            let _ = socket.flush().await;
+            let _ = writeln_line(uart, "handshake failed").await;
+            LINK_ACTIVE.store(false, Ordering::Relaxed);
+            continue;
+        }
         LINK_ACTIVE.store(true, Ordering::Relaxed);
-        let _ = writeln_line(uart, "client connected").await;
+        let _ = writeln_line(uart, "link active").await;
 
-        let _ = spi_bridge_session(uart, &mut socket, spi).await;
+        let _ = spi_bridge_session(uart, &mut socket, spi, bridge_config).await;
         socket.abort();
         let _ = socket.flush().await;
         LINK_ACTIVE.store(false, Ordering::Relaxed);
@@ -639,6 +707,7 @@ async fn spi_bridge_session(
     uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
     spi: &mut UpstreamSpiDevice,
+    bridge_config: BridgeConfig,
 ) -> Result<(), ()> {
     let _ = writeln_line(
         uart,
@@ -646,6 +715,7 @@ async fn spi_bridge_session(
     )
     .await;
     let mut net_buf = [0u8; SPI_PAYLOAD_MAX];
+    let mut line_buf = String::<256>::new();
     spi.prepare_response_frame(&[]);
 
     loop {
@@ -663,7 +733,27 @@ async fn spi_bridge_session(
         if let Some(frame) = spi.poll_transaction() {
             if let Some(payload) = parse_spi_request_frame(frame) {
                 if !payload.is_empty() {
-                    write_socket(socket, payload).await?;
+                    let mut inbound = Vec::<u8, SPI_PAYLOAD_MAX>::new();
+                    let _ = inbound.extend_from_slice(payload);
+                    for &byte in inbound.iter() {
+                        match byte {
+                            b'\r' => {}
+                            b'\n' => {
+                                if line_buf.starts_with('/') {
+                                    let response = render_local_bridge_command(bridge_config, line_buf.as_str());
+                                    spi.prepare_response_frame(response.as_bytes());
+                                } else {
+                                    write_socket(socket, line_buf.as_bytes()).await?;
+                                    write_socket(socket, b"\n").await?;
+                                }
+                                line_buf.clear();
+                            }
+                            byte if byte.is_ascii() => {
+                                let _ = line_buf.push(byte as char);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             if socket.recv_queue() == 0 {
@@ -674,8 +764,107 @@ async fn spi_bridge_session(
     }
 }
 
+async fn exchange_link_handshake(socket: &mut TcpSocket<'_>, initiator: bool) -> Result<(), ()> {
+    let mut buf = [0u8; 7];
+
+    if initiator {
+        write_socket(socket, LINK_HANDSHAKE_MAGIC).await?;
+        match select(
+            read_socket_exact(socket, &mut buf),
+            Timer::after_millis(LINK_HANDSHAKE_TIMEOUT_MS),
+        )
+        .await
+        {
+            Either::First(Ok(())) if buf == LINK_HANDSHAKE_MAGIC => Ok(()),
+            _ => Err(()),
+        }
+    } else {
+        match select(
+            read_socket_exact(socket, &mut buf),
+            Timer::after_millis(LINK_HANDSHAKE_TIMEOUT_MS),
+        )
+        .await
+        {
+            Either::First(Ok(())) if buf == LINK_HANDSHAKE_MAGIC => {
+                write_socket(socket, LINK_HANDSHAKE_MAGIC).await
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+async fn handle_local_bridge_command_uart(
+    uart: &mut BufferedUart,
+    bridge_config: BridgeConfig,
+    line: &str,
+) -> Result<bool, ()> {
+    if !line.starts_with('/') {
+        return Ok(false);
+    }
+    let response = render_local_bridge_command(bridge_config, line);
+    writeln_line(uart, response.as_str()).await?;
+    Ok(true)
+}
+
+fn render_local_bridge_command(bridge_config: BridgeConfig, line: &str) -> String<192> {
+    let mut out = String::<192>::new();
+    match line {
+        "/help" => {
+            let _ = out.push_str("pico commands: /help /show /ping /link");
+        }
+        "/show" => {
+            let rendered = render_config(&bridge_config);
+            let _ = out.push_str(rendered.as_str());
+        }
+        "/ping" => {
+            let _ = out.push_str("pong");
+        }
+        "/link" => {
+            if LINK_ACTIVE.load(Ordering::Relaxed) {
+                let _ = out.push_str("link up");
+            } else {
+                let _ = out.push_str("link down");
+            }
+        }
+        _ => {
+            let _ = out.push_str("error unknown pico command");
+        }
+    }
+    out
+}
+
+async fn read_socket_exact(socket: &mut TcpSocket<'_>, mut buf: &mut [u8]) -> Result<(), ()> {
+    while !buf.is_empty() {
+        match socket.read(buf).await {
+            Ok(0) | Err(_) => return Err(()),
+            Ok(n) => buf = &mut buf[n..],
+        }
+    }
+    Ok(())
+}
+
+async fn connect_with_timeout(
+    socket: &mut TcpSocket<'_>,
+    remote: Ipv4Address,
+    port: u16,
+) -> Result<(), ()> {
+    match select(
+        socket.connect((remote, port)),
+        Timer::after_millis(LINK_CONNECT_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => Ok(()),
+        Either::First(Err(_)) | Either::Second(()) => {
+            socket.abort();
+            Err(())
+        }
+    }
+}
+
 impl UpstreamSpiDevice {
     fn prepare_response_frame(&mut self, payload: &[u8]) {
+        self.reset_spi_state();
         self.tx_frame.fill(0);
         self.rx_frame.fill(0);
         self.tx_frame[0] = 0x5a;
@@ -685,6 +874,21 @@ impl UpstreamSpiDevice {
         self.tx_idx = 0;
         self.rx_idx = 0;
         self.prime_tx_fifo();
+    }
+
+    fn reset_spi_state(&mut self) {
+        let p = rp_pac::SPI1;
+        p.cr1().modify(|w| w.set_sse(false));
+        while p.sr().read().rne() {
+            let _ = p.dr().read();
+        }
+        p.icr().write_value({
+            let mut w = rp_pac::spi::regs::Icr(0);
+            w.set_roric(true);
+            w.set_rtic(true);
+            w
+        });
+        p.cr1().modify(|w| w.set_sse(true));
     }
 
     fn prime_tx_fifo(&mut self) {
@@ -701,6 +905,11 @@ impl UpstreamSpiDevice {
 
     fn poll_transaction(&mut self) -> Option<&[u8; SPI_FRAME_SIZE]> {
         let p = rp_pac::SPI1;
+        if self.rx_idx > 0 && self.rx_idx < SPI_FRAME_SIZE && !p.sr().read().bsy() && !p.sr().read().rne() {
+            // The master released CS before a full framed exchange completed.
+            // Reset to the beginning of the canned response so the next transaction starts cleanly.
+            self.prepare_response_frame(&[]);
+        }
         self.prime_tx_fifo();
         while p.sr().read().rne() {
             let byte = p.dr().read().data() as u8;

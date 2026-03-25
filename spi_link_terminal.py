@@ -38,10 +38,28 @@ def parse_frame(frame: list[int]) -> bytes:
     return bytes(frame[2 : 2 + length])
 
 
+def print_help() -> None:
+    print("chat mode:")
+    print("  plain text   send to the remote peer")
+    print("  /help        ask the local Pico for command help")
+    print("  /show        show the local Pico config")
+    print("  /ping        ping the local Pico")
+    print("  /link        show the local Pico link state")
+    print("  //help       show this app help")
+    print("  //quit       exit the app")
+
+
 def stdin_thread(outbound: "queue.Queue[bytes]") -> None:
     while True:
         line = sys.stdin.readline()
         if line == "":
+            outbound.put(b"")
+            return
+        stripped = line.strip()
+        if stripped == "//help":
+            outbound.put(b"//__local_help__\n")
+            continue
+        if stripped == "//quit":
             outbound.put(b"")
             return
         outbound.put(line.encode("utf-8"))
@@ -66,7 +84,7 @@ def main() -> int:
 
     print(
         f"connected to /dev/spidev{args.bus}.{args.device} @ {args.speed}Hz mode{args.mode}. "
-        "type text and press Enter. Ctrl-C to exit."
+        "plain text chats with the remote peer. / commands talk to the local Pico. //help for app help."
     )
 
     try:
@@ -77,6 +95,9 @@ def main() -> int:
                     chunk = outbound.get_nowait()
                     if chunk == b"":
                         return 0
+                    if chunk == b"//__local_help__\n":
+                        print_help()
+                        continue
                     pending += chunk
             except queue.Empty:
                 pass

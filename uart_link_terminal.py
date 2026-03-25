@@ -28,11 +28,28 @@ def read_loop(ser: serial.Serial) -> None:
         sys.stdout.flush()
 
 
+def print_help() -> None:
+    print("chat mode:")
+    print("  plain text   send to the remote peer")
+    print("  /help        ask the local Pico for command help")
+    print("  /show        show the local Pico config")
+    print("  /ping        ping the local Pico")
+    print("  /link        show the local Pico link state")
+    print("  //help       show this app help")
+    print("  //quit       exit the app")
+
+
 def write_loop(ser: serial.Serial) -> int:
     try:
         while True:
             line = sys.stdin.readline()
             if line == "":
+                return 0
+            stripped = line.strip()
+            if stripped == "//help":
+                print_help()
+                continue
+            if stripped == "//quit":
                 return 0
             ser.write(line.encode("utf-8"))
             ser.flush()
@@ -63,7 +80,7 @@ def main() -> int:
             print(f"[{args.label}] connected to {args.port} @ {args.baud}")
         else:
             print(f"connected to {args.port} @ {args.baud}")
-        print("type text and press Enter. Ctrl-C to exit.")
+        print("plain text chats with the remote peer. / commands talk to the local Pico. //help for app help.")
 
         reader = threading.Thread(target=read_loop, args=(ser,), daemon=True)
         reader.start()
