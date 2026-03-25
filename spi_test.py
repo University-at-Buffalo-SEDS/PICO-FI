@@ -69,6 +69,13 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes) -> int:
     return 0 if ok else 1
 
 
+def encode_line_payload(text: str) -> bytes:
+    data = text.encode("utf-8")
+    if not data.endswith(b"\n"):
+        data += b"\n"
+    return data
+
+
 def format_bytes(values: list[int]) -> str:
     return " ".join(f"{value:02x}" for value in values)
 
@@ -89,6 +96,9 @@ def main() -> int:
     frame_parser = subparsers.add_parser("frame", help="Send one full framed request.")
     frame_parser.add_argument("payload", nargs="?", default="", help="ASCII payload to include in the frame.")
 
+    line_parser = subparsers.add_parser("line", help="Send one full framed line request ending in newline.")
+    line_parser.add_argument("text", help="ASCII line to send, for example '/ping' or 'hello'.")
+
     args = parser.parse_args()
 
     spi = spidev.SpiDev()
@@ -102,6 +112,8 @@ def main() -> int:
             return short_probe(spi, args.count, args.delay_ms / 1000.0)
         if args.command == "frame":
             return framed_exchange(spi, args.payload.encode("utf-8"))
+        if args.command == "line":
+            return framed_exchange(spi, encode_line_payload(args.text))
         parser.error("unknown command")
     finally:
         spi.close()

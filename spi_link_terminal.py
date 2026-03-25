@@ -69,7 +69,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Interactive SPI master terminal for the Pico SPI-slave bridge.")
     parser.add_argument("--bus", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--speed", type=int, default=200_000)
+    parser.add_argument("--speed", type=int, default=50_000)
     parser.add_argument("--mode", type=int, default=0)
     parser.add_argument("--poll-ms", type=int, default=50)
     args = parser.parse_args()
@@ -78,13 +78,15 @@ def main() -> int:
     spi.open(args.bus, args.device)
     spi.max_speed_hz = args.speed
     spi.mode = args.mode
+    spi.bits_per_word = 8
 
     outbound: "queue.Queue[bytes]" = queue.Queue()
     threading.Thread(target=stdin_thread, args=(outbound,), daemon=True).start()
 
     print(
         f"connected to /dev/spidev{args.bus}.{args.device} @ {args.speed}Hz mode{args.mode}. "
-        "plain text chats with the remote peer. / commands talk to the local Pico. //help for app help."
+        "plain text chats with the remote peer. / commands talk to the local Pico. "
+        "//help for app help."
     )
 
     try:
