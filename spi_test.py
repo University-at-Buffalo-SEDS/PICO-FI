@@ -66,17 +66,30 @@ def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
 def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) -> int:
     tx = build_frame(payload, magic)
     orig = tx[:]
-    rx = spi.xfer2(tx)
-    ok, length, body = parse_frame(rx)
+    rx_first = spi.xfer2(tx)
+    ok_first, length_first, body_first = parse_frame(rx_first)
+
+    # The Pico receives the request during this transfer and stages its reply
+    # for the next CS-bounded transaction.
+    rx_second = spi.xfer2(build_frame(b"", REQ_MAGIC))
+    ok_second, length_second, body_second = parse_frame(rx_second)
+
     print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
-    print(f"frame rx: {format_bytes(rx[: min(24, len(rx))])} ...")
-    print(f"valid response: {'yes' if ok else 'no'}")
-    print(f"declared length: {length}")
-    if body:
-        print(f"payload: {body.decode('utf-8', errors='replace')!r}")
+    print(f"frame rx1: {format_bytes(rx_first[: min(24, len(rx_first))])} ...")
+    print(f"frame rx2: {format_bytes(rx_second[: min(24, len(rx_second))])} ...")
+    print(f"valid response: {'yes' if ok_second else 'no'}")
+    print(f"declared length: {length_second}")
+    if magic == REQ_COMMAND_MAGIC:
+        print(
+            f"first transfer response: magic=0x{rx_first[0]:02x} len={length_first}"
+            if ok_first
+            else "first transfer response: invalid"
+        )
+    if body_second:
+        print(f"payload: {body_second.decode('utf-8', errors='replace')!r}")
     else:
         print("payload: b''")
-    return 0 if ok else 1
+    return 0 if ok_second else 1
 
 
 def encode_line_payload(text: str) -> bytes:
