@@ -55,9 +55,10 @@ def short_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
 
 def framed_exchange(spi: spidev.SpiDev, payload: bytes) -> int:
     tx = build_frame(payload)
+    orig = tx[:]
     rx = spi.xfer2(tx)
     ok, length, body = parse_frame(rx)
-    print(f"frame tx: {format_bytes(tx[: min(24, len(tx))])} ...")
+    print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
     print(f"frame rx: {format_bytes(rx[: min(24, len(rx))])} ...")
     print(f"valid response: {'yes' if ok else 'no'}")
     print(f"declared length: {length}")

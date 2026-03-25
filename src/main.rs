@@ -42,6 +42,7 @@ struct UpstreamSpiDevice {
     rx_frame: [u8; SPI_FRAME_SIZE],
     tx_idx: usize,
     rx_idx: usize,
+    cs_active: bool,
 }
 
 type WizRunner = embassy_net_wiznet::Runner<
@@ -547,6 +548,7 @@ fn init_upstream_spi(
         rx_frame: [0; SPI_FRAME_SIZE],
         tx_idx: 0,
         rx_idx: 0,
+        cs_active: false,
     };
     device.prepare_response_frame(&[]);
     device
@@ -864,19 +866,17 @@ async fn connect_with_timeout(
 
 impl UpstreamSpiDevice {
     fn prepare_response_frame(&mut self, payload: &[u8]) {
-        self.reset_spi_state();
         self.tx_frame.fill(0);
-        self.rx_frame.fill(0);
         self.tx_frame[0] = 0x5a;
         let len = payload.len().min(SPI_PAYLOAD_MAX);
         self.tx_frame[1] = len as u8;
         self.tx_frame[2..2 + len].copy_from_slice(&payload[..len]);
-        self.tx_idx = 0;
-        self.rx_idx = 0;
-        self.prime_tx_fifo();
+        if !self.cs_active {
+            self.begin_transaction();
+        }
     }
 
-    fn reset_spi_state(&mut self) {
+    fn begin_transaction(&mut self) {
         let p = rp_pac::SPI1;
         p.cr1().modify(|w| w.set_sse(false));
         while p.sr().read().rne() {
@@ -889,6 +889,14 @@ impl UpstreamSpiDevice {
             w
         });
         p.cr1().modify(|w| w.set_sse(true));
+        self.rx_frame.fill(0);
+        self.tx_idx = 0;
+        self.rx_idx = 0;
+        self.prime_tx_fifo();
+    }
+
+    fn cs_is_low(&self) -> bool {
+        !rp_pac::IO_BANK0.gpio(13).status().read().infrompad()
     }
 
     fn prime_tx_fifo(&mut self) {
@@ -905,11 +913,22 @@ impl UpstreamSpiDevice {
 
     fn poll_transaction(&mut self) -> Option<&[u8; SPI_FRAME_SIZE]> {
         let p = rp_pac::SPI1;
-        if self.rx_idx > 0 && self.rx_idx < SPI_FRAME_SIZE && !p.sr().read().bsy() && !p.sr().read().rne() {
-            // The master released CS before a full framed exchange completed.
-            // Reset to the beginning of the canned response so the next transaction starts cleanly.
-            self.prepare_response_frame(&[]);
+        let cs_low = self.cs_is_low();
+
+        if cs_low && !self.cs_active {
+            self.cs_active = true;
+            self.begin_transaction();
+        } else if !cs_low && self.cs_active {
+            self.cs_active = false;
+            // Re-arm the canned response for the next CS-bounded transaction.
+            self.begin_transaction();
+            return None;
         }
+
+        if !self.cs_active {
+            return None;
+        }
+
         self.prime_tx_fifo();
         while p.sr().read().rne() {
             let byte = p.dr().read().data() as u8;
