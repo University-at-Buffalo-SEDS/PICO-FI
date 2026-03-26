@@ -278,15 +278,9 @@ async fn session(
                     write_socket(socket, payload).await?;
                 }
                 Some(RequestFrame::Command(payload)) => {
-                    let response = render_local_bridge_command(
-                        bridge_config,
-                        link_active,
-                        trim_ascii_line(payload),
-                    );
-                    // Send command response back through SPI
-                    let resp = SpiFrame {
-                        data: make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()),
-                    };
+                    let command = trim_ascii_line(payload);
+                    // Use direct byte array response builder (same as process_spi_commands)
+                    let resp = build_command_response_frame(command, link_active);
                     let _ = spi_tx.try_send(resp);
                 }
                 _ => {}
@@ -294,6 +288,41 @@ async fn session(
         }
         yield_now().await;
     }
+}
+
+/// Helper to build response frames directly with byte arrays, avoiding heapless::String
+fn build_command_response_frame(command: &str, link_active: &AtomicBool) -> SpiFrame {
+    let mut data = [0u8; FRAME_SIZE];
+
+    // Explicitly set response text based on command
+    let response_text: &[u8] = if command == "/ping" {
+        b"pong"
+    } else if command == "/link" {
+        if link_active.load(Ordering::Relaxed) {
+            b"link up"
+        } else {
+            b"link down"
+        }
+    } else if command == "/help" {
+        b"pico commands: /help /show /ping /link"
+    } else if command == "/show" {
+        b"config"
+    } else {
+        b"error unknown pico command"
+    };
+
+    // Set magic byte and length
+    data[0] = RESP_COMMAND_MAGIC;
+    let len = response_text.len();
+    data[1] = len as u8;
+
+    // Explicitly copy each byte to ensure it's written
+    for idx in 0..len {
+        data[idx + 2] = response_text[idx];
+    }
+
+    // Ensure the frame is returned with all bytes set
+    SpiFrame { data }
 }
 
 /// Helper function that processes SPI command requests and sends responses back.
@@ -308,15 +337,9 @@ async fn process_spi_commands(
     if let Ok(frame) = spi_rx.try_receive() {
         match parse_request_frame(&frame.data) {
             Some(RequestFrame::Command(payload)) => {
-                let response = render_local_bridge_command(
-                    bridge_config,
-                    link_active,
-                    trim_ascii_line(payload),
-                );
-                // Send command response back through SPI
-                let resp = SpiFrame {
-                    data: make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()),
-                };
+                let command = trim_ascii_line(payload);
+                // Build response directly without going through heapless::String
+                let resp = build_command_response_frame(command, link_active);
                 let _ = spi_tx.try_send(resp);
             }
             Some(RequestFrame::Data(payload)) if !payload.is_empty() => {
@@ -331,10 +354,9 @@ impl UpstreamSpiDevice {
     /// Stages a complete response frame for the next SPI transaction.
     /// This is called by the SPI polling task when core 0 sends a response.
     pub fn stage_response_frame(&mut self, frame: [u8; FRAME_SIZE]) {
-        self.clear_after_transaction = frame[1] != 0;
         self.tx_frame = frame;
-        // Always rearm to ensure frame is loaded into TX FIFO
-        // The next CS assertion will use this frame
+        // Always call rearm when not in active transaction
+        // This ensures the frame is properly loaded into the FIFO
         if !self.cs_active {
             self.rearm_transaction();
         }
@@ -342,12 +364,9 @@ impl UpstreamSpiDevice {
 
     /// Stages a response frame for the next SPI transaction.
     fn prepare_response_frame(&mut self, magic: u8, payload: &[u8]) {
-        self.clear_after_transaction = !payload.is_empty();
-        self.tx_frame.fill(0);
-        self.tx_frame[0] = magic;
-        let len = payload.len().min(PAYLOAD_MAX);
-        self.tx_frame[1] = len as u8;
-        self.tx_frame[2..2 + len].copy_from_slice(&payload[..len]);
+        // Use the public make_response_frame to ensure consistency
+        let frame = make_response_frame(magic, payload);
+        self.tx_frame = frame;
         if !self.cs_active {
             self.rearm_transaction();
         }
@@ -394,16 +413,7 @@ impl UpstreamSpiDevice {
 
     /// Finalizes the current CS-bounded transaction and prepares for the next one.
     fn finish_transaction(&mut self) {
-        // Rearm FIRST to load current tx_frame into the hardware FIFO
         self.rearm_transaction();
-
-        // THEN clear for single-shot responses
-        if self.clear_after_transaction {
-            self.clear_after_transaction = false;
-            self.tx_frame.fill(0);
-            self.tx_frame[0] = RESP_DATA_MAGIC;
-            self.tx_frame[1] = 0;
-        }
     }
 
     /// Preloads as many bytes as possible into the hardware TX FIFO.

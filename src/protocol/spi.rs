@@ -44,10 +44,45 @@ pub fn parse_request_frame(frame: &[u8; FRAME_SIZE]) -> Option<RequestFrame<'_>>
 /// Builds a response frame with the given magic byte and payload.
 pub fn make_response_frame(magic: u8, payload: &[u8]) -> [u8; FRAME_SIZE] {
     let mut frame = [0u8; FRAME_SIZE];
-    let len = payload.len().min(PAYLOAD_MAX);
+
+    // Ensure frame is completely zeroed
+    for i in 0..FRAME_SIZE {
+        frame[i] = 0;
+    }
+
+    // Set magic byte
     frame[0] = magic;
+
+    // Calculate and set length
+    let len = if payload.len() > PAYLOAD_MAX {
+        PAYLOAD_MAX
+    } else {
+        payload.len()
+    };
     frame[1] = len as u8;
-    frame[2..2 + len].copy_from_slice(&payload[..len]);
+
+    // Copy payload
+    if len > 0 {
+        for i in 0..len {
+            frame[2 + i] = payload[i];
+        }
+    }
+
     frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_response_frame() {
+        let payload = b"pong";
+        let frame = make_response_frame(RESP_COMMAND_MAGIC, payload);
+        assert_eq!(frame[0], RESP_COMMAND_MAGIC);
+        assert_eq!(frame[1], 4);
+        assert_eq!(&frame[2..6], b"pong");
+        assert_eq!(frame[6], 0);  // Rest should be zero
+    }
 }
 
