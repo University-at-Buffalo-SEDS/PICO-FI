@@ -43,8 +43,25 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
 def parse_frame(frame: list[int]) -> tuple[int, bytes]:
     if len(frame) != FRAME_SIZE or frame[0] not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
         return 0, b""
-    length = min(frame[1], PAYLOAD_MAX)
-    return frame[0], bytes(frame[2 : 2 + length])
+    
+    magic = frame[0]
+    length_byte = frame[1]
+    
+    # If length is 0xFF or clearly invalid, detect actual data end
+    if length_byte == 0xFF:
+        # Find the first null byte or control character that indicates end
+        for i in range(PAYLOAD_MAX):
+            byte_val = frame[2 + i]
+            if byte_val == 0x00 or (byte_val < 0x20 and byte_val not in (0x0A, 0x0D, 0x09)):
+                length = i
+                break
+        else:
+            length = 0  # All bytes were invalid, treat as empty
+    else:
+        length = min(length_byte, PAYLOAD_MAX)
+    
+    payload = bytes(frame[2 : 2 + length])
+    return magic, payload
 
 
 def print_payload(prompt: "PromptState", payload: bytes) -> None:
@@ -69,12 +86,14 @@ def exchange_frame(
     if magic != REQ_COMMAND_MAGIC:
         return
 
-    for _ in range(command_timeout_polls):
+    # For commands, keep polling until we get a response with actual content (0x5B magic)
+    for poll_num in range(command_timeout_polls):
         time.sleep(poll_delay_s)
         rx_magic, rx_payload = parse_frame(spi.xfer2(build_frame(b"")))
         if rx_payload:
             print_payload(prompt, rx_payload)
-        if rx_magic == RESP_COMMAND_MAGIC:
+        # Stop if we got a command response (0x5B) with content
+        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
             return
     prompt.print_line("[pico] command timed out waiting for SPI reply")
 

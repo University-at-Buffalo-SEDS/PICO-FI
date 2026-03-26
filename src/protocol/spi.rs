@@ -40,3 +40,14 @@ pub fn parse_request_frame(frame: &[u8; FRAME_SIZE]) -> Option<RequestFrame<'_>>
         _ => None,
     }
 }
+
+/// Builds a response frame with the given magic byte and payload.
+pub fn make_response_frame(magic: u8, payload: &[u8]) -> [u8; FRAME_SIZE] {
+    let mut frame = [0u8; FRAME_SIZE];
+    let len = payload.len().min(PAYLOAD_MAX);
+    frame[0] = magic;
+    frame[1] = len as u8;
+    frame[2..2 + len].copy_from_slice(&payload[..len]);
+    frame
+}
+

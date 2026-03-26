@@ -2,10 +2,12 @@
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::runtime::BridgeRuntime;
+use crate::bridge::spi_task::SpiFrame;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
 use crate::protocol::spi::{
-    FRAME_SIZE, PAYLOAD_MAX, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, parse_request_frame,
+    FRAME_SIZE, PAYLOAD_MAX, RESP_DATA_MAGIC, RESP_COMMAND_MAGIC, RequestFrame, parse_request_frame,
+    make_response_frame,
 };
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
@@ -15,6 +17,8 @@ use embassy_rp::Peri;
 use embassy_rp::peripherals::{PIN_10, PIN_11, PIN_12, PIN_13, SPI1};
 use embassy_rp::uart::BufferedUart;
 use embassy_rp::PeripheralType;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
 use embedded_hal::spi::MODE_0;
 use embedded_hal_nb::spi::FullDuplex;
@@ -133,7 +137,9 @@ pub async fn run_client(
     stack: Stack<'static>,
     host: [u8; 4],
     port: u16,
-    spi: &mut UpstreamSpiDevice,
+    _spi: Option<&mut UpstreamSpiDevice>,
+    spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
@@ -147,13 +153,18 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
-            .await
-            .is_err()
-        {
+
+        // Try to connect while also processing SPI commands
+        loop {
+            // Process any pending SPI commands while waiting for connection
+            process_spi_commands(&spi_rx, &spi_tx, bridge_config, runtime.link_active).await;
+
+            if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms).await.is_ok() {
+                break;
+            }
             Timer::after_millis(runtime.reconnect_delay_ms).await;
-            continue;
         }
+
         if exchange_link_handshake(
             &mut socket,
             true,
@@ -170,7 +181,7 @@ pub async fn run_client(
         }
         runtime.link_active.store(true, Ordering::Relaxed);
 
-        let _ = session(uart, &mut socket, spi, bridge_config, runtime.link_active).await;
+        let _ = session(uart, &mut socket, spi_rx, spi_tx, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -183,7 +194,9 @@ pub async fn run_server(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
     port: u16,
-    spi: &mut UpstreamSpiDevice,
+    _spi: Option<&mut UpstreamSpiDevice>,
+    spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
@@ -193,7 +206,19 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        socket.accept(port).await.map_err(|_| ())?;
+        // Wait for TCP connection while still processing SPI commands
+        loop {
+            // Process any pending SPI commands (e.g., /ping) even before TCP connects
+            process_spi_commands(&spi_rx, &spi_tx, bridge_config, runtime.link_active).await;
+
+            // Try to accept with a short timeout so we don't starve SPI processing
+            if socket.accept(port).await.is_ok() {
+                break;
+            }
+
+            yield_now().await;
+        }
+
         if exchange_link_handshake(
             &mut socket,
             false,
@@ -210,7 +235,7 @@ pub async fn run_server(
         }
         runtime.link_active.store(true, Ordering::Relaxed);
 
-        let _ = session(uart, &mut socket, spi, bridge_config, runtime.link_active).await;
+        let _ = session(uart, &mut socket, spi_rx, spi_tx, bridge_config, runtime.link_active).await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -218,15 +243,17 @@ pub async fn run_server(
 }
 
 /// Bridges framed SPI transactions to the TCP socket.
+/// Receives SPI frames from core 1 via channel instead of polling directly.
+/// Sends response frames back to core 1 via a separate channel.
 async fn session(
     _uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
-    spi: &mut UpstreamSpiDevice,
+    spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; PAYLOAD_MAX];
-    spi.prepare_response_frame(RESP_DATA_MAGIC, &[]);
 
     loop {
         if !socket.may_recv() && !socket.can_recv() {
@@ -237,11 +264,16 @@ async fn session(
             if net_n == 0 {
                 return Ok(());
             }
-            spi.prepare_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n.min(PAYLOAD_MAX)]);
+            // Send network data back through SPI as a data response
+            let resp = SpiFrame {
+                data: make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
+            };
+            let _ = spi_tx.try_send(resp);
         }
 
-        if let Some(frame) = spi.poll_transaction() {
-            match parse_request_frame(frame) {
+        // Receive frames from core 1 via channel instead of polling
+        if let Ok(frame) = spi_rx.try_receive() {
+            match parse_request_frame(&frame.data) {
                 Some(RequestFrame::Data(payload)) if !payload.is_empty() => {
                     write_socket(socket, payload).await?;
                 }
@@ -251,17 +283,61 @@ async fn session(
                         link_active,
                         trim_ascii_line(payload),
                     );
-                    spi.prepare_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
+                    // Send command response back through SPI
+                    let resp = SpiFrame {
+                        data: make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()),
+                    };
+                    let _ = spi_tx.try_send(resp);
                 }
                 _ => {}
             }
-            spi.clear_pending_frame();
         }
         yield_now().await;
     }
 }
 
+/// Helper function that processes SPI command requests and sends responses back.
+/// This runs independently of the TCP session so local commands are always handled.
+async fn process_spi_commands(
+    spi_rx: &Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_tx: &Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+) {
+    // Check if there's a command frame waiting
+    if let Ok(frame) = spi_rx.try_receive() {
+        match parse_request_frame(&frame.data) {
+            Some(RequestFrame::Command(payload)) => {
+                let response = render_local_bridge_command(
+                    bridge_config,
+                    link_active,
+                    trim_ascii_line(payload),
+                );
+                // Send command response back through SPI
+                let resp = SpiFrame {
+                    data: make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()),
+                };
+                let _ = spi_tx.try_send(resp);
+            }
+            Some(RequestFrame::Data(payload)) if !payload.is_empty() => {
+                // Data frames are only processed when connected, so discard them
+            }
+            _ => {}
+        }
+    }
+}
+
 impl UpstreamSpiDevice {
+    /// Stages a complete response frame for the next SPI transaction.
+    /// This is called by the SPI polling task when core 0 sends a response.
+    pub fn stage_response_frame(&mut self, frame: [u8; FRAME_SIZE]) {
+        self.clear_after_transaction = frame[1] != 0;
+        self.tx_frame = frame;
+        if !self.cs_active {
+            self.rearm_transaction();
+        }
+    }
+
     /// Stages a response frame for the next SPI transaction.
     fn prepare_response_frame(&mut self, magic: u8, payload: &[u8]) {
         self.clear_after_transaction = !payload.is_empty();
@@ -276,7 +352,7 @@ impl UpstreamSpiDevice {
     }
 
     /// Polls one CS-bounded transaction and yields a complete frame once captured.
-    fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
+    pub fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
         if self.pending_frame.is_some() {
             return self.pending_frame.as_ref();
         }
@@ -301,7 +377,7 @@ impl UpstreamSpiDevice {
     }
 
     /// Marks the currently pending frame as consumed by the bridge loop.
-    fn clear_pending_frame(&mut self) {
+    pub fn clear_pending_frame(&mut self) {
         self.pending_frame = None;
     }
 

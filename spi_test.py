@@ -34,10 +34,28 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
 def parse_frame(frame: list[int]) -> tuple[int, int, bytes]:
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
-    if frame[0] not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+    magic = frame[0]
+    if magic not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
         return 0, frame[1] if len(frame) > 1 else 0, b""
-    length = min(frame[1], PAYLOAD_MAX)
-    return frame[0], length, bytes(frame[2 : 2 + length])
+    
+    # Parse length byte - if it's 0xFF or clearly invalid, it might be uninitialized
+    length_byte = frame[1]
+    length = min(length_byte, PAYLOAD_MAX)
+    
+    # Extract payload and filter out invalid UTF-8
+    raw_payload = bytes(frame[2 : 2 + length])
+    
+    # If length is suspiciously large (0xFF) or all bytes are the same (0xFF pattern),
+    # try to detect actual end of valid data
+    if length_byte == 0xFF and raw_payload:
+        # Find the first null byte or pattern change
+        for i, byte_val in enumerate(raw_payload):
+            if byte_val == 0x00 or byte_val < 0x20 and byte_val != 0x0A and byte_val != 0x0D:
+                length = i
+                raw_payload = raw_payload[:i]
+                break
+    
+    return magic, length, raw_payload
 
 
 def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
@@ -79,7 +97,8 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
         resp_magic, resp_len, resp_body = parse_frame(rx)
         responses.append((resp_magic, rx, resp_len, resp_body))
         if magic == REQ_COMMAND_MAGIC:
-            if resp_magic == RESP_COMMAND_MAGIC:
+            # For commands, keep polling until we get a 0x5B response with actual content
+            if resp_magic == RESP_COMMAND_MAGIC and resp_len > 0:
                 break
         elif resp_magic in (RESP_MAGIC, RESP_COMMAND_MAGIC):
             break
@@ -94,7 +113,11 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
             if magic_first
             else "first transfer response: invalid"
         )
-        final = next(((m, l, b) for m, _, l, b in responses if m == RESP_COMMAND_MAGIC), None)
+        # Look for a valid command response (0x5B with non-zero length and non-garbage data)
+        final = next(
+            ((m, l, b) for m, _, l, b in responses if m == RESP_COMMAND_MAGIC and l > 0),
+            None
+        )
     else:
         final = next(((m, l, b) for m, _, l, b in responses if m in (RESP_MAGIC, RESP_COMMAND_MAGIC)), None)
     valid = final is not None
@@ -103,7 +126,11 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
     print(f"response magic: 0x{final_magic:02x}")
     print(f"declared length: {final_len}")
     if final_body:
-        print(f"payload: {final_body.decode('utf-8', errors='replace')!r}")
+        try:
+            decoded = final_body.decode('utf-8', errors='replace')
+            print(f"payload: {decoded!r}")
+        except Exception:
+            print(f"payload: {final_body.hex()}")
     else:
         print("payload: b''")
     return 0 if valid else 1
