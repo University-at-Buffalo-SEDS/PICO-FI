@@ -1,6 +1,7 @@
 //! Bridge implementations for each upstream role.
 
 pub mod commands;
+pub mod i2c;
 pub mod runtime;
 pub mod spi;
 pub mod spi_task;
