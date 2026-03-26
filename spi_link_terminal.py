@@ -46,6 +46,11 @@ def parse_frame(frame: list[int]) -> tuple[int, bytes]:
     if len(frame) != FRAME_SIZE:
         return 0, b""
     
+    # Detect garbage frame (mostly 0xFF)
+    ff_count = sum(1 for b in frame if b == 0xFF)
+    if ff_count > len(frame) * 0.8:
+        return 0, b""
+    
     # Collect all consecutive non-zero bytes from the response
     response_bytes = bytearray()
     for byte_val in frame:

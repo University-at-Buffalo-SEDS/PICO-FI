@@ -1,6 +1,6 @@
 //! SPI upstream bridge implementation and SPI slave framing state.
 
-use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::commands::{trim_ascii_line};
 use crate::bridge::runtime::BridgeRuntime;
 use crate::bridge::spi_task::SpiFrame;
 use crate::config::BridgeConfig;
@@ -253,7 +253,7 @@ async fn session(
     socket: &mut TcpSocket<'_>,
     spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    bridge_config: BridgeConfig,
+    _bridge_config: BridgeConfig,
     link_active: &AtomicBool,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; PAYLOAD_MAX];
@@ -294,7 +294,7 @@ async fn session(
 }
 
 /// Helper to build response frames directly with byte arrays, avoiding heapless::String
-fn build_command_response_frame(command: &str, link_active: &AtomicBool) -> SpiFrame {
+fn build_command_response_frame(command: &str, _link_active: &AtomicBool) -> SpiFrame {
     let mut data = [0u8; FRAME_SIZE];
 
     // Diagnostic: show what we received
@@ -344,7 +344,7 @@ fn build_command_response_frame(command: &str, link_active: &AtomicBool) -> SpiF
 async fn process_spi_commands(
     spi_rx: &Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     spi_tx: &Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    bridge_config: BridgeConfig,
+    _bridge_config: BridgeConfig,
     link_active: &AtomicBool,
 ) {
     // Check if there's a command frame waiting
@@ -368,14 +368,14 @@ impl UpstreamSpiDevice {
     /// Stages a complete response frame for the next SPI transaction.
     /// This is called by the SPI polling task when core 0 sends a response.
     pub fn stage_response_frame(&mut self, frame: [u8; FRAME_SIZE]) {
-        self.tx_frame = frame;
-        // Reset offset so new response starts from byte 0
-        self.tx_response_offset = 0;
-        // Always call rearm when not in active transaction
-        // This ensures the frame is properly loaded into the FIFO
-        if !self.cs_active {
-            self.rearm_transaction();
+        // Validate frame has valid magic byte
+        let magic = frame[0];
+        if magic == 0x5A || magic == 0x5B {
+            // Valid response frame
+            self.tx_frame = frame;
+            self.tx_response_offset = 0;
         }
+        // Otherwise keep current response (don't corrupt with garbage)
     }
 
     /// Stages a response frame for the next SPI transaction.
@@ -383,86 +383,93 @@ impl UpstreamSpiDevice {
         // Use the public make_response_frame to ensure consistency
         let frame = make_response_frame(magic, payload);
         self.tx_frame = frame;
-        if !self.cs_active {
-            self.rearm_transaction();
-        }
+        self.tx_response_offset = 0;
     }
 
     /// Polls one CS-bounded transaction and yields a complete frame once captured.
+    /// Waits for CS to go LOW (transaction start), collects all bytes while LOW,
+    /// then waits for CS to go HIGH before returning the complete frame.
     pub fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
         if self.pending_frame.is_some() {
             return self.pending_frame.as_ref();
         }
 
+        // Wait for CS to assert (go LOW)
         if !self.cs_is_low() {
             return None;
         }
 
+        // CS is LOW - transaction starting
         self.cs_active = true;
-        while self.cs_is_low() {
+
+        // Continuously drain RX and refill TX while CS is held LOW
+        loop {
+            // Drain any received bytes into our frame
             self.drain_rx_fifo();
-            // Continuously refill TX FIFO during transaction
-            // This handles the case where TX FIFO can only hold 1-2 bytes
+
+            // Keep TX FIFO filled to prevent 0xFF garbage
             self.prefill_tx_fifo();
+
+            // Check if CS is still low
+            if !self.cs_is_low() {
+                break;
+            }
         }
+
+        // CS went HIGH - transaction is complete
         self.cs_active = false;
+
+        // Final drain to catch any last bytes
         self.drain_rx_fifo();
 
+        // Reset TX offset for next transaction
+        self.tx_response_offset = 0;
+
+        // Return frame if we collected bytes
         if self.rx_len > 0 {
             self.pending_frame = Some(self.rx_frame);
         }
-        self.finish_transaction();
+
         self.pending_frame.as_ref()
     }
 
     /// Marks the currently pending frame as consumed by the bridge loop.
     pub fn clear_pending_frame(&mut self) {
         self.pending_frame = None;
-        // Clear the frame now that it's been consumed
+        // Clear frame data for next transaction
         self.rx_frame.fill(0);
         self.rx_len = 0;
     }
 
-    /// Reinitializes counters and preloads the next response bytes into the TX FIFO.
-    /// NOTE: Does NOT clear rx_frame or reset rx_len - bytes accumulate across transactions
-    /// until poll_transaction() returns a frame and it's consumed
-    fn rearm_transaction(&mut self) {
-        self.reset_hw_fifos();
-        // Keep rx_frame and rx_len - they accumulate across multiple SPI transactions
-        // since each transaction with 1-byte FIFO only reads 1 byte at a time
-        self.tx_len = 0;
-        self.prefill_tx_fifo();
-    }
-
-    /// Finalizes the current CS-bounded transaction and prepares for the next one.
-    fn finish_transaction(&mut self) {
-        self.rearm_transaction();
-    }
-
     /// Preloads bytes into the hardware TX FIFO for chunked response transmission.
     /// Sends bytes until FIFO is full (max 8 bytes in hardware FIFO).
-    /// This allows the master to read multiple bytes per transaction.
+    /// CRITICAL: Only loads valid bytes from tx_frame based on tx_response_offset
     fn prefill_tx_fifo(&mut self) {
         let p = rp_pac::SPI1;
 
-        // Fill FIFO until it's full (hardware SPI1 has 8-byte FIFO on RP2040)
+        // Check FIFO can accept more
         loop {
-            if self.tx_response_offset >= FRAME_SIZE {
-                // Response complete, cycle back to start
-                self.tx_response_offset = 0;
-            }
-
             let sr = p.sr().read();
-            if sr.tnf() {
-                // Write byte directly to data register
-                let byte = self.tx_frame[self.tx_response_offset];
-                p.dr().write_value(rp_pac::spi::regs::Dr(byte as u32));
-                self.tx_response_offset += 1;
-                self.tx_len += 1;
-            } else {
+            if !sr.tnf() {
                 // FIFO is full
                 break;
             }
+
+            // Make sure offset is valid
+            if self.tx_response_offset >= FRAME_SIZE {
+                // Cycle back to start (shouldn't happen for normal single-frame responses)
+                self.tx_response_offset = 0;
+            }
+
+            // Get byte from frame at current offset
+            let byte = self.tx_frame[self.tx_response_offset];
+
+            // Write to SPI data register
+            p.dr().write_value(rp_pac::spi::regs::Dr(byte as u32));
+
+            // Advance offset
+            self.tx_response_offset += 1;
+            self.tx_len += 1;
         }
     }
 

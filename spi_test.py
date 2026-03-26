@@ -32,11 +32,25 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
     return frame
 
 
+def is_garbage_frame(frame: list[int]) -> bool:
+    """Detect if frame is garbage (mostly 0xFF or uninitialized)"""
+    # Count FF bytes
+    ff_count = sum(1 for b in frame if b == 0xFF)
+    # If more than 80% are 0xFF, it's garbage
+    if ff_count > len(frame) * 0.8:
+        return True
+    return False
+
+
 def parse_frame(frame: list[int]) -> tuple[int, int, bytes]:
     """Extract all non-zero bytes from RX buffer returned from one SPI transaction"""
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
     
+    # Check for garbage frame
+    if is_garbage_frame(frame):
+        return 0, 0, b""
+
     # Collect all consecutive non-zero bytes from the response
     # The hardware FIFO fills up with bytes, and we extract all of them
     response_bytes = bytearray()
@@ -73,79 +87,95 @@ def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
 
 
 def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) -> int:
-    tx = build_frame(payload, magic)
-    orig = tx[:]
-    
-    # Send request and get first response transaction
-    rx_first = spi.xfer2(tx)
-    magic_first, len_first, body_first = parse_frame(rx_first)
-    
-    # Collect all response bytes across multiple transactions
-    response_bytes = bytearray()
-    response_bytes.extend(body_first)  # Add bytes from first transaction
-    
-    responses: list[tuple[int, list[int], int, bytes]] = []
-    responses.append((magic_first, rx_first, len_first, body_first))
-    
-    # For command responses, poll multiple times to collect all bytes
-    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 50
-    
-    for idx in range(poll_count - 1):  # -1 because we already have first response
-        if magic == REQ_COMMAND_MAGIC:
-            time.sleep(0.01)  # Small delay between polls
+    # Retry up to 3 times if we get corrupted responses
+    for attempt in range(3):
+        tx = build_frame(payload, magic)
+        orig = tx[:]
         
-        rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
-        resp_magic, resp_len, resp_body = parse_frame(rx)
-        responses.append((resp_magic, rx, resp_len, resp_body))
+        # Send request and get first response transaction
+        rx_first = spi.xfer2(tx)
+        magic_first, len_first, body_first = parse_frame(rx_first)
         
-        if resp_body:
-            response_bytes.extend(resp_body)
+        # Collect all response bytes across multiple transactions
+        response_bytes = bytearray()
+        response_bytes.extend(body_first)  # Add bytes from first transaction
         
-        # Check if we have magic + length + all data
+        responses: list[tuple[int, list[int], int, bytes]] = []
+        responses.append((magic_first, rx_first, len_first, body_first))
+        
+        # For command responses, poll multiple times to collect all bytes
+        poll_count = 1 if magic != REQ_COMMAND_MAGIC else 50
+        
+        for idx in range(poll_count - 1):  # -1 because we already have first response
+            if magic == REQ_COMMAND_MAGIC:
+                time.sleep(0.01)  # Small delay between polls
+            
+            rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
+            resp_magic, resp_len, resp_body = parse_frame(rx)
+            responses.append((resp_magic, rx, resp_len, resp_body))
+            
+            if resp_body:
+                response_bytes.extend(resp_body)
+            
+            # Check if we have magic + length + all data
+            if len(response_bytes) >= 2:
+                response_magic = response_bytes[0]
+                response_length = response_bytes[1]
+                # If we have the full response (magic + length + data), we can stop
+                if len(response_bytes) >= response_length + 2:
+                    break
+        
+        # Validate response - check for garbage
         if len(response_bytes) >= 2:
             response_magic = response_bytes[0]
             response_length = response_bytes[1]
-            # If we have the full response (magic + length + data), we can stop
-            if len(response_bytes) >= response_length + 2:
-                break
-    
-    print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
-    print(f"frame rx1: {format_bytes(rx_first[: min(24, len(rx_first))])} ...")
-    for idx, (resp_magic, rx, resp_len, _) in enumerate(responses[1:], start=2):
-        print(f"frame rx{idx}: {format_bytes(rx[: min(24, len(rx))])} ...")
-    
-    if magic == REQ_COMMAND_MAGIC:
-        print(
-            f"first transfer response: magic=0x{magic_first:02x} len={len_first}"
-            if magic_first
-            else "first transfer response: invalid"
-        )
-    
-    # Parse collected response bytes
-    valid = False
-    response_magic = 0
-    response_length = 0
-    final_body = b""
-    
-    if len(response_bytes) >= 2:
-        response_magic = response_bytes[0]
-        response_length = response_bytes[1]
-        if len(response_bytes) > 2:
-            final_body = bytes(response_bytes[2:2 + response_length])
+            
+            # Check for corruption - if declared length is 0xFF or invalid, retry
+            if response_length == 0xFF or response_length > PAYLOAD_MAX:
+                print(f"[Attempt {attempt + 1}] Bad response (invalid length: {response_length}), retrying...")
+                time.sleep(0.1)
+                continue
+            
+            if len(response_bytes) > 2:
+                final_body = bytes(response_bytes[2:2 + response_length])
+            else:
+                final_body = b""
+        else:
+            print(f"[Attempt {attempt + 1}] No valid response, retrying...")
+            time.sleep(0.1)
+            continue
+        
+        # If we got here, response looks valid
+        print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
+        print(f"frame rx1: {format_bytes(rx_first[: min(24, len(rx_first))])} ...")
+        for idx, (resp_magic, rx, resp_len, _) in enumerate(responses[1:], start=2):
+            print(f"frame rx{idx}: {format_bytes(rx[: min(24, len(rx))])} ...")
+        
+        if magic == REQ_COMMAND_MAGIC:
+            print(
+                f"first transfer response: magic=0x{response_magic:02x} len={response_length}"
+                if response_magic
+                else "first transfer response: invalid"
+            )
+        
         valid = response_magic in (RESP_MAGIC, RESP_COMMAND_MAGIC)
+        print(f"valid response: {'yes' if valid else 'no'}")
+        print(f"response magic: 0x{response_magic:02x}")
+        print(f"declared length: {response_length}")
+        if final_body:
+            try:
+                decoded = final_body.decode('utf-8', errors='replace')
+                print(f"payload: {decoded!r}")
+            except Exception:
+                print(f"payload: {final_body.hex()}")
+        else:
+            print("payload: b''")
+        
+        return 0 if valid else 1
     
-    print(f"valid response: {'yes' if valid else 'no'}")
-    print(f"response magic: 0x{response_magic:02x}")
-    print(f"declared length: {response_length}")
-    if final_body:
-        try:
-            decoded = final_body.decode('utf-8', errors='replace')
-            print(f"payload: {decoded!r}")
-        except Exception:
-            print(f"payload: {final_body.hex()}")
-    else:
-        print("payload: b''")
-    return 0 if valid else 1
+    # All retries failed
+    print("ERROR: Failed to get valid response after 3 attempts - SPI communication unreliable")
+    return 1
 
 
 def encode_line_payload(text: str) -> bytes:
