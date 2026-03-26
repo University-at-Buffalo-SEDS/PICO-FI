@@ -4,7 +4,14 @@
 import argparse
 import time
 
-from .raw import CHUNK_SIZE, open_bus
+try:
+    from .raw import CHUNK_SIZE, open_bus
+except ImportError:
+    import os
+    import sys
+
+    sys.path.append(os.path.dirname(__file__))
+    from raw import CHUNK_SIZE, open_bus
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2

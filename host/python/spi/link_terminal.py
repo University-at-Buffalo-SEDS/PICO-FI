@@ -16,7 +16,13 @@ import time
 import tty
 from dataclasses import dataclass, field
 
-from .raw import FRAME_SIZE, open_bus
+try:
+    from .raw import FRAME_SIZE, open_bus
+except ImportError:
+    import os
+
+    sys.path.append(os.path.dirname(__file__))
+    from raw import FRAME_SIZE, open_bus
 
 PAYLOAD_MAX = FRAME_SIZE - 2
 REQ_MAGIC = 0xA5

@@ -3,7 +3,13 @@
 
 import sys
 
-from .raw import open_bus
+try:
+    from .raw import open_bus
+except ImportError:
+    import os
+
+    sys.path.append(os.path.dirname(__file__))
+    from raw import open_bus
 
 BUS_NUM = 1
 ADDR = 0x55
