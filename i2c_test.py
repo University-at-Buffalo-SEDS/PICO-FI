@@ -75,30 +75,27 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         print(f"Sending to I2C addr 0x{I2C_ADDR:02x}...")
         print(f"Sent: {format_bytes(tx)}...")
         
-        # I2C has 32-byte limit, so send in chunks
+        # Send frame in 32-byte chunks
         CHUNK_SIZE = 32
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
             chunk = tx[i:i+CHUNK_SIZE]
             try:
-                # Try SMBus write_i2c_block_data with register 0
                 bus.write_i2c_block_data(I2C_ADDR, 0, list(chunk))
             except TypeError:
-                # Fallback: write byte by byte if API differs
+                # Fallback: write byte by byte
                 for byte in chunk:
                     bus.write_byte(I2C_ADDR, byte)
             time.sleep(0.01)
         
         time.sleep(0.1)
         
-        # Read response in chunks
+        # Read response in 32-byte chunks and reassemble
         rx = bytearray()
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
             chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
             try:
-                # Try SMBus read with register 0
                 chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
             except (TypeError, OSError):
-                # Fallback: read byte by byte
                 chunk = []
                 for _ in range(chunk_size):
                     try:
