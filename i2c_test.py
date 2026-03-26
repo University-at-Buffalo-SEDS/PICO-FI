@@ -75,19 +75,33 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         print(f"Sending to I2C addr 0x{I2C_ADDR:02x}...")
         print(f"Sent: {format_bytes(tx)}...")
         
-        # Write to Pico - I2C write_i2c_block_data
-        # Note: This varies by I2C slave implementation
-        # Most straightforward: use i2cdev interface directly
-        try:
-            # Try write/read pattern
-            bus.write_i2c_block_data(I2C_ADDR, 0, list(tx))
-            time.sleep(0.1)
-            
-            # Read response
-            rx = bus.read_i2c_block_data(I2C_ADDR, 0, FRAME_SIZE)
-            rx = bytes(rx)
-        finally:
-            bus.close()
+        # I2C has 32-byte limit, so send in chunks
+        CHUNK_SIZE = 32
+        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+            chunk = list(tx[i:i+CHUNK_SIZE])
+            if chunk:
+                try:
+                    bus.write_i2c_block_data(I2C_ADDR, 0, chunk)
+                except Exception as e:
+                    # Some implementations don't need address byte
+                    bus.write_i2c_block_data(I2C_ADDR, chunk)
+            time.sleep(0.01)
+        
+        time.sleep(0.1)
+        
+        # Read response in chunks
+        rx = bytearray()
+        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+            chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
+            try:
+                chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
+            except:
+                chunk = bus.read_i2c_block_data(I2C_ADDR, chunk_size)
+            rx.extend(chunk)
+            time.sleep(0.01)
+        
+        rx = bytes(rx[:FRAME_SIZE])
+        bus.close()
         
         print(f"Recv: {format_bytes(rx)}...")
         
@@ -112,6 +126,10 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         print(f"  1. Pico is connected on I2C bus {bus_num}")
         print(f"  2. GPIO0 (SDA) and GPIO1 (SCL) are wired correctly")
         print(f"  3. smbus-cffi is installed: pip install smbus-cffi")
+        try:
+            bus.close()
+        except:
+            pass
         return 1
 
 
@@ -150,4 +168,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
