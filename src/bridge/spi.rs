@@ -333,6 +333,8 @@ impl UpstreamSpiDevice {
     pub fn stage_response_frame(&mut self, frame: [u8; FRAME_SIZE]) {
         self.clear_after_transaction = frame[1] != 0;
         self.tx_frame = frame;
+        // Always rearm to ensure frame is loaded into TX FIFO
+        // The next CS assertion will use this frame
         if !self.cs_active {
             self.rearm_transaction();
         }
@@ -392,13 +394,16 @@ impl UpstreamSpiDevice {
 
     /// Finalizes the current CS-bounded transaction and prepares for the next one.
     fn finish_transaction(&mut self) {
+        // Rearm FIRST to load current tx_frame into the hardware FIFO
+        self.rearm_transaction();
+
+        // THEN clear for single-shot responses
         if self.clear_after_transaction {
             self.clear_after_transaction = false;
             self.tx_frame.fill(0);
             self.tx_frame[0] = RESP_DATA_MAGIC;
             self.tx_frame[1] = 0;
         }
-        self.rearm_transaction();
     }
 
     /// Preloads as many bytes as possible into the hardware TX FIFO.
