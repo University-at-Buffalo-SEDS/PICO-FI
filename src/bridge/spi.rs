@@ -2,7 +2,7 @@
 
 use core::sync::atomic::{Ordering as MemoryOrdering, compiler_fence};
 
-use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::commands::trim_ascii_line;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
@@ -40,6 +40,8 @@ pub struct UpstreamSpiDevice {
     frame_reported: bool,
     /// Clears a one-shot response payload after the master finishes reading it.
     clear_after_transaction: bool,
+    /// Holds one completed request frame until the bridge loop consumes it.
+    pending_frame: Option<[u8; FRAME_SIZE]>,
 }
 
 /// Configures `SPI1` as the framed upstream slave transport.
@@ -118,6 +120,7 @@ pub fn init_upstream_spi<TX: ChannelInstance, RX: ChannelInstance>(
         cs_active: false,
         frame_reported: false,
         clear_after_transaction: false,
+        pending_frame: None,
     };
     device.prepare_response_frame(RESP_DATA_MAGIC, &[]);
     device
@@ -242,15 +245,12 @@ async fn session(
                     write_socket(socket, payload).await?;
                 }
                 Some(RequestFrame::Command(payload)) => {
-                    let response = render_local_bridge_command(
-                        bridge_config,
-                        link_active,
-                        trim_ascii_line(payload),
-                    );
-                    spi.prepare_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
+                    let _ = (bridge_config, link_active, trim_ascii_line(payload));
+                    spi.prepare_response_frame(RESP_COMMAND_MAGIC, b"debug-cmd");
                 }
                 _ => {}
             }
+            spi.clear_pending_frame();
         }
         // Yield cooperatively without adding a fixed 1 ms service gap to the SPI hot path.
         yield_now().await;
@@ -331,6 +331,10 @@ impl UpstreamSpiDevice {
 
     /// Polls the active SPI transaction and yields a complete frame once fully received.
     fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
+        if self.pending_frame.is_some() {
+            return self.pending_frame.as_ref();
+        }
+
         let cs_low = self.cs_is_low();
 
         if cs_low && !self.cs_active {
@@ -338,14 +342,19 @@ impl UpstreamSpiDevice {
             self.frame_reported = false;
         } else if !cs_low && self.cs_active {
             self.cs_active = false;
+            if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
+                self.frame_reported = true;
+                self.pending_frame = Some(self.rx_frame);
+            }
             self.finish_transaction();
-            return None;
+            return self.pending_frame.as_ref();
         }
 
         if !self.cs_active {
             if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
                 self.frame_reported = true;
-                return Some(&self.rx_frame);
+                self.pending_frame = Some(self.rx_frame);
+                return self.pending_frame.as_ref();
             }
 
             // Short transfers can begin and end entirely between polls, leaving DMA mid-frame
@@ -358,9 +367,15 @@ impl UpstreamSpiDevice {
 
         if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
             self.frame_reported = true;
-            return Some(&self.rx_frame);
+            self.pending_frame = Some(self.rx_frame);
+            return self.pending_frame.as_ref();
         }
         None
+    }
+
+    /// Marks the currently pending frame as consumed by the bridge loop.
+    fn clear_pending_frame(&mut self) {
+        self.pending_frame = None;
     }
 
     /// Programs one DMA channel for a single SPI transaction direction.

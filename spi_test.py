@@ -73,6 +73,8 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
     responses: list[tuple[int, list[int], int, bytes]] = []
     poll_count = 1 if magic != REQ_COMMAND_MAGIC else 10
     for _ in range(poll_count):
+        if magic == REQ_COMMAND_MAGIC:
+            time.sleep(0.02)
         rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
         resp_magic, resp_len, resp_body = parse_frame(rx)
         responses.append((resp_magic, rx, resp_len, resp_body))
