@@ -1,8 +1,6 @@
 //! SPI upstream bridge implementation and SPI slave framing state.
 
-use core::sync::atomic::{Ordering as MemoryOrdering, compiler_fence};
-
-use crate::bridge::commands::trim_ascii_line;
+use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
@@ -10,34 +8,44 @@ use crate::protocol::spi::{
     FRAME_SIZE, PAYLOAD_MAX, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, parse_request_frame,
 };
 use embassy_futures::yield_now;
-use embassy_rp::dma::ChannelInstance;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
 use embassy_rp::Peri;
 use embassy_rp::peripherals::{PIN_10, PIN_11, PIN_12, PIN_13, SPI1};
-use embassy_rp::spi::{self, Blocking};
 use embassy_rp::uart::BufferedUart;
+use embassy_rp::PeripheralType;
 use embassy_time::{Duration, Timer};
-use rp_pac::dma::vals::{DataSize, TreqSel};
+use embedded_hal::spi::MODE_0;
+use embedded_hal_nb::spi::FullDuplex;
 use portable_atomic::{AtomicBool, Ordering};
+use rp2040_hal::gpio::{self, FunctionSpi, PullDown, bank0};
+use rp2040_hal::pac as hal_pac;
+use rp2040_hal::spi::{Enabled as HalSpiEnabled, Spi as HalSpi};
+
+type SpiSckPin = gpio::Pin<bank0::Gpio10, FunctionSpi, PullDown>;
+type SpiTxPin = gpio::Pin<bank0::Gpio11, FunctionSpi, PullDown>;
+type SpiRxPin = gpio::Pin<bank0::Gpio12, FunctionSpi, PullDown>;
+type SpiCsPin = gpio::Pin<bank0::Gpio13, FunctionSpi, PullDown>;
+type SpiPinout = (SpiTxPin, SpiRxPin, SpiSckPin);
+type SlaveSpi = HalSpi<HalSpiEnabled, hal_pac::SPI1, SpiPinout, 8>;
 
 /// Stateful SPI slave transport that buffers one request and one response frame.
 pub struct UpstreamSpiDevice {
-    /// Keeps the Embassy SPI peripheral configured for the lifetime of the slave device.
-    _configured: spi::Spi<'static, SPI1, Blocking>,
-    /// DMA channel number used to feed response bytes into the SPI TX FIFO.
-    tx_dma_ch: u8,
-    /// DMA channel number used to drain request bytes from the SPI RX FIFO.
-    rx_dma_ch: u8,
+    /// HAL-managed SPI1 peripheral configured in slave mode.
+    spi: SlaveSpi,
+    /// Owns the CS pin configuration for the lifetime of the slave transport.
+    _cs: SpiCsPin,
     /// Contains the next response frame to transmit back to the SPI master.
     tx_frame: [u8; FRAME_SIZE],
     /// Captures the most recent request frame received from the SPI master.
     rx_frame: [u8; FRAME_SIZE],
+    /// Number of response bytes already queued into the hardware TX FIFO.
+    tx_len: usize,
+    /// Number of request bytes captured for the current transaction.
+    rx_len: usize,
     /// Indicates whether chip-select is currently asserted.
     cs_active: bool,
-    /// Tracks whether the current transaction's frame has already been surfaced to the caller.
-    frame_reported: bool,
     /// Clears a one-shot response payload after the master finishes reading it.
     clear_after_transaction: bool,
     /// Holds one completed request frame until the bridge loop consumes it.
@@ -45,7 +53,7 @@ pub struct UpstreamSpiDevice {
 }
 
 /// Configures `SPI1` as the framed upstream slave transport.
-pub fn init_upstream_spi<TX: ChannelInstance, RX: ChannelInstance>(
+pub fn init_upstream_spi<TX: PeripheralType, RX: PeripheralType>(
     spi1: Peri<'static, SPI1>,
     sclk: Peri<'static, PIN_10>,
     tx: Peri<'static, PIN_11>,
@@ -54,71 +62,64 @@ pub fn init_upstream_spi<TX: ChannelInstance, RX: ChannelInstance>(
     _tx_dma: Peri<'static, TX>,
     _rx_dma: Peri<'static, RX>,
 ) -> UpstreamSpiDevice {
-    let mut spi_config = spi::Config::default();
-    spi_config.frequency = 1_000_000;
-    // RP2040 SPI1 uses GPIO11 as the peripheral TX pin and GPIO12 as RX, even in slave mode.
-    let configured = spi::Spi::new_blocking(spi1, sclk, tx, rx, spi_config);
-    let _cs = cs;
+    let _ = (spi1, sclk, tx, rx, cs);
+    let mut pac = unsafe { hal_pac::Peripherals::steal() };
 
-    rp_pac::IO_BANK0.gpio(13).ctrl().write(|w| {
-        w.set_funcsel(rp_pac::io::vals::Gpio13ctrlFuncsel::SPI1_SS_N.to_bits());
-    });
-    rp_pac::PADS_BANK0.gpio(13).modify(|w| {
-        w.set_ie(true);
-        w.set_pue(true);
-        w.set_pde(false);
-    });
-
-    let p = rp_pac::SPI1;
-    p.cr1().write_value(rp_pac::spi::regs::Cr1(0));
-    p.cpsr().write_value({
-        let mut reg = rp_pac::spi::regs::Cpsr(0);
-        reg.set_cpsdvsr(2);
-        reg
-    });
-    p.cr0().write_value({
-        let mut w = rp_pac::spi::regs::Cr0(0);
-        w.set_dss(0b0111);
-        w.set_frf(0);
-        w.set_spo(false);
-        w.set_sph(false);
-        w.set_scr(0);
-        w
-    });
-    p.cr1().write_value({
-        let mut w = rp_pac::spi::regs::Cr1(0);
-        w.set_lbm(false);
-        w.set_sse(false);
-        w.set_ms(true);
-        w.set_sod(false);
-        w
-    });
-    p.dmacr().write_value({
-        let mut w = rp_pac::spi::regs::Dmacr(0);
-        w.set_rxdmae(false);
-        w.set_txdmae(false);
-        w
-    });
-    while p.sr().read().rne() {
-        let _ = p.dr().read();
+    let sck_pin = match unsafe {
+        gpio::new_pin(gpio::DynPinId {
+            bank: gpio::DynBankId::Bank0,
+            num: 10,
+        })
     }
-    p.cr1().write_value({
-        let mut w = rp_pac::spi::regs::Cr1(0);
-        w.set_lbm(false);
-        w.set_sse(true);
-        w.set_ms(true);
-        w.set_sod(false);
-        w
-    });
+    .try_into_pin::<bank0::Gpio10>()
+    {
+        Ok(pin) => pin.into_pull_type::<PullDown>().into_function::<FunctionSpi>(),
+        Err(_) => panic!("GPIO10 must be valid for SPI1 SCK"),
+    };
+    let tx_pin = match unsafe {
+        gpio::new_pin(gpio::DynPinId {
+            bank: gpio::DynBankId::Bank0,
+            num: 11,
+        })
+    }
+    .try_into_pin::<bank0::Gpio11>()
+    {
+        Ok(pin) => pin.into_pull_type::<PullDown>().into_function::<FunctionSpi>(),
+        Err(_) => panic!("GPIO11 must be valid for SPI1 TX"),
+    };
+    let rx_pin = match unsafe {
+        gpio::new_pin(gpio::DynPinId {
+            bank: gpio::DynBankId::Bank0,
+            num: 12,
+        })
+    }
+    .try_into_pin::<bank0::Gpio12>()
+    {
+        Ok(pin) => pin.into_pull_type::<PullDown>().into_function::<FunctionSpi>(),
+        Err(_) => panic!("GPIO12 must be valid for SPI1 RX"),
+    };
+    let cs_pin = match unsafe {
+        gpio::new_pin(gpio::DynPinId {
+            bank: gpio::DynBankId::Bank0,
+            num: 13,
+        })
+    }
+    .try_into_pin::<bank0::Gpio13>()
+    {
+        Ok(pin) => pin.into_pull_type::<PullDown>().into_function::<FunctionSpi>(),
+        Err(_) => panic!("GPIO13 must be valid for SPI1 CS"),
+    };
 
-        let mut device = UpstreamSpiDevice {
-            _configured: configured,
-        tx_dma_ch: TX::number(),
-        rx_dma_ch: RX::number(),
+    let spi = HalSpi::<_, _, _, 8>::new(pac.SPI1, (tx_pin, rx_pin, sck_pin)).init_slave(&mut pac.RESETS, MODE_0);
+
+    let mut device = UpstreamSpiDevice {
+        spi,
+        _cs: cs_pin,
         tx_frame: [0; FRAME_SIZE],
         rx_frame: [0; FRAME_SIZE],
+        tx_len: 0,
+        rx_len: 0,
         cs_active: false,
-        frame_reported: false,
         clear_after_transaction: false,
         pending_frame: None,
     };
@@ -159,8 +160,8 @@ pub async fn run_client(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-            .await
-            .is_err()
+        .await
+        .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -199,8 +200,8 @@ pub async fn run_server(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-            .await
-            .is_err()
+        .await
+        .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -245,14 +246,17 @@ async fn session(
                     write_socket(socket, payload).await?;
                 }
                 Some(RequestFrame::Command(payload)) => {
-                    let _ = (bridge_config, link_active, trim_ascii_line(payload));
-                    spi.prepare_response_frame(RESP_COMMAND_MAGIC, b"debug-cmd");
+                    let response = render_local_bridge_command(
+                        bridge_config,
+                        link_active,
+                        trim_ascii_line(payload),
+                    );
+                    spi.prepare_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
                 }
                 _ => {}
             }
             spi.clear_pending_frame();
         }
-        // Yield cooperatively without adding a fixed 1 ms service gap to the SPI hot path.
         yield_now().await;
     }
 }
@@ -267,14 +271,95 @@ impl UpstreamSpiDevice {
         self.tx_frame[1] = len as u8;
         self.tx_frame[2..2 + len].copy_from_slice(&payload[..len]);
         if !self.cs_active {
-            self.begin_transaction();
+            self.rearm_transaction();
         }
     }
 
-    /// Reinitializes the RX/TX state for the next CS-bounded transaction.
-    fn begin_transaction(&mut self) {
+    /// Polls one CS-bounded transaction and yields a complete frame once captured.
+    fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
+        if self.pending_frame.is_some() {
+            return self.pending_frame.as_ref();
+        }
+
+        if !self.cs_is_low() {
+            return None;
+        }
+
+        self.cs_active = true;
+        while self.cs_is_low() {
+            self.drain_rx_fifo();
+            self.prefill_tx_fifo();
+        }
+        self.cs_active = false;
+        self.drain_rx_fifo();
+
+        if self.rx_len > 0 {
+            self.pending_frame = Some(self.rx_frame);
+        }
+        self.finish_transaction();
+        self.pending_frame.as_ref()
+    }
+
+    /// Marks the currently pending frame as consumed by the bridge loop.
+    fn clear_pending_frame(&mut self) {
+        self.pending_frame = None;
+    }
+
+    /// Reinitializes counters and preloads the next response bytes into the TX FIFO.
+    fn rearm_transaction(&mut self) {
+        self.reset_hw_fifos();
+        self.rx_frame.fill(0);
+        self.rx_len = 0;
+        self.tx_len = 0;
+        self.prefill_tx_fifo();
+    }
+
+    /// Finalizes the current CS-bounded transaction and prepares for the next one.
+    fn finish_transaction(&mut self) {
+        if self.clear_after_transaction {
+            self.clear_after_transaction = false;
+            self.tx_frame.fill(0);
+            self.tx_frame[0] = RESP_DATA_MAGIC;
+            self.tx_frame[1] = 0;
+        }
+        self.rearm_transaction();
+    }
+
+    /// Preloads as many bytes as possible into the hardware TX FIFO.
+    fn prefill_tx_fifo(&mut self) {
+        while self.tx_len < FRAME_SIZE {
+            match self.spi.write(self.tx_frame[self.tx_len]) {
+                Ok(()) => self.tx_len += 1,
+                Err(nb::Error::WouldBlock) => break,
+                Err(nb::Error::Other(_)) => break,
+            }
+        }
+    }
+
+    /// Drains any bytes currently waiting in the hardware RX FIFO.
+    fn drain_rx_fifo(&mut self) {
+        loop {
+            match self.spi.read() {
+                Ok(byte) => {
+                    if self.rx_len < FRAME_SIZE {
+                        self.rx_frame[self.rx_len] = byte;
+                        self.rx_len += 1;
+                    }
+                }
+                Err(nb::Error::WouldBlock) => break,
+                Err(nb::Error::Other(_)) => break,
+            }
+        }
+    }
+
+    /// Returns whether the hardware CS pin is currently asserted.
+    fn cs_is_low(&self) -> bool {
+        !rp_pac::IO_BANK0.gpio(13).status().read().infrompad()
+    }
+
+    /// Resets the SPI FIFOs without reimplementing the rest of the SPI configuration.
+    fn reset_hw_fifos(&self) {
         let p = rp_pac::SPI1;
-        self.abort_dma();
         p.cr1().modify(|w| w.set_sse(false));
         while p.sr().read().rne() {
             let _ = p.dr().read();
@@ -286,165 +371,5 @@ impl UpstreamSpiDevice {
             w
         });
         p.cr1().modify(|w| w.set_sse(true));
-        self.rx_frame.fill(0);
-        self.frame_reported = false;
-        p.dmacr().write_value({
-            let mut w = rp_pac::spi::regs::Dmacr(0);
-            w.set_rxdmae(true);
-            w.set_txdmae(true);
-            w
-        });
-        self.start_dma();
-    }
-
-    /// Samples the hardware chip-select line to detect transaction edges.
-    fn cs_is_low(&self) -> bool {
-        !rp_pac::IO_BANK0.gpio(13).status().read().infrompad()
-    }
-
-    /// Starts full-frame DMA servicing for the current SPI transaction buffers.
-    fn start_dma(&mut self) {
-        let spi = rp_pac::SPI1;
-        let dr = spi.dr().as_ptr();
-        let tx_dma_ch = self.tx_dma_ch;
-        let rx_dma_ch = self.rx_dma_ch;
-        let tx_frame = self.tx_frame.as_ptr();
-        let rx_frame = self.rx_frame.as_mut_ptr();
-
-        Self::configure_dma_channel(
-            tx_dma_ch,
-            tx_frame,
-            dr as *mut u8,
-            true,
-            false,
-            TreqSel::SPI1_TX,
-        );
-        Self::configure_dma_channel(
-            rx_dma_ch,
-            dr as *const u8,
-            rx_frame,
-            false,
-            true,
-            TreqSel::SPI1_RX,
-        );
-    }
-
-    /// Polls the active SPI transaction and yields a complete frame once fully received.
-    fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
-        if self.pending_frame.is_some() {
-            return self.pending_frame.as_ref();
-        }
-
-        let cs_low = self.cs_is_low();
-
-        if cs_low && !self.cs_active {
-            self.cs_active = true;
-            self.frame_reported = false;
-        } else if !cs_low && self.cs_active {
-            self.cs_active = false;
-            if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
-                self.frame_reported = true;
-                self.pending_frame = Some(self.rx_frame);
-            }
-            self.finish_transaction();
-            return self.pending_frame.as_ref();
-        }
-
-        if !self.cs_active {
-            if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
-                self.frame_reported = true;
-                self.pending_frame = Some(self.rx_frame);
-                return self.pending_frame.as_ref();
-            }
-
-            // Short transfers can begin and end entirely between polls, leaving DMA mid-frame
-            // with CS already deasserted. Detect that stale state and rearm immediately.
-            if self.transaction_started() {
-                self.finish_transaction();
-            }
-            return None;
-        }
-
-        if !self.frame_reported && !self.dma_channel_busy(self.rx_dma_ch) {
-            self.frame_reported = true;
-            self.pending_frame = Some(self.rx_frame);
-            return self.pending_frame.as_ref();
-        }
-        None
-    }
-
-    /// Marks the currently pending frame as consumed by the bridge loop.
-    fn clear_pending_frame(&mut self) {
-        self.pending_frame = None;
-    }
-
-    /// Programs one DMA channel for a single SPI transaction direction.
-    fn configure_dma_channel(
-        channel: u8,
-        read_addr: *const u8,
-        write_addr: *mut u8,
-        incr_read: bool,
-        incr_write: bool,
-        dreq: TreqSel,
-    ) {
-        let ch = rp_pac::DMA.ch(channel as usize);
-        ch.read_addr().write_value(read_addr as u32);
-        ch.write_addr().write_value(write_addr as u32);
-        ch.trans_count().write(|w| {
-            *w = FRAME_SIZE as u32;
-        });
-
-        compiler_fence(MemoryOrdering::SeqCst);
-        ch.ctrl_trig().write(|w| {
-            w.set_treq_sel(dreq);
-            w.set_data_size(DataSize::SIZE_BYTE);
-            w.set_incr_read(incr_read);
-            w.set_incr_write(incr_write);
-            w.set_chain_to(channel);
-            w.set_en(true);
-        });
-        compiler_fence(MemoryOrdering::SeqCst);
-    }
-
-    /// Returns whether the selected DMA channel is still active.
-    fn dma_channel_busy(&self, channel: u8) -> bool {
-        rp_pac::DMA.ch(channel as usize).ctrl_trig().read().busy()
-    }
-
-    /// Returns whether the current DMA transaction has consumed any bytes.
-    fn transaction_started(&self) -> bool {
-        self.dma_remaining_count(self.rx_dma_ch) < FRAME_SIZE as u32
-            || self.dma_remaining_count(self.tx_dma_ch) < FRAME_SIZE as u32
-    }
-
-    /// Returns the DMA transfer count remaining for the selected channel.
-    fn dma_remaining_count(&self, channel: u8) -> u32 {
-        rp_pac::DMA.ch(channel as usize).trans_count().read()
-    }
-
-    /// Finalizes the current CS-bounded transaction and rearms the slave for the next one.
-    fn finish_transaction(&mut self) {
-        self.abort_dma();
-        if self.clear_after_transaction {
-            self.clear_after_transaction = false;
-            self.tx_frame.fill(0);
-            self.tx_frame[0] = RESP_DATA_MAGIC;
-            self.tx_frame[1] = 0;
-        }
-        self.begin_transaction();
-    }
-
-    /// Aborts any in-flight SPI DMA transfers and disables SPI DMA requests.
-    fn abort_dma(&self) {
-        rp_pac::SPI1.dmacr().write_value({
-            let mut w = rp_pac::spi::regs::Dmacr(0);
-            w.set_rxdmae(false);
-            w.set_txdmae(false);
-            w
-        });
-        rp_pac::DMA.chan_abort().modify(|m| {
-            m.set_chan_abort((1 << self.tx_dma_ch) | (1 << self.rx_dma_ch));
-        });
-        while self.dma_channel_busy(self.tx_dma_ch) || self.dma_channel_busy(self.rx_dma_ch) {}
     }
 }
