@@ -78,13 +78,14 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         # I2C has 32-byte limit, so send in chunks
         CHUNK_SIZE = 32
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-            chunk = list(tx[i:i+CHUNK_SIZE])
-            if chunk:
-                try:
-                    bus.write_i2c_block_data(I2C_ADDR, 0, chunk)
-                except Exception as e:
-                    # Some implementations don't need address byte
-                    bus.write_i2c_block_data(I2C_ADDR, chunk)
+            chunk = tx[i:i+CHUNK_SIZE]
+            try:
+                # Try SMBus write_i2c_block_data with register 0
+                bus.write_i2c_block_data(I2C_ADDR, 0, list(chunk))
+            except TypeError:
+                # Fallback: write byte by byte if API differs
+                for byte in chunk:
+                    bus.write_byte(I2C_ADDR, byte)
             time.sleep(0.01)
         
         time.sleep(0.1)
@@ -94,9 +95,17 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
             chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
             try:
+                # Try SMBus read with register 0
                 chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
-            except:
-                chunk = bus.read_i2c_block_data(I2C_ADDR, chunk_size)
+            except (TypeError, OSError):
+                # Fallback: read byte by byte
+                chunk = []
+                for _ in range(chunk_size):
+                    try:
+                        byte = bus.read_byte(I2C_ADDR)
+                        chunk.append(byte)
+                    except:
+                        chunk.append(0)
             rx.extend(chunk)
             time.sleep(0.01)
         
@@ -122,10 +131,6 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
     
     except Exception as e:
         print(f"ERROR: I2C error - {e}")
-        print(f"Make sure:")
-        print(f"  1. Pico is connected on I2C bus {bus_num}")
-        print(f"  2. GPIO0 (SDA) and GPIO1 (SCL) are wired correctly")
-        print(f"  3. smbus-cffi is installed: pip install smbus-cffi")
         try:
             bus.close()
         except:
