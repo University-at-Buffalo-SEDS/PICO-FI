@@ -181,7 +181,13 @@ async fn app(spawner: Spawner) {
         );
         // Spawn dedicated I2C polling task.
         spawner.spawn(
-            i2c_controller_task(i2c, I2C_FRAME_CHANNEL.sender(), I2C_RESPONSE_CHANNEL.receiver())
+            i2c_controller_task(
+                i2c,
+                bridge_config,
+                &LINK_ACTIVE,
+                I2C_FRAME_CHANNEL.sender(),
+                I2C_RESPONSE_CHANNEL.receiver(),
+            )
                 .expect("i2c controller task token allocation failed"),
         );
         Some(())
@@ -304,10 +310,12 @@ async fn run_bridge_mode(
 #[embassy_executor::task]
 async fn i2c_controller_task(
     mut i2c: I2cSlave<'static, I2C0>,
+    bridge_config: BridgeConfig,
+    link_active: &'static AtomicBool,
     tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
     rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
 ) {
-    i2c_poll_task(&mut i2c, tx, rx_resp).await
+    i2c_poll_task(&mut i2c, bridge_config, link_active, tx, rx_resp).await
 }
 
 /// Starts the Embassy executor and launches the async application task.
@@ -318,8 +326,6 @@ fn main() -> ! {
         spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }
-
-
 
 
 

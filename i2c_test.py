@@ -12,6 +12,10 @@ from i2c_raw import CHUNK_SIZE, open_bus
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
 I2C_ADDR = 0x55  # Pico I2C slave address
+CHUNK_DELAY_S = 0.001
+INITIAL_RESPONSE_WAIT_S = 0.01
+COMMAND_POLL_DELAY_S = 0.01
+COMMAND_TIMEOUT_POLLS = 40
 
 REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
@@ -64,7 +68,8 @@ def read_frame(bus) -> bytes:
         chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
         chunk = bus.read(I2C_ADDR, chunk_size)
         rx.extend(chunk)
-        time.sleep(0.01)
+        if len(rx) < FRAME_SIZE:
+            time.sleep(CHUNK_DELAY_S)
     return bytes(rx[:FRAME_SIZE])
 
 
@@ -73,7 +78,8 @@ def write_frame(bus, frame: bytes) -> None:
     for i in range(0, FRAME_SIZE, CHUNK_SIZE):
         chunk = frame[i:i + CHUNK_SIZE]
         bus.write(I2C_ADDR, chunk)
-        time.sleep(0.01)
+        if i + CHUNK_SIZE < FRAME_SIZE:
+            time.sleep(CHUNK_DELAY_S)
 
 
 def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
@@ -86,14 +92,14 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         print(f"Sent: {format_bytes(tx)}...")
 
         write_frame(bus, tx)
-        time.sleep(0.05)
+        time.sleep(INITIAL_RESPONSE_WAIT_S)
 
         rx = read_frame(bus)
         magic_val, length, body = parse_frame(rx)
 
         if magic == REQ_COMMAND_MAGIC and magic_val != RESP_COMMAND_MAGIC:
-            for _ in range(20):
-                time.sleep(0.05)
+            for _ in range(COMMAND_TIMEOUT_POLLS):
+                time.sleep(COMMAND_POLL_DELAY_S)
                 rx = read_frame(bus)
                 magic_val, length, body = parse_frame(rx)
                 if magic_val == RESP_COMMAND_MAGIC:
