@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""
-I2C-based test tool for Pico-Fi communication
-Uses raw Linux I2C_RDWR transfers to communicate with Pico
-"""
+"""I2C-based test tool for Pico-Fi communication."""
 
 import argparse
 import time
 
-from i2c_raw import CHUNK_SIZE, open_bus
+from .raw import CHUNK_SIZE, open_bus
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
-I2C_ADDR = 0x55  # Pico I2C slave address
+I2C_ADDR = 0x55
 CHUNK_DELAY_S = 0.001
 INITIAL_RESPONSE_WAIT_S = 0.01
 COMMAND_POLL_DELAY_S = 0.01
@@ -24,45 +21,34 @@ RESP_COMMAND_MAGIC = 0x5B
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
-    """Build a frame for sending"""
     payload = payload[:PAYLOAD_MAX]
     frame = bytearray(2 + len(payload))
     frame[0] = magic
     frame[1] = len(payload)
-    frame[2:2+len(payload)] = payload
+    frame[2:2 + len(payload)] = payload
     return bytes(frame)
 
 
 def is_garbage_frame(frame: bytes) -> bool:
-    """Detect if frame is garbage (mostly 0xFF)"""
     ff_count = sum(1 for b in frame if b == 0xFF)
     return ff_count > len(frame) * 0.8
 
 
 def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
-    """Extract data from frame"""
-    if len(frame) != FRAME_SIZE:
+    if len(frame) != FRAME_SIZE or is_garbage_frame(frame):
         return 0, 0, b""
-    if is_garbage_frame(frame):
-        return 0, 0, b""
-
     magic_val = frame[0]
     length = frame[1]
-    if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+    if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
         return 0, 0, b""
-    if length > PAYLOAD_MAX:
-        return 0, 0, b""
-    body = bytes(frame[2:2 + length])
-    return magic_val, length, body
+    return magic_val, length, bytes(frame[2:2 + length])
 
 
 def format_bytes(data: bytes) -> str:
-    """Format bytes for display"""
     return " ".join(f"{b:02x}" for b in data[:16])
 
 
 def read_frame(bus) -> bytes:
-    """Read one full framed response from the Pico"""
     rx = bytearray()
     for _ in range(0, FRAME_SIZE, CHUNK_SIZE):
         chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
@@ -74,7 +60,6 @@ def read_frame(bus) -> bytes:
 
 
 def write_frame(bus, frame: bytes) -> None:
-    """Write one full framed request to the Pico"""
     for i in range(0, len(frame), CHUNK_SIZE):
         chunk = frame[i:i + CHUNK_SIZE]
         bus.write(I2C_ADDR, chunk)
@@ -83,20 +68,16 @@ def write_frame(bus, frame: bytes) -> None:
 
 
 def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
-    """Send frame via I2C and receive response"""
+    bus = None
     try:
         bus = open_bus(bus_num)
         tx = build_frame(payload, magic)
-        
         print(f"Sending to I2C addr 0x{I2C_ADDR:02x}...")
         print(f"Sent: {format_bytes(tx)}...")
-
         write_frame(bus, tx)
         time.sleep(INITIAL_RESPONSE_WAIT_S)
-
         rx = read_frame(bus)
         magic_val, length, body = parse_frame(rx)
-
         if magic == REQ_COMMAND_MAGIC and magic_val != RESP_COMMAND_MAGIC:
             for _ in range(COMMAND_TIMEOUT_POLLS):
                 time.sleep(COMMAND_POLL_DELAY_S)
@@ -104,65 +85,48 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
                 magic_val, length, body = parse_frame(rx)
                 if magic_val == RESP_COMMAND_MAGIC:
                     break
-
-        bus.close()
-        
         print(f"Recv: {format_bytes(rx)}...")
-        
-        valid = magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC)
-        
         print(f"Magic: 0x{magic_val:02x}, Length: {length}")
-        
-        if valid and body:
+        if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) and body:
             try:
-                decoded = body.decode('utf-8', errors='replace')
-                print(f"Response: {decoded!r}")
-            except:
+                print(f"Response: {body.decode('utf-8', errors='replace')!r}")
+            except Exception:
                 print(f"Response: {body.hex()}")
-        
-        return 0 if valid else 1
-    
-    except Exception as e:
-        print(f"ERROR: I2C error - {e}")
-        try:
-            bus.close()
-        except:
-            pass
+        return 0 if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) else 1
+    except Exception as exc:
+        print(f"ERROR: I2C error - {exc}")
         return 1
+    finally:
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="I2C test tool for Pico-Fi")
     parser.add_argument("--bus", type=int, default=1, help="I2C bus number")
-    parser.add_argument("--addr", type=int, default=0x55, help="Pico I2C address (hex)")
-    
+    parser.add_argument("--addr", type=int, default=0x55, help="Pico I2C address")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    
     probe_parser = subparsers.add_parser("probe", help="Probe with empty frames")
     probe_parser.add_argument("--count", type=int, default=10)
-    
     cmd_parser = subparsers.add_parser("command", help="Send command")
     cmd_parser.add_argument("text", help="Command text (e.g., /ping)")
-    
     args = parser.parse_args()
     global I2C_ADDR
     I2C_ADDR = args.addr
-    
     if args.command == "probe":
         failures = 0
         for i in range(args.count):
-            print(f"\n--- Probe {i+1} ---")
-            result = i2c_exchange(args.bus, b"")
-            if result != 0:
+            print(f"\n--- Probe {i + 1} ---")
+            if i2c_exchange(args.bus, b"") != 0:
                 failures += 1
             time.sleep(0.2)
         print(f"\nProbe: {args.count - failures}/{args.count} successful")
         return 0 if failures == 0 else 1
-    
-    elif args.command == "command":
-        text = args.text + "\n"
-        return i2c_exchange(args.bus, text.encode(), REQ_COMMAND_MAGIC)
-    
+    if args.command == "command":
+        return i2c_exchange(args.bus, (args.text + "\n").encode(), REQ_COMMAND_MAGIC)
     return 1
 
 

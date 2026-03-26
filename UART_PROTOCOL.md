@@ -173,6 +173,6 @@ ser.write(b"hello from host\n")
 
 ## Host-side references
 
-- Interactive UART terminal: [uart_link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/uart_link_terminal.py)
+- Interactive UART terminal: [host/python/uart/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/link_terminal.py)
 - Firmware UART bridge: [src/bridge/uart.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/uart.rs)
 - Boot/config shell: [src/shell.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/shell.rs)

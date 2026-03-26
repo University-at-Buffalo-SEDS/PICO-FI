@@ -41,7 +41,7 @@ Constants:
 
 ## References
 
-- Interactive I2C terminal: [i2c_link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/i2c_link_terminal.py)
-- I2C test tool: [i2c_test.py](/Users/rylan/Documents/GitKraken/pico-fi/i2c_test.py)
+- Interactive I2C terminal: [host/python/i2c/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/link_terminal.py)
+- I2C test tool: [host/python/i2c/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/test.py)
 - Firmware I2C bridge: [src/bridge/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c.rs)
 - I2C protocol constants: [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)

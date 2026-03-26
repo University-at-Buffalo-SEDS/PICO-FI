@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Interactive UART terminal for Pico-Fi."""
 
 from __future__ import annotations
 
@@ -13,12 +14,7 @@ import time
 import tty
 from dataclasses import dataclass, field
 
-try:
-    import serial
-except ImportError as exc:  # pragma: no cover - runtime dependency
-    raise SystemExit(
-        "error: pyserial is required. Install it with `python3 -m pip install pyserial`."
-    ) from exc
+import serial
 
 
 def print_help() -> list[str]:
@@ -78,11 +74,6 @@ class PromptState:
         with self.lock:
             self._clear_prompt()
             sys.stdout.write(line + "\n")
-            self.redraw()
-
-    def replace_buffer(self, value: str) -> None:
-        with self.lock:
-            self.buffer = value
             self.redraw()
 
     def handle_key(self, ch: str) -> str | None:
@@ -163,31 +154,25 @@ def write_loop(ser: serial.Serial, prompt: PromptState) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Interactive UART terminal for the two-Pico network bridge."
-    )
-    parser.add_argument("--port", required=True, help="Serial device, e.g. /dev/cu.usbmodemXXXX or /dev/serial0")
+    parser = argparse.ArgumentParser(description="Interactive UART terminal for Pico-Fi")
+    parser.add_argument("--port", required=True)
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--label", default="", help="Optional startup label.")
-    parser.add_argument("--sender", default="", help="Sender label prepended to outbound chat lines.")
+    parser.add_argument("--label", default="")
+    parser.add_argument("--sender", default="")
     args = parser.parse_args()
-
     try:
         ser = serial.Serial(args.port, args.baud, timeout=0.1)
     except serial.SerialException as exc:
         print(f"error: failed to open {args.port}: {exc}", file=sys.stderr)
         return 1
-
     sender = args.sender or default_sender_label()
     prompt = PromptState(sender=sender)
-
     with ser:
         if args.label:
             print(f"[{args.label}] connected to {args.port} @ {args.baud}")
         else:
             print(f"connected to {args.port} @ {args.baud}")
         print("plain text chats with the remote peer. / commands talk to the local Pico. //help for app help.")
-
         reader = threading.Thread(target=read_loop, args=(ser, prompt), daemon=True)
         reader.start()
         status = write_loop(ser, prompt)

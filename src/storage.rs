@@ -132,6 +132,7 @@ fn decode_record(buf: &[u8; RECORD_SIZE]) -> Option<BridgeConfig> {
         0 => UpstreamMode::Uart,
         1 => UpstreamMode::I2c,
         2 => UpstreamMode::Test,
+        3 => UpstreamMode::Spi,
         _ => return None,
     };
 
@@ -165,6 +166,7 @@ fn encode_upstream_mode(mode: UpstreamMode) -> u8 {
         UpstreamMode::Uart => 0,
         UpstreamMode::I2c => 1,
         UpstreamMode::Test => 2,
+        UpstreamMode::Spi => 3,
     }
 }
 

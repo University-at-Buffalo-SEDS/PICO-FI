@@ -73,16 +73,6 @@ class RawI2cBus:
     def read(self, addr: int, length: int) -> bytes:
         return self.transfer(addr, (I2C_M_RD, length))[0]
 
-    def write_chunks(self, addr: int, data: bytes, chunk_size: int = CHUNK_SIZE) -> None:
-        for i in range(0, len(data), chunk_size):
-            self.write(addr, data[i:i + chunk_size])
-
-    def read_chunks(self, addr: int, total_length: int, chunk_size: int = CHUNK_SIZE) -> bytes:
-        rx = bytearray()
-        while len(rx) < total_length:
-            rx.extend(self.read(addr, min(chunk_size, total_length - len(rx))))
-        return bytes(rx)
-
 
 def open_bus(bus_num: int) -> RawI2cBus:
     return RawI2cBus(bus_num)

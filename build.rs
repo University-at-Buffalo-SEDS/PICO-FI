@@ -132,7 +132,8 @@ fn render_bridge_mode(bridge: &JsonBridgeConfig) -> String {
 fn render_upstream_mode(upstream: &JsonUpstreamConfig) -> String {
     match upstream.transport.as_str() {
         "uart" => "UpstreamMode::Uart".to_owned(),
-        "i2c" | "spi" => "UpstreamMode::I2c".to_owned(),
+        "i2c" => "UpstreamMode::I2c".to_owned(),
+        "spi" => "UpstreamMode::Spi".to_owned(),
         "test" => "UpstreamMode::Test".to_owned(),
         other => panic!("unsupported upstream.transport: {other}"),
     }

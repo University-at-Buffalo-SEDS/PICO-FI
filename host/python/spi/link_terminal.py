@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-I2C interactive terminal for Pico-Fi
-Real-time bidirectional communication over I2C
-"""
+"""Interactive SPI terminal for Pico-Fi."""
+
+from __future__ import annotations
 
 import argparse
 import collections
@@ -17,136 +16,32 @@ import time
 import tty
 from dataclasses import dataclass, field
 
-try:
-    from i2c_raw import CHUNK_SIZE, open_bus
-except ImportError:
-    raise SystemExit("error: raw I2C helpers unavailable.")
+from .raw import FRAME_SIZE, open_bus
 
-FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
-I2C_ADDR = 0x55
-CHUNK_DELAY_S = 0.001
-INITIAL_RESPONSE_WAIT_S = 0.01
-
 REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
-RESP_MAGIC = 0x5A
 RESP_DATA_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
-    """Build I2C frame"""
     payload = payload[:PAYLOAD_MAX]
     frame = bytearray(2 + len(payload))
     frame[0] = magic
     frame[1] = len(payload)
-    frame[2:2+len(payload)] = payload
+    frame[2:2 + len(payload)] = payload
     return bytes(frame)
 
 
-def is_garbage_frame(frame: bytes) -> bool:
-    """Detect garbage frame"""
-    ff_count = sum(1 for b in frame if b == 0xFF)
-    return ff_count > len(frame) * 0.8
-
-
 def parse_frame(frame: bytes) -> tuple[int, bytes]:
-    """Extract response from frame"""
     if len(frame) != FRAME_SIZE:
         return 0, b""
-    if is_garbage_frame(frame):
-        return 0, b""
-
     magic = frame[0]
     length = frame[1]
-    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC):
-        return 0, b""
-    if length > PAYLOAD_MAX:
+    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
         return 0, b""
     return magic, bytes(frame[2:2 + length])
-
-
-def print_payload(prompt: "PromptState", payload: bytes) -> None:
-    """Print response payload"""
-    text = payload.decode("utf-8", errors="replace").replace("\r", "")
-    for line in text.split("\n"):
-        if line:
-            prompt.print_line(line)
-
-
-def print_raw_frame(prompt: "PromptState", magic: int, payload: bytes) -> None:
-    """Print a compact raw frame summary"""
-    hex_payload = payload.hex(" ")
-    prompt.print_line(f"[raw] magic=0x{magic:02x} len={len(payload)} data={hex_payload}")
-
-
-def read_frame(bus) -> bytes:
-    """Read one full framed response from the Pico"""
-    rx = bytearray()
-    for _ in range(0, FRAME_SIZE, CHUNK_SIZE):
-        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-        chunk = bus.read(I2C_ADDR, chunk_size)
-        rx.extend(chunk)
-        if len(rx) < FRAME_SIZE:
-            time.sleep(CHUNK_DELAY_S)
-    return bytes(rx[:FRAME_SIZE])
-
-
-def write_frame(bus, frame: bytes) -> None:
-    """Write one full framed request to the Pico"""
-    for i in range(0, len(frame), CHUNK_SIZE):
-        chunk = frame[i:i + CHUNK_SIZE]
-        bus.write(I2C_ADDR, chunk)
-        if i + CHUNK_SIZE < len(frame):
-            time.sleep(CHUNK_DELAY_S)
-
-
-def exchange_frame(
-    bus,
-    prompt: "PromptState",
-    magic: int,
-    payload: bytes,
-    poll_delay_s: float,
-    raw_mode: bool,
-    command_timeout_polls: int = 50,
-) -> None:
-    """Send frame and collect response"""
-    try:
-        tx = build_frame(payload, magic)
-
-        write_frame(bus, tx)
-        time.sleep(INITIAL_RESPONSE_WAIT_S)
-
-        rx = read_frame(bus)
-        rx_magic, rx_payload = parse_frame(rx)
-        if raw_mode and rx_magic:
-            print_raw_frame(prompt, rx_magic, rx_payload)
-        
-        if magic != REQ_COMMAND_MAGIC:
-            if rx_payload:
-                print_payload(prompt, rx_payload)
-            return
-
-        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
-            print_payload(prompt, rx_payload)
-            return
-
-        for _ in range(command_timeout_polls):
-            time.sleep(poll_delay_s)
-            rx = read_frame(bus)
-            rx_magic, rx_payload = parse_frame(rx)
-            if raw_mode and rx_magic:
-                print_raw_frame(prompt, rx_magic, rx_payload)
-
-            if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
-                print_payload(prompt, rx_payload)
-                return
-
-        prompt.print_line("[pico] command timed out waiting for I2C reply")
-    
-    except Exception as e:
-        prompt.print_line(f"[error] I2C error: {e}")
 
 
 def print_help() -> list[str]:
@@ -225,7 +120,6 @@ class PromptState:
 
 
 def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
-    """Handle terminal input"""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -243,38 +137,58 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Interactive I2C terminal for Pico-Fi")
-    parser.add_argument("--bus", type=int, default=1, help="I2C bus number")
-    parser.add_argument("--addr", type=int, default=0x55, help="Pico I2C address")
-    parser.add_argument("--poll-ms", type=int, default=50, help="Poll delay in ms")
-    parser.add_argument("--raw", action="store_true", help="Print raw framed I2C responses")
-    parser.add_argument("--sender", default="", help="Sender label prepended to chat lines")
-    args = parser.parse_args()
-    global I2C_ADDR
-    I2C_ADDR = args.addr
+def print_payload(prompt: PromptState, payload: bytes) -> None:
+    text = payload.decode("utf-8", errors="replace").replace("\r", "")
+    for line in text.split("\n"):
+        if line:
+            prompt.print_line(line)
 
+
+def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_delay_s: float) -> None:
     try:
-        bus = open_bus(args.bus)
-    except Exception as e:
-        print(f"ERROR: Cannot open I2C bus {args.bus}: {e}")
-        print("Make sure:")
-        print(f"  1. I2C{args.bus} is enabled")
-        print("  2. Pico is connected (GPIO0↔SDA, GPIO1↔SCL)")
-        print("  3. Running with sudo (if needed)")
-        return 1
+        bus.write_frame(build_frame(payload, magic))
+        rx_magic, rx_payload = parse_frame(bus.read_frame())
+        if magic != REQ_COMMAND_MAGIC:
+            if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                print_payload(prompt, rx_payload)
+            return
+        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
+            print_payload(prompt, rx_payload)
+            return
+        for _ in range(50):
+            time.sleep(poll_delay_s)
+            rx_magic, rx_payload = parse_frame(bus.read_frame())
+            if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
+                print_payload(prompt, rx_payload)
+                return
+        prompt.print_line("[pico] command timed out waiting for SPI reply")
+    except Exception as exc:
+        prompt.print_line(f"[error] SPI error: {exc}")
 
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Interactive SPI terminal for Pico-Fi")
+    parser.add_argument("--bus", type=int, default=0)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--speed", type=int, default=1_000_000)
+    parser.add_argument("--poll-ms", type=int, default=50)
+    parser.add_argument("--sender", default="")
+    args = parser.parse_args()
+    try:
+        bus = open_bus(args.bus, args.device, args.speed)
+    except Exception as exc:
+        print(f"ERROR: Cannot open SPI bus {args.bus}.{args.device}: {exc}")
+        print("Make sure SPI is enabled and wired to GPIO10/11/12/13")
+        return 1
     sender = args.sender or default_sender_label()
     prompt = PromptState(sender=sender)
     outbound: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=input_loop, args=(outbound, prompt), daemon=True).start()
-
     print(
-        f"connected to I2C bus {args.bus} @ addr 0x{args.addr:02x}. "
+        f"connected to SPI bus {args.bus}.{args.device} @ {args.speed} Hz. "
         "plain text chats with the remote peer. / commands talk to the local Pico. "
         "//help for app help."
     )
-
     try:
         pending: collections.deque[tuple[int, bytes]] = collections.deque()
         while True:
@@ -302,19 +216,14 @@ def main() -> int:
             poll_delay_s = args.poll_ms / 1000.0
             if pending:
                 magic, payload = pending.popleft()
-                exchange_frame(bus, prompt, magic, payload, poll_delay_s, args.raw)
+                exchange_frame(bus, prompt, magic, payload, poll_delay_s)
             else:
-                # Poll for incoming data
                 try:
-                    rx = read_frame(bus)
-                    rx_magic, payload = parse_frame(rx)
-                    if args.raw and rx_magic:
-                        print_raw_frame(prompt, rx_magic, payload)
+                    rx_magic, payload = parse_frame(bus.read_frame())
                     if rx_magic == RESP_DATA_MAGIC and payload:
                         print_payload(prompt, payload)
                 except Exception:
                     pass
-                
                 time.sleep(poll_delay_s)
     except KeyboardInterrupt:
         bus.close()
@@ -322,7 +231,7 @@ def main() -> int:
     finally:
         try:
             bus.close()
-        except:
+        except Exception:
             pass
 
 

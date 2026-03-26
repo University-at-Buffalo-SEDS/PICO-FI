@@ -19,7 +19,7 @@ pub async fn write_banner(uart: &mut BufferedUart) -> Result<(), ()> {
     writeln_line(uart, "  set static <ip>/<prefix> <gateway> <dns>").await?;
     writeln_line(uart, "  set client <dest-ip> <port>").await?;
     writeln_line(uart, "  set server <listen-port>").await?;
-    writeln_line(uart, "  set upstream <uart|i2c|test>").await?;
+    writeln_line(uart, "  set upstream <uart|i2c|spi|test>").await?;
     writeln_line(uart, "  reset").await?;
     writeln_line(uart, "  start").await
 }
