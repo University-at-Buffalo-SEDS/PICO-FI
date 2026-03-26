@@ -77,25 +77,56 @@ def exchange_frame(
     magic: int,
     payload: bytes,
     poll_delay_s: float,
-    command_timeout_polls: int = 10,
+    command_timeout_polls: int = 20,  # More polls for chunked responses
 ) -> None:
     rx_magic, rx_payload = parse_frame(spi.xfer2(build_frame(payload, magic)))
-    if rx_payload:
-        print_payload(prompt, rx_payload)
-
+    
     if magic != REQ_COMMAND_MAGIC:
+        # Data response - just print and return
+        if rx_payload:
+            print_payload(prompt, rx_payload)
         return
 
-    # For commands, keep polling until we get a response with actual content (0x5B magic)
+    # For command responses, collect across multiple chunked transactions
+    response_length = 0
+    response_data = bytearray()
+    got_header = False
+    
+    # First frame might have header info
+    if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
+        if not got_header and len(rx_payload) >= 1:
+            response_length = rx_payload[0]
+            if len(rx_payload) > 1:
+                response_data.extend(rx_payload[1:])
+            got_header = True
+    
+    # Poll for remaining chunks
     for poll_num in range(command_timeout_polls):
         time.sleep(poll_delay_s)
         rx_magic, rx_payload = parse_frame(spi.xfer2(build_frame(b"")))
-        if rx_payload:
-            print_payload(prompt, rx_payload)
-        # Stop if we got a command response (0x5B) with content
-        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
-            return
-    prompt.print_line("[pico] command timed out waiting for SPI reply")
+        
+        if rx_magic == RESP_COMMAND_MAGIC or rx_magic == RESP_DATA_MAGIC:
+            if not got_header and rx_payload and len(rx_payload) >= 1:
+                # First response frame: extract length
+                response_length = rx_payload[0]
+                if len(rx_payload) > 1:
+                    response_data.extend(rx_payload[1:])
+                got_header = True
+            elif got_header and rx_payload:
+                # Subsequent frames: add data bytes
+                response_data.extend(rx_payload)
+        
+        # Stop if we have all the data
+        if got_header and len(response_data) >= response_length:
+            break
+    
+    # Print collected response
+    if got_header:
+        final_data = bytes(response_data[:response_length])
+        if final_data:
+            print_payload(prompt, final_data)
+    else:
+        prompt.print_line("[pico] command timed out waiting for SPI reply")
 
 
 def print_help() -> list[str]:

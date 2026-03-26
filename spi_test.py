@@ -89,18 +89,37 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
     magic_first, length_first, body_first = parse_frame(rx_first)
 
     responses: list[tuple[int, list[int], int, bytes]] = []
-    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 10
+    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 20  # More polls for chunked responses
+    
+    # Collect response chunks across multiple transactions
+    response_magic = 0
+    response_length = 0
+    response_data = bytearray()
+    got_header = False
+    
     for _ in range(poll_count):
         if magic == REQ_COMMAND_MAGIC:
             time.sleep(0.02)
         rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
         resp_magic, resp_len, resp_body = parse_frame(rx)
         responses.append((resp_magic, rx, resp_len, resp_body))
-        if magic == REQ_COMMAND_MAGIC:
-            # For commands, keep polling until we get a 0x5B response with actual content
-            if resp_magic == RESP_COMMAND_MAGIC and resp_len > 0:
-                break
-        elif resp_magic in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+        
+        # Handle chunked response format: first frame has [magic, length], rest has data
+        if resp_magic == RESP_COMMAND_MAGIC or resp_magic == RESP_DATA_MAGIC:
+            if not got_header and resp_len >= 1 and resp_body:
+                # First frame: extract magic byte and length byte
+                response_magic = resp_magic
+                response_length = resp_body[0]
+                # Add any remaining bytes from first frame
+                if len(resp_body) > 1:
+                    response_data.extend(resp_body[1:])
+                got_header = True
+            elif got_header and resp_body:
+                # Subsequent frames: add all bytes as data
+                response_data.extend(resp_body)
+        
+        # Stop if we have collected all response data
+        if got_header and len(response_data) >= response_length:
             break
 
     print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
@@ -113,18 +132,14 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
             if magic_first
             else "first transfer response: invalid"
         )
-        # Look for a valid command response (0x5B with non-zero length and non-garbage data)
-        final = next(
-            ((m, l, b) for m, _, l, b in responses if m == RESP_COMMAND_MAGIC and l > 0),
-            None
-        )
-    else:
-        final = next(((m, l, b) for m, _, l, b in responses if m in (RESP_MAGIC, RESP_COMMAND_MAGIC)), None)
-    valid = final is not None
-    final_magic, final_len, final_body = final if final else (0, 0, b"")
+    
+    # Validate response
+    valid = got_header and response_magic in (RESP_COMMAND_MAGIC, RESP_DATA_MAGIC)
+    final_body = bytes(response_data[:response_length])
+    
     print(f"valid response: {'yes' if valid else 'no'}")
-    print(f"response magic: 0x{final_magic:02x}")
-    print(f"declared length: {final_len}")
+    print(f"response magic: 0x{response_magic:02x}")
+    print(f"declared length: {response_length}")
     if final_body:
         try:
             decoded = final_body.decode('utf-8', errors='replace')

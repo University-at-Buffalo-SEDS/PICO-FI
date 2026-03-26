@@ -54,6 +54,8 @@ pub struct UpstreamSpiDevice {
     clear_after_transaction: bool,
     /// Holds one completed request frame until the bridge loop consumes it.
     pending_frame: Option<[u8; FRAME_SIZE]>,
+    /// Tracks offset into tx_frame for chunked response transmission.
+    tx_response_offset: usize,
 }
 
 /// Configures `SPI1` as the framed upstream slave transport.
@@ -126,6 +128,7 @@ pub fn init_upstream_spi<TX: PeripheralType, RX: PeripheralType>(
         cs_active: false,
         clear_after_transaction: false,
         pending_frame: None,
+        tx_response_offset: 0,
     };
     device.prepare_response_frame(RESP_DATA_MAGIC, &[]);
     device
@@ -355,6 +358,8 @@ impl UpstreamSpiDevice {
     /// This is called by the SPI polling task when core 0 sends a response.
     pub fn stage_response_frame(&mut self, frame: [u8; FRAME_SIZE]) {
         self.tx_frame = frame;
+        // Reset offset so new response starts from byte 0
+        self.tx_response_offset = 0;
         // Always call rearm when not in active transaction
         // This ensures the frame is properly loaded into the FIFO
         if !self.cs_active {
@@ -385,6 +390,8 @@ impl UpstreamSpiDevice {
         self.cs_active = true;
         while self.cs_is_low() {
             self.drain_rx_fifo();
+            // Continuously refill TX FIFO during transaction
+            // This handles the case where TX FIFO can only hold 1-2 bytes
             self.prefill_tx_fifo();
         }
         self.cs_active = false;
@@ -416,13 +423,29 @@ impl UpstreamSpiDevice {
         self.rearm_transaction();
     }
 
-    /// Preloads as many bytes as possible into the hardware TX FIFO.
+    /// Preloads 2 bytes into the hardware TX FIFO for chunked response transmission.
+    /// Each transaction sends 2 bytes from the response frame, advancing the offset.
     fn prefill_tx_fifo(&mut self) {
-        while self.tx_len < FRAME_SIZE {
-            match self.spi.write(self.tx_frame[self.tx_len]) {
-                Ok(()) => self.tx_len += 1,
-                Err(nb::Error::WouldBlock) => break,
-                Err(nb::Error::Other(_)) => break,
+        let p = rp_pac::SPI1;
+
+        // Send 2 bytes per transaction (working within the 1-2 byte FIFO limit)
+        let chunks_to_send = 2;
+
+        for _ in 0..chunks_to_send {
+            if self.tx_response_offset >= FRAME_SIZE {
+                // Response complete, cycle back to start
+                self.tx_response_offset = 0;
+            }
+
+            let sr = p.sr().read();
+            if sr.tnf() {
+                // Write byte directly to data register
+                let byte = self.tx_frame[self.tx_response_offset];
+                p.dr().write_value(rp_pac::spi::regs::Dr(byte as u32));
+                self.tx_response_offset += 1;
+                self.tx_len += 1;
+            } else {
+                break;
             }
         }
     }
