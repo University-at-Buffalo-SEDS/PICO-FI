@@ -284,7 +284,7 @@ def main() -> int:
         print(f"ERROR: Cannot open I2C bus {args.bus}: {e}")
         print("Make sure:")
         print(f"  1. I2C{args.bus} is enabled")
-        print("  2. Pico is connected (GPIO2↔SDA, GPIO3↔SCL)")
+        print("  2. Pico is connected (GPIO0↔SDA, GPIO1↔SCL)")
         print("  3. Running with sudo (if needed)")
         return 1
 

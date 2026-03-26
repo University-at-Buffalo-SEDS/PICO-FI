@@ -1,20 +1,18 @@
 # I2C Protocol
 
-This project uses a framed I2C protocol between a Linux I2C master and the Pico acting as an `I2C1` slave at address `0x55`.
+This project uses a framed I2C protocol between a Linux I2C master and the Pico acting as an `I2C0` slave at address `0x55`.
 
 ## Electrical setup
 
 The Pico uses:
 
-- `GPIO2` = `I2C1 SDA`
-- `GPIO3` = `I2C1 SCL`
-
-These pins were chosen to avoid the boot/control UART on `GPIO0/GPIO1`.
+- `GPIO0` = `I2C0 SDA`
+- `GPIO1` = `I2C0 SCL`
 
 Pi wiring:
 
-- Pi SDA -> Pico `GPIO2`
-- Pi SCL -> Pico `GPIO3`
+- Pi SDA -> Pico `GPIO0`
+- Pi SCL -> Pico `GPIO1`
 - Pi GND -> Pico GND
 
 ## Frame layout

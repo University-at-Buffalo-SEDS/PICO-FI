@@ -16,7 +16,7 @@ try:
     except Exception as e:
         print(f"❌ Device at 0x{addr:02x} not responding: {e}")
         print("\nTroubleshooting:")
-        print("1. Check GPIO2 (SDA) and GPIO3 (SCL) are wired correctly")
+        print("1. Check GPIO0 (SDA) and GPIO1 (SCL) are wired correctly")
         print("2. Verify Pico is powered on")
         print("3. Check pull-up resistors (4.7k ohm recommended)")
         print("4. Run: i2cdetect -y 1")

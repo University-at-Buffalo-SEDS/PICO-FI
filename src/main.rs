@@ -10,7 +10,6 @@ mod protocol;
 mod shell;
 mod storage;
 
-use bridge::i2c::init_upstream_i2c;
 use bridge::i2c_task::{i2c_poll_task, I2cFrame};
 use bridge::runtime::BridgeRuntime;
 use config::{BridgeConfig, BridgeMode, UpstreamMode};
@@ -18,7 +17,8 @@ use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, UART0};
+use embassy_rp::i2c_slave::{Config as I2cSlaveConfig, I2cSlave};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, UART0};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -34,6 +34,7 @@ use storage::ConfigStorage;
 bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
+    I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
 });
 
 /// Static TX buffer used by the boot/control UART.
@@ -103,7 +104,7 @@ async fn app(spawner: Spawner) {
 
     let mut uart_config = uart::Config::default();
     uart_config.baudrate = 115_200;
-    let mut uart = BufferedUart::new(
+    let uart = BufferedUart::new(
         p.UART0,
         p.PIN_0,
         p.PIN_1,
@@ -112,10 +113,17 @@ async fn app(spawner: Spawner) {
         UART_RX_BUF.init([0; 512]),
         uart_config,
     );
+    let mut uart = Some(uart);
 
     let mut config_storage = ConfigStorage::new(p.FLASH);
     let initial_config = config_storage.load().unwrap_or_default();
-    let bridge_config = configuration_shell(&mut uart, &mut config_storage, initial_config).await;
+    let bridge_config = configuration_shell(
+        uart.as_mut()
+            .expect("configuration shell requires the boot UART"),
+        &mut config_storage,
+        initial_config,
+    )
+    .await;
     if !matches!(bridge_config.upstream_mode, UpstreamMode::Test) {
         spawner.spawn(
             heartbeat_task(
@@ -128,10 +136,19 @@ async fn app(spawner: Spawner) {
     }
 
     let upstream_i2c = if matches!(bridge_config.upstream_mode, UpstreamMode::I2c) {
-        let i2c = init_upstream_i2c(
-            p.I2C1,
-            p.PIN_2,
-            p.PIN_3,
+        // Release UART0 before reusing GPIO0/GPIO1 as the I2C0 upstream bus.
+        drop(uart.take());
+        let mut i2c_config = I2cSlaveConfig::default();
+        i2c_config.addr = 0x55;
+        i2c_config.general_call = false;
+        i2c_config.sda_pullup = false;
+        i2c_config.scl_pullup = false;
+        let i2c = I2cSlave::new(
+            p.I2C0,
+            unsafe { embassy_rp::peripherals::PIN_1::steal() },
+            unsafe { embassy_rp::peripherals::PIN_0::steal() },
+            Irqs,
+            i2c_config,
         );
         // Spawn dedicated I2C polling task.
         spawner.spawn(
@@ -166,7 +183,7 @@ async fn app(spawner: Spawner) {
     };
 
     let result = run_bridge_mode(
-        &mut uart,
+        uart.as_mut(),
         stack,
         bridge_config,
         upstream_i2c.as_ref(),
@@ -185,7 +202,7 @@ async fn app(spawner: Spawner) {
 
 /// Selects the correct bridge implementation for the configured role and upstream transport.
 async fn run_bridge_mode(
-    uart: &mut BufferedUart,
+    uart: Option<&mut BufferedUart>,
     stack: embassy_net::Stack<'static>,
     bridge_config: BridgeConfig,
     upstream_i2c_enabled: Option<&()>,
@@ -204,28 +221,37 @@ async fn run_bridge_mode(
 
     match (bridge_config.bridge_mode, bridge_config.upstream_mode) {
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Uart) => {
-            bridge::uart::run_client(uart, stack, host, port, bridge_config, runtime).await
+            bridge::uart::run_client(
+                uart.expect("uart mode requires an active UART"),
+                stack,
+                host,
+                port,
+                bridge_config,
+                runtime,
+            )
+            .await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
-            bridge::uart::run_server(uart, stack, port, bridge_config, runtime).await
+            bridge::uart::run_server(
+                uart.expect("uart mode requires an active UART"),
+                stack,
+                port,
+                bridge_config,
+                runtime,
+            )
+            .await
         }
         (BridgeMode::TcpClient { host, port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
-            Some(_) => {
-                let _ = uart;
-                bridge::i2c::run_client(stack, host, port, bridge_config, runtime, i2c_rx, i2c_tx).await
-            }
+            Some(_) => bridge::i2c::run_client(stack, host, port, bridge_config, runtime, i2c_rx, i2c_tx).await,
             None => Err(()),
         },
         (BridgeMode::TcpServer { port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
-            Some(_) => {
-                let _ = uart;
-                bridge::i2c::run_server(stack, port, bridge_config, runtime, i2c_rx, i2c_tx).await
-            }
+            Some(_) => bridge::i2c::run_server(stack, port, bridge_config, runtime, i2c_rx, i2c_tx).await,
             None => Err(()),
         },
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Test) => {
             bridge::test::run_client(
-                uart,
+                uart.expect("test mode requires an active UART"),
                 stack,
                 host,
                 port,
@@ -235,7 +261,7 @@ async fn run_bridge_mode(
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Test) => {
             bridge::test::run_server(
-                uart,
+                uart.expect("test mode requires an active UART"),
                 stack,
                 port,
                 status_led.expect("test server mode requires a status LED"),
@@ -248,7 +274,7 @@ async fn run_bridge_mode(
 /// Dedicated task for continuous I2C polling.
 #[embassy_executor::task]
 async fn i2c_controller_task(
-    mut i2c: bridge::i2c::UpstreamI2cDevice,
+    mut i2c: I2cSlave<'static, I2C0>,
     tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
     rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
 ) {
@@ -263,12 +289,6 @@ fn main() -> ! {
         spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }
-
-
-
-
-
-
 
 
 
