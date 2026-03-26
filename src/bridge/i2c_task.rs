@@ -6,8 +6,7 @@ use embassy_rp::peripherals::I2C0;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 
-const SMBUS_CHUNK_MAX: usize = 32;
-const SMBUS_WRITE_OVERHEAD: usize = 2;
+const I2C_CHUNK_MAX: usize = 32;
 
 /// Message type for framed I2C transfers passed between the bus task and bridge session.
 #[derive(Clone, Copy)]
@@ -15,13 +14,13 @@ pub struct I2cFrame {
     pub data: [u8; FRAME_SIZE],
 }
 
-/// Continuously services the I2C bus, reassembling SMBus-sized chunks into full frames.
+/// Continuously services the I2C bus, reassembling fixed 32-byte chunks into full frames.
 pub async fn i2c_poll_task(
     i2c: &mut I2cSlave<'static, I2C0>,
     tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
     rx_resp: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
 ) -> ! {
-    let mut transaction_buf = [0u8; SMBUS_CHUNK_MAX + SMBUS_WRITE_OVERHEAD];
+    let mut transaction_buf = [0u8; I2C_CHUNK_MAX];
     let mut rx_frame = [0u8; FRAME_SIZE];
     let mut rx_pos = 0usize;
     let mut tx_frame = make_response_frame(RESP_DATA_MAGIC, b"");
@@ -71,21 +70,9 @@ fn append_chunk(chunk: &[u8], frame: &mut [u8; FRAME_SIZE], pos: &mut usize) {
         return;
     }
 
-    // `write_i2c_block_data(addr, cmd, data)` puts `cmd` on the wire first and SMBus block
-    // transactions also include a count byte before the payload.
-    let payload = if chunk.len() >= 2 && chunk[0] == 0 {
-        let declared = chunk[1] as usize;
-        if declared + 2 == chunk.len() {
-            &chunk[2..]
-        } else {
-            &chunk[1..]
-        }
-    } else {
-        chunk
-    };
     let remaining = FRAME_SIZE.saturating_sub(*pos);
-    let take = remaining.min(payload.len());
-    frame[*pos..*pos + take].copy_from_slice(&payload[..take]);
+    let take = remaining.min(chunk.len());
+    frame[*pos..*pos + take].copy_from_slice(&chunk[..take]);
     *pos += take;
 }
 
@@ -95,7 +82,7 @@ async fn respond_chunk(
     tx_pos: usize,
 ) -> usize {
     let remaining = FRAME_SIZE.saturating_sub(tx_pos);
-    let send_len = remaining.min(SMBUS_CHUNK_MAX).max(1);
+    let send_len = remaining.min(I2C_CHUNK_MAX).max(1);
     let start = tx_pos.min(FRAME_SIZE.saturating_sub(1));
     let end = (start + send_len).min(FRAME_SIZE);
 

@@ -36,12 +36,21 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
-            .await
-            .is_err()
+        match select(
+            i2c_rx.receive(),
+            connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
+        )
+        .await
         {
-            Timer::after_millis(runtime.reconnect_delay_ms).await;
-            continue;
+            Either::First(frame) => {
+                handle_i2c_request(frame, None, bridge_config, runtime.link_active, i2c_tx).await?;
+                continue;
+            }
+            Either::Second(Err(_)) => {
+                Timer::after_millis(runtime.reconnect_delay_ms).await;
+                continue;
+            }
+            Either::Second(Ok(())) => {}
         }
         if exchange_link_handshake(
             &mut socket,
@@ -88,7 +97,14 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        socket.accept(port).await.map_err(|_| ())?;
+        match select(i2c_rx.receive(), socket.accept(port)).await {
+            Either::First(frame) => {
+                handle_i2c_request(frame, None, bridge_config, runtime.link_active, i2c_tx).await?;
+                continue;
+            }
+            Either::Second(Err(_)) => return Err(()),
+            Either::Second(Ok(())) => {}
+        }
         if exchange_link_handshake(
             &mut socket,
             false,
@@ -131,7 +147,7 @@ async fn session(
     loop {
         match select(i2c_rx.receive(), socket.read(&mut net_buf)).await {
             Either::First(frame) => {
-                handle_i2c_request(frame, socket, bridge_config, link_active, i2c_tx).await?;
+                handle_i2c_request(frame, Some(socket), bridge_config, link_active, i2c_tx).await?;
             }
             Either::Second(Ok(net_n)) => {
                 if net_n == 0 {
@@ -147,16 +163,18 @@ async fn session(
 
 async fn handle_i2c_request(
     frame: I2cFrame,
-    socket: &mut TcpSocket<'_>,
+    socket: Option<&mut TcpSocket<'_>>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
     i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
 ) -> Result<(), ()> {
     match parse_request_frame(&frame.data) {
         Some(RequestFrame::Data(payload)) => {
-            if !payload.is_empty() {
-                write_socket(socket, payload).await?;
-            } else {
+            if let Some(socket) = socket {
+                if !payload.is_empty() {
+                    write_socket(socket, payload).await?;
+                }
+            } else if !payload.is_empty() {
                 let response = make_response_frame(RESP_DATA_MAGIC, b"");
                 i2c_tx.send(I2cFrame { data: response }).await;
             }

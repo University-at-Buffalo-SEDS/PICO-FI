@@ -94,8 +94,6 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         if magic == REQ_COMMAND_MAGIC and magic_val != RESP_COMMAND_MAGIC:
             for _ in range(20):
                 time.sleep(0.05)
-                write_frame(bus, build_frame(b""))
-                time.sleep(0.02)
                 rx = read_frame(bus)
                 magic_val, length, body = parse_frame(rx)
                 if magic_val == RESP_COMMAND_MAGIC:

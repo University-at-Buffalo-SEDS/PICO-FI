@@ -73,6 +73,25 @@ def print_payload(prompt: "PromptState", payload: bytes) -> None:
             prompt.print_line(line)
 
 
+def read_frame(bus) -> bytes:
+    """Read one full framed response from the Pico"""
+    rx = bytearray()
+    for _ in range(0, FRAME_SIZE, CHUNK_SIZE):
+        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
+        chunk = bus.read(I2C_ADDR, chunk_size)
+        rx.extend(chunk)
+        time.sleep(0.01)
+    return bytes(rx[:FRAME_SIZE])
+
+
+def write_frame(bus, frame: bytes) -> None:
+    """Write one full framed request to the Pico"""
+    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+        chunk = frame[i:i + CHUNK_SIZE]
+        bus.write(I2C_ADDR, chunk)
+        time.sleep(0.01)
+
+
 def exchange_frame(
     bus,
     prompt: "PromptState",
@@ -84,22 +103,11 @@ def exchange_frame(
     """Send frame and collect response"""
     try:
         tx = build_frame(payload, magic)
-        
-        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-            chunk = tx[i:i+CHUNK_SIZE]
-            bus.write(I2C_ADDR, chunk)
-            time.sleep(0.01)
-        
+
+        write_frame(bus, tx)
         time.sleep(0.05)
-        
-        rx = bytearray()
-        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-            chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-            chunk = bus.read(I2C_ADDR, chunk_size)
-            rx.extend(chunk)
-            time.sleep(0.01)
-        
-        rx = bytes(rx[:FRAME_SIZE])
+
+        rx = read_frame(bus)
         rx_magic, rx_payload = parse_frame(rx)
         
         if magic != REQ_COMMAND_MAGIC:
@@ -113,23 +121,7 @@ def exchange_frame(
 
         for _ in range(command_timeout_polls):
             time.sleep(poll_delay_s)
-            tx_poll = build_frame(b"")
-            
-            for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-                chunk = tx_poll[i:i+CHUNK_SIZE]
-                bus.write(I2C_ADDR, chunk)
-                time.sleep(0.005)
-            
-            time.sleep(0.02)
-            
-            rx = bytearray()
-            for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-                chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-                chunk = bus.read(I2C_ADDR, chunk_size)
-                rx.extend(chunk)
-                time.sleep(0.005)
-            
-            rx = bytes(rx[:FRAME_SIZE])
+            rx = read_frame(bus)
             rx_magic, rx_payload = parse_frame(rx)
 
             if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
@@ -298,25 +290,9 @@ def main() -> int:
             else:
                 # Poll for incoming data
                 try:
-                    tx = build_frame(b"")
-                    
-                    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-                        chunk = tx[i:i+CHUNK_SIZE]
-                        bus.write(args.addr, chunk)
-                        time.sleep(0.005)
-                    
-                    time.sleep(0.02)
-                    
-                    rx = bytearray()
-                    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-                        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-                        chunk = bus.read(args.addr, chunk_size)
-                        rx.extend(chunk)
-                        time.sleep(0.005)
-                    
-                    rx = bytes(rx[:FRAME_SIZE])
+                    rx = read_frame(bus)
                     rx_magic, payload = parse_frame(rx)
-                    if payload:
+                    if rx_magic == RESP_DATA_MAGIC and payload:
                         print_payload(prompt, payload)
                 except Exception:
                     pass
