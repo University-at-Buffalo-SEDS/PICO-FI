@@ -75,6 +75,12 @@ def print_payload(prompt: "PromptState", payload: bytes) -> None:
             prompt.print_line(line)
 
 
+def print_raw_frame(prompt: "PromptState", magic: int, payload: bytes) -> None:
+    """Print a compact raw frame summary"""
+    hex_payload = payload.hex(" ")
+    prompt.print_line(f"[raw] magic=0x{magic:02x} len={len(payload)} data={hex_payload}")
+
+
 def read_frame(bus) -> bytes:
     """Read one full framed response from the Pico"""
     rx = bytearray()
@@ -89,10 +95,10 @@ def read_frame(bus) -> bytes:
 
 def write_frame(bus, frame: bytes) -> None:
     """Write one full framed request to the Pico"""
-    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+    for i in range(0, len(frame), CHUNK_SIZE):
         chunk = frame[i:i + CHUNK_SIZE]
         bus.write(I2C_ADDR, chunk)
-        if i + CHUNK_SIZE < FRAME_SIZE:
+        if i + CHUNK_SIZE < len(frame):
             time.sleep(CHUNK_DELAY_S)
 
 
@@ -102,6 +108,7 @@ def exchange_frame(
     magic: int,
     payload: bytes,
     poll_delay_s: float,
+    raw_mode: bool,
     command_timeout_polls: int = 50,
 ) -> None:
     """Send frame and collect response"""
@@ -113,6 +120,8 @@ def exchange_frame(
 
         rx = read_frame(bus)
         rx_magic, rx_payload = parse_frame(rx)
+        if raw_mode and rx_magic:
+            print_raw_frame(prompt, rx_magic, rx_payload)
         
         if magic != REQ_COMMAND_MAGIC:
             if rx_payload:
@@ -127,6 +136,8 @@ def exchange_frame(
             time.sleep(poll_delay_s)
             rx = read_frame(bus)
             rx_magic, rx_payload = parse_frame(rx)
+            if raw_mode and rx_magic:
+                print_raw_frame(prompt, rx_magic, rx_payload)
 
             if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
                 print_payload(prompt, rx_payload)
@@ -237,6 +248,7 @@ def main() -> int:
     parser.add_argument("--bus", type=int, default=1, help="I2C bus number")
     parser.add_argument("--addr", type=int, default=0x55, help="Pico I2C address")
     parser.add_argument("--poll-ms", type=int, default=50, help="Poll delay in ms")
+    parser.add_argument("--raw", action="store_true", help="Print raw framed I2C responses")
     parser.add_argument("--sender", default="", help="Sender label prepended to chat lines")
     args = parser.parse_args()
     global I2C_ADDR
@@ -290,12 +302,14 @@ def main() -> int:
             poll_delay_s = args.poll_ms / 1000.0
             if pending:
                 magic, payload = pending.popleft()
-                exchange_frame(bus, prompt, magic, payload, poll_delay_s)
+                exchange_frame(bus, prompt, magic, payload, poll_delay_s, args.raw)
             else:
                 # Poll for incoming data
                 try:
                     rx = read_frame(bus)
                     rx_magic, payload = parse_frame(rx)
+                    if args.raw and rx_magic:
+                        print_raw_frame(prompt, rx_magic, payload)
                     if rx_magic == RESP_DATA_MAGIC and payload:
                         print_payload(prompt, payload)
                 except Exception:

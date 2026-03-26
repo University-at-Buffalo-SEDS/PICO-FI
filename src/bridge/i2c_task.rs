@@ -85,11 +85,11 @@ pub async fn i2c_poll_task(
                     reset_rx_state(&mut rx_frame, &mut rx_pos, &mut rx_expected);
                 }
                 await_response_frame(&rx_resp, &mut tx_frame, &mut tx_pos).await;
-                tx_pos = respond_chunk(i2c, &tx_frame, tx_pos).await;
+                tx_pos = respond_chunk(i2c, &mut tx_frame, tx_pos).await;
             }
             Ok(Command::Read) => {
                 await_response_frame(&rx_resp, &mut tx_frame, &mut tx_pos).await;
-                tx_pos = respond_chunk(i2c, &tx_frame, tx_pos).await;
+                tx_pos = respond_chunk(i2c, &mut tx_frame, tx_pos).await;
             }
             Ok(Command::GeneralCall(_)) => {}
             Err(_) => {
@@ -194,7 +194,7 @@ fn append_chunk(
 
 async fn respond_chunk(
     i2c: &mut I2cSlave<'static, I2C0>,
-    frame: &[u8; FRAME_SIZE],
+    frame: &mut [u8; FRAME_SIZE],
     tx_pos: usize,
 ) -> usize {
     let remaining = FRAME_SIZE.saturating_sub(tx_pos);
@@ -204,11 +204,17 @@ async fn respond_chunk(
 
     match i2c.respond_and_fill(&frame[start..end], 0).await {
         Ok(ReadStatus::Done) | Ok(ReadStatus::LeftoverBytes(_)) => {
-            if end >= FRAME_SIZE { 0 } else { end }
+            if end >= FRAME_SIZE {
+                *frame = make_response_frame(RESP_DATA_MAGIC, b"");
+                0
+            } else {
+                end
+            }
         }
         Ok(ReadStatus::NeedMoreBytes) => end.min(FRAME_SIZE),
         Err(_) => {
             i2c.reset();
+            *frame = make_response_frame(RESP_DATA_MAGIC, b"");
             0
         }
     }

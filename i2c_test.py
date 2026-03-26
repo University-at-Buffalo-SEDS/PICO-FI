@@ -75,10 +75,10 @@ def read_frame(bus) -> bytes:
 
 def write_frame(bus, frame: bytes) -> None:
     """Write one full framed request to the Pico"""
-    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+    for i in range(0, len(frame), CHUNK_SIZE):
         chunk = frame[i:i + CHUNK_SIZE]
         bus.write(I2C_ADDR, chunk)
-        if i + CHUNK_SIZE < FRAME_SIZE:
+        if i + CHUNK_SIZE < len(frame):
             time.sleep(CHUNK_DELAY_S)
 
 
