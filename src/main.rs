@@ -18,6 +18,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c_slave::{Config as I2cSlaveConfig, I2cSlave};
+use embassy_rp::interrupt::InterruptExt as _;
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, UART0};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_sync::channel::Channel;
@@ -70,6 +71,28 @@ const LINK_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
 /// Fixed magic exchanged by both peers to confirm protocol compatibility.
 const LINK_HANDSHAKE_MAGIC: &[u8] = b"PICOFI1";
 
+fn disable_uart0() {
+    let regs = rp_pac::UART0;
+    regs.uartimsc().write_value(Default::default());
+    regs.uartdmacr().write_value(Default::default());
+    regs.uartcr().write(|w| {
+        w.set_uarten(false);
+        w.set_txe(false);
+        w.set_rxe(false);
+    });
+    regs.uarticr().write(|w| {
+        w.set_rtic(true);
+        w.set_txic(true);
+        w.set_rxic(true);
+        w.set_feic(true);
+        w.set_peic(true);
+        w.set_beic(true);
+        w.set_oeic(true);
+    });
+    embassy_rp::interrupt::Interrupt::UART0_IRQ.disable();
+    embassy_rp::interrupt::Interrupt::UART0_IRQ.unpend();
+}
+
 /// Blinks the onboard LED while a bridge link is active.
 #[embassy_executor::task]
 async fn heartbeat_task(mut led: Output<'static>) {
@@ -116,7 +139,12 @@ async fn app(spawner: Spawner) {
     let mut uart = Some(uart);
 
     let mut config_storage = ConfigStorage::new(p.FLASH);
-    let initial_config = config_storage.load().unwrap_or_default();
+    let compiled_config = BridgeConfig::default();
+    let initial_config = if matches!(compiled_config.upstream_mode, UpstreamMode::I2c) {
+        compiled_config
+    } else {
+        config_storage.load().unwrap_or(compiled_config)
+    };
     let bridge_config = configuration_shell(
         uart.as_mut()
             .expect("configuration shell requires the boot UART"),
@@ -138,6 +166,7 @@ async fn app(spawner: Spawner) {
     let upstream_i2c = if matches!(bridge_config.upstream_mode, UpstreamMode::I2c) {
         // Release UART0 before reusing GPIO0/GPIO1 as the I2C0 upstream bus.
         drop(uart.take());
+        disable_uart0();
         let mut i2c_config = I2cSlaveConfig::default();
         i2c_config.addr = 0x55;
         i2c_config.general_call = false;
@@ -289,9 +318,6 @@ fn main() -> ! {
         spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }
-
-
-
 
 
 

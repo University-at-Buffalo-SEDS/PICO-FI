@@ -57,6 +57,25 @@ def format_bytes(data: bytes) -> str:
     return " ".join(f"{b:02x}" for b in data[:16])
 
 
+def read_frame(bus) -> bytes:
+    """Read one full framed response from the Pico"""
+    rx = bytearray()
+    for _ in range(0, FRAME_SIZE, CHUNK_SIZE):
+        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
+        chunk = bus.read(I2C_ADDR, chunk_size)
+        rx.extend(chunk)
+        time.sleep(0.01)
+    return bytes(rx[:FRAME_SIZE])
+
+
+def write_frame(bus, frame: bytes) -> None:
+    """Write one full framed request to the Pico"""
+    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+        chunk = frame[i:i + CHUNK_SIZE]
+        bus.write(I2C_ADDR, chunk)
+        time.sleep(0.01)
+
+
 def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
     """Send frame via I2C and receive response"""
     try:
@@ -65,28 +84,27 @@ def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
         
         print(f"Sending to I2C addr 0x{I2C_ADDR:02x}...")
         print(f"Sent: {format_bytes(tx)}...")
-        
-        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-            chunk = tx[i:i + CHUNK_SIZE]
-            bus.write(I2C_ADDR, chunk)
-            time.sleep(0.01)
-        
-        time.sleep(0.1)
-        
-        rx = bytearray()
-        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-            chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-            chunk = bus.read(I2C_ADDR, chunk_size)
-            rx.extend(chunk)
-            time.sleep(0.01)
-        
-        rx = bytes(rx[:FRAME_SIZE])
+
+        write_frame(bus, tx)
+        time.sleep(0.05)
+
+        rx = read_frame(bus)
+        magic_val, length, body = parse_frame(rx)
+
+        if magic == REQ_COMMAND_MAGIC and magic_val != RESP_COMMAND_MAGIC:
+            for _ in range(20):
+                time.sleep(0.05)
+                write_frame(bus, build_frame(b""))
+                time.sleep(0.02)
+                rx = read_frame(bus)
+                magic_val, length, body = parse_frame(rx)
+                if magic_val == RESP_COMMAND_MAGIC:
+                    break
+
         bus.close()
         
         print(f"Recv: {format_bytes(rx)}...")
         
-        # Parse
-        magic_val, length, body = parse_frame(rx)
         valid = magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC)
         
         print(f"Magic: 0x{magic_val:02x}, Length: {length}")
