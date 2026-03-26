@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-UART-based test tool for Pico-Fi communication
-Replaces spi_test.py but uses serial communication instead
-"""
+"""UART-based test tool for Pico-Fi communication."""
 
 import argparse
 import sys
@@ -132,4 +129,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

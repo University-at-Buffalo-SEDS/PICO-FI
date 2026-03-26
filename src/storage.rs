@@ -130,7 +130,7 @@ fn decode_record(buf: &[u8; RECORD_SIZE]) -> Option<BridgeConfig> {
 
     let upstream_mode = match buf[32] {
         0 => UpstreamMode::Uart,
-        1 => UpstreamMode::Spi,
+        1 => UpstreamMode::I2c,
         2 => UpstreamMode::Test,
         _ => return None,
     };
@@ -163,7 +163,7 @@ fn encode_bridge_mode(mode: BridgeMode) -> u8 {
 fn encode_upstream_mode(mode: UpstreamMode) -> u8 {
     match mode {
         UpstreamMode::Uart => 0,
-        UpstreamMode::Spi => 1,
+        UpstreamMode::I2c => 1,
         UpstreamMode::Test => 2,
     }
 }

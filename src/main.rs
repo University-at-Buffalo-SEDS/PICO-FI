@@ -10,8 +10,8 @@ mod protocol;
 mod shell;
 mod storage;
 
-use bridge::spi::init_upstream_spi;
-use bridge::spi_task::{spi_poll_task, SpiFrame};
+use bridge::i2c::init_upstream_i2c;
+use bridge::i2c_task::{i2c_poll_task, I2cFrame};
 use bridge::runtime::BridgeRuntime;
 use config::{BridgeConfig, BridgeMode, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
@@ -45,11 +45,11 @@ static UART_RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 /// Single-core Embassy executor used by the firmware.
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
-/// Channel for SPI frames from polling task to bridge session (capacity of 4 pending frames).
-static SPI_FRAME_CHANNEL: Channel<CriticalSectionRawMutex, SpiFrame, 4> = Channel::new();
+/// Channel for I2C frames from polling task to bridge session.
+static I2C_FRAME_CHANNEL: Channel<CriticalSectionRawMutex, I2cFrame, 4> = Channel::new();
 
-/// Channel for response frames from bridge session back to SPI polling task.
-static SPI_RESPONSE_CHANNEL: Channel<CriticalSectionRawMutex, SpiFrame, 4> = Channel::new();
+/// Channel for response frames from bridge session back to the I2C polling task.
+static I2C_RESPONSE_CHANNEL: Channel<CriticalSectionRawMutex, I2cFrame, 4> = Channel::new();
 
 /// Shared link-state flag consumed by status reporting and heartbeat LED behavior.
 static LINK_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -127,20 +127,16 @@ async fn app(spawner: Spawner) {
         );
     }
 
-    let upstream_spi = if matches!(bridge_config.upstream_mode, UpstreamMode::Spi) {
-        let spi = init_upstream_spi(
-            p.SPI1,
-            p.PIN_10,
-            p.PIN_11,
-            p.PIN_12,
-            p.PIN_13,
-            p.DMA_CH2,
-            p.DMA_CH3,
+    let upstream_i2c = if matches!(bridge_config.upstream_mode, UpstreamMode::I2c) {
+        let i2c = init_upstream_i2c(
+            p.I2C1,
+            p.PIN_2,
+            p.PIN_3,
         );
-        // Spawn dedicated SPI polling task
+        // Spawn dedicated I2C polling task.
         spawner.spawn(
-            spi_controller_task(spi, SPI_FRAME_CHANNEL.sender(), SPI_RESPONSE_CHANNEL.receiver())
-                .expect("spi controller task token allocation failed"),
+            i2c_controller_task(i2c, I2C_FRAME_CHANNEL.sender(), I2C_RESPONSE_CHANNEL.receiver())
+                .expect("i2c controller task token allocation failed"),
         );
         Some(())
     } else {
@@ -173,10 +169,10 @@ async fn app(spawner: Spawner) {
         &mut uart,
         stack,
         bridge_config,
-        upstream_spi.as_ref(),
+        upstream_i2c.as_ref(),
         status_led.as_mut(),
-        SPI_FRAME_CHANNEL.receiver(),
-        SPI_RESPONSE_CHANNEL.sender(),
+        I2C_FRAME_CHANNEL.receiver(),
+        I2C_RESPONSE_CHANNEL.sender(),
     )
     .await;
 
@@ -192,10 +188,10 @@ async fn run_bridge_mode(
     uart: &mut BufferedUart,
     stack: embassy_net::Stack<'static>,
     bridge_config: BridgeConfig,
-    upstream_spi_enabled: Option<&()>,
+    upstream_i2c_enabled: Option<&()>,
     status_led: Option<&mut Output<'static>>,
-    spi_rx: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    spi_tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    i2c_rx: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
 ) -> Result<(), ()> {
     let runtime = BridgeRuntime {
         link_active: &LINK_ACTIVE,
@@ -213,15 +209,17 @@ async fn run_bridge_mode(
         (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
             bridge::uart::run_server(uart, stack, port, bridge_config, runtime).await
         }
-        (BridgeMode::TcpClient { host, port }, UpstreamMode::Spi) => match upstream_spi_enabled {
+        (BridgeMode::TcpClient { host, port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
             Some(_) => {
-                bridge::spi::run_client(uart, stack, host, port, None, spi_rx, spi_tx, bridge_config, runtime).await
+                let _ = uart;
+                bridge::i2c::run_client(stack, host, port, bridge_config, runtime, i2c_rx, i2c_tx).await
             }
             None => Err(()),
         },
-        (BridgeMode::TcpServer { port }, UpstreamMode::Spi) => match upstream_spi_enabled {
+        (BridgeMode::TcpServer { port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
             Some(_) => {
-                bridge::spi::run_server(uart, stack, port, None, spi_rx, spi_tx, bridge_config, runtime).await
+                let _ = uart;
+                bridge::i2c::run_server(stack, port, bridge_config, runtime, i2c_rx, i2c_tx).await
             }
             None => Err(()),
         },
@@ -247,16 +245,14 @@ async fn run_bridge_mode(
     }
 }
 
-/// Dedicated task for continuous SPI polling.
-/// Runs on the same core as the bridge but in a separate task with high priority,
-/// ensuring SPI transactions are polled frequently and not starved by network I/O.
+/// Dedicated task for continuous I2C polling.
 #[embassy_executor::task]
-async fn spi_controller_task(
-    mut spi: bridge::spi::UpstreamSpiDevice,
-    tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+async fn i2c_controller_task(
+    mut i2c: bridge::i2c::UpstreamI2cDevice,
+    tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
 ) {
-    spi_poll_task(&mut spi, tx, rx_resp).await
+    i2c_poll_task(&mut i2c, tx, rx_resp).await
 }
 
 /// Starts the Embassy executor and launches the async application task.
@@ -267,8 +263,6 @@ fn main() -> ! {
         spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }
-
-
 
 
 

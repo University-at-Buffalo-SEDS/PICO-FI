@@ -1,3 +1,3 @@
 //! Wire-level protocol definitions used by bridge transports.
 
-pub mod spi;
+pub mod i2c;

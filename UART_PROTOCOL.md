@@ -2,7 +2,7 @@
 
 This document describes how to talk to the Pico over its UART upstream interface.
 
-Unlike SPI, UART is line-oriented. The Pico buffers incoming ASCII until newline and then decides whether the line is:
+Unlike I2C, UART is line-oriented. The Pico buffers incoming ASCII until newline and then decides whether the line is:
 
 - a local Pico command, or
 - bridged data that should be forwarded over Ethernet
@@ -92,7 +92,7 @@ Implications:
 - newline ends the message
 - a line that begins with `/` is treated as a local Pico command
 
-If you need to send arbitrary binary packets, use the SPI transport instead.
+If you need to send arbitrary binary packets, use the I2C transport instead.
 
 ### Data examples
 

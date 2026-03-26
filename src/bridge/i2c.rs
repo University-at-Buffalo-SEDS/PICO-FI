@@ -1,15 +1,26 @@
-//! I2C0 slave on GPIO0 (SDA) and GPIO1 (SCL)
-//! Uses rp2040-hal to configure hardware I2C peripheral in slave mode
+//! I2C upstream bridge implementation and RP2040 I2C1 slave driver.
 
-use embassy_time::Timer;
-use crate::protocol::spi::FRAME_SIZE;
+use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::i2c_task::I2cFrame;
+use crate::bridge::runtime::BridgeRuntime;
+use crate::config::BridgeConfig;
+use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
+use crate::protocol::i2c::{
+    FRAME_SIZE, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame,
+    parse_request_frame,
+};
+use embassy_futures::select::{Either, select};
+use embassy_net::Ipv4Address;
+use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
+use embassy_rp::Peri;
+use embassy_rp::peripherals::{I2C1, PIN_2, PIN_3};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Receiver, Sender};
+use embassy_time::{Duration, Timer};
+use portable_atomic::{AtomicBool, Ordering};
 
 const I2C_SLAVE_ADDR: u16 = 0x55;
-
-#[derive(Clone, Copy)]
-pub struct I2cFrame {
-    pub data: [u8; FRAME_SIZE],
-}
 
 pub struct UpstreamI2cDevice {
     rx_frame: [u8; FRAME_SIZE],
@@ -17,21 +28,22 @@ pub struct UpstreamI2cDevice {
     rx_pos: usize,
     tx_pos: usize,
     pending_frame: Option<[u8; FRAME_SIZE]>,
+    response_pending: bool,
 }
 
 impl UpstreamI2cDevice {
     pub fn new() -> Self {
-        init_i2c0_slave();
+        init_i2c1_slave();
 
-        let mut dev = UpstreamI2cDevice {
+        let dev = UpstreamI2cDevice {
             rx_frame: [0u8; FRAME_SIZE],
-            tx_frame: [0u8; FRAME_SIZE],
+            tx_frame: empty_data_frame(),
             rx_pos: 0,
             tx_pos: 0,
             pending_frame: None,
+            response_pending: false,
         };
-
-        // Initialize with default response (zeros)
+        let mut dev = dev;
         dev.preload_i2c_tx();
         dev
     }
@@ -39,18 +51,14 @@ impl UpstreamI2cDevice {
     pub fn stage_response_frame(&mut self, frame: [u8; FRAME_SIZE]) {
         self.tx_frame = frame;
         self.tx_pos = 0;
-        // Immediately preload the new data
+        self.response_pending = true;
         self.preload_i2c_tx();
     }
 
     pub fn poll_transaction(&mut self) -> Option<&[u8; FRAME_SIZE]> {
-        if self.pending_frame.is_some() {
-            return self.pending_frame.as_ref();
+        if self.pending_frame.is_none() {
+            self.handle_i2c_transaction();
         }
-
-        // Poll I2C status and handle transactions
-        self.handle_i2c_transaction();
-
         self.pending_frame.as_ref()
     }
 
@@ -60,185 +68,311 @@ impl UpstreamI2cDevice {
         self.rx_pos = 0;
     }
 
-    pub async fn receive_frame(&mut self) -> Option<[u8; FRAME_SIZE]> {
-        Timer::after_millis(10).await;
-        None
+    fn reset_response_frame(&mut self) {
+        self.tx_frame = empty_data_frame();
+        self.tx_pos = 0;
+        self.response_pending = false;
+        self.preload_i2c_tx();
     }
 
-    /// Preload TX FIFO with all response data
-    fn preload_i2c_tx(&self) {
+    fn preload_i2c_tx(&mut self) {
         unsafe {
-            const I2C0_BASE: usize = 0x40044000;
+            const I2C1_BASE: usize = 0x4004_8000;
             const IC_DATA_CMD: usize = 0x10;
             const IC_STATUS: usize = 0x70;
 
-            let data_cmd_addr = (I2C0_BASE + IC_DATA_CMD) as *mut u32;
-            let status_addr = (I2C0_BASE + IC_STATUS) as *const u32;
+            let data_cmd_addr = (I2C1_BASE + IC_DATA_CMD) as *mut u32;
+            let status_addr = (I2C1_BASE + IC_STATUS) as *const u32;
 
-            // Load entire frame into TX FIFO (FIFO is 8 bytes, will be drained and refilled)
-            for i in 0..FRAME_SIZE {
-                // Check TFNF (transmit FIFO not full) bit 1
+            while self.tx_pos < FRAME_SIZE {
                 let status = core::ptr::read_volatile(status_addr);
                 if (status & 0x02) == 0 {
-                    break; // FIFO full, stop
+                    break;
                 }
-
-                let byte = self.tx_frame[i] as u32;
+                let byte = self.tx_frame[self.tx_pos] as u32;
                 core::ptr::write_volatile(data_cmd_addr, byte);
+                self.tx_pos += 1;
             }
         }
     }
 
-    /// Poll I2C hardware and handle incoming/outgoing data
     fn handle_i2c_transaction(&mut self) {
         unsafe {
-            const I2C0_BASE: usize = 0x40044000;
+            const I2C1_BASE: usize = 0x4004_8000;
             const IC_RAW_INTR_STAT: usize = 0x34;
             const IC_DATA_CMD: usize = 0x10;
             const IC_STATUS: usize = 0x70;
-            const IC_CLR_RX_UNDER: usize = 0x48;
-            const IC_CLR_RX_OVER: usize = 0x4C;
-            const IC_CLR_TX_OVER: usize = 0x50;
             const IC_CLR_ACTIVITY: usize = 0x5C;
+            const IC_CLR_RX_UNDER: usize = 0x44;
+            const IC_CLR_RX_OVER: usize = 0x48;
+            const IC_CLR_TX_OVER: usize = 0x4C;
+            const IC_CLR_RD_REQ: usize = 0x50;
             const IC_CLR_STOP_DET: usize = 0x60;
 
-            let intr_stat_addr = (I2C0_BASE + IC_RAW_INTR_STAT) as *const u32;
-            let data_cmd_addr = (I2C0_BASE + IC_DATA_CMD) as *mut u32;
-            let status_addr = (I2C0_BASE + IC_STATUS) as *const u32;
-
+            let intr_stat_addr = (I2C1_BASE + IC_RAW_INTR_STAT) as *const u32;
+            let data_cmd_addr = (I2C1_BASE + IC_DATA_CMD) as *mut u32;
+            let status_addr = (I2C1_BASE + IC_STATUS) as *const u32;
             let intr_stat = core::ptr::read_volatile(intr_stat_addr);
 
-            // ALWAYS top up TX FIFO first - this is critical!
-            // RD_REQ = bit 5 - master is reading from us
-            if (intr_stat & 0x20) != 0 || true {
-                // Keep TX FIFO topped up
-                let status = core::ptr::read_volatile(status_addr);
+            if (intr_stat & 0x20) != 0 {
+                let _ = core::ptr::read_volatile((I2C1_BASE + IC_CLR_RD_REQ) as *const u32);
 
-                // TFNF (transmit FIFO not full) = bit 1
-                for _ in 0..16 {
+                for _ in 0..FRAME_SIZE {
                     let status = core::ptr::read_volatile(status_addr);
                     if (status & 0x02) == 0 {
-                        break; // FIFO full
+                        break;
                     }
-
-                    // Write next byte from current frame
-                    if self.tx_pos < FRAME_SIZE {
-                        let byte = self.tx_frame[self.tx_pos] as u32;
-                        core::ptr::write_volatile(data_cmd_addr, byte);
-                        self.tx_pos += 1;
-                    } else {
-                        // Cycle back to start if we've sent entire frame
-                        self.tx_pos = 0;
-                        if self.tx_frame[0] != 0 || self.tx_frame[1] != 0 {
-                            // Only cycle if not all zeros (default response)
-                            break;
-                        }
+                    if self.tx_pos >= FRAME_SIZE {
+                        break;
                     }
+                    let byte = self.tx_frame[self.tx_pos] as u32;
+                    core::ptr::write_volatile(data_cmd_addr, byte);
+                    self.tx_pos += 1;
                 }
             }
 
-            // Rx_full = bit 2
-            if (intr_stat & 0x04) != 0 {
+            loop {
+                let status = core::ptr::read_volatile(status_addr);
+                if (status & 0x08) == 0 {
+                    break;
+                }
+
                 let data_reg = core::ptr::read_volatile(data_cmd_addr);
                 let byte = (data_reg & 0xFF) as u8;
-
                 if self.rx_pos < FRAME_SIZE {
                     self.rx_frame[self.rx_pos] = byte;
                     self.rx_pos += 1;
                 }
             }
 
-            // Clear error interrupts
             if (intr_stat & 0x01) != 0 {
-                let _ = core::ptr::read_volatile((I2C0_BASE + IC_CLR_ACTIVITY) as *const u32);
+                let _ = core::ptr::read_volatile((I2C1_BASE + IC_CLR_RX_UNDER) as *const u32);
             }
             if (intr_stat & 0x08) != 0 {
-                let _ = core::ptr::read_volatile((I2C0_BASE + IC_CLR_RX_UNDER) as *const u32);
+                let _ = core::ptr::read_volatile((I2C1_BASE + IC_CLR_RX_OVER) as *const u32);
             }
-            if (intr_stat & 0x20) != 0 {
-                let _ = core::ptr::read_volatile((I2C0_BASE + IC_CLR_RX_OVER) as *const u32);
+            if (intr_stat & 0x10) != 0 {
+                let _ = core::ptr::read_volatile((I2C1_BASE + IC_CLR_TX_OVER) as *const u32);
             }
-            if (intr_stat & 0x40) != 0 {
-                let _ = core::ptr::read_volatile((I2C0_BASE + IC_CLR_TX_OVER) as *const u32);
+            if (intr_stat & 0x100) != 0 {
+                let _ = core::ptr::read_volatile((I2C1_BASE + IC_CLR_ACTIVITY) as *const u32);
             }
 
-            // Stop_det = bit 9
             if (intr_stat & 0x200) != 0 {
-                let _ = core::ptr::read_volatile((I2C0_BASE + IC_CLR_STOP_DET) as *const u32);
+                let _ = core::ptr::read_volatile((I2C1_BASE + IC_CLR_STOP_DET) as *const u32);
 
-                // Transaction complete
                 if self.rx_pos > 0 {
                     self.pending_frame = Some(self.rx_frame);
                     self.rx_pos = 0;
                     self.rx_frame.fill(0);
                     self.tx_pos = 0;
-                    // Preload next response
-                    self.preload_i2c_tx();
+                } else if self.response_pending {
+                    self.reset_response_frame();
                 }
             }
         }
     }
 }
 
-/// Initialize I2C0 as slave using volatile pointer access
-fn init_i2c0_slave() {
+fn empty_data_frame() -> [u8; FRAME_SIZE] {
+    make_response_frame(RESP_DATA_MAGIC, b"")
+}
+
+fn init_i2c1_slave() {
     unsafe {
-        // I2C0 base address
-        const I2C0_BASE: usize = 0x40044000;
-
-        // IO_BANK0 base address
-        const IO_BANK0_BASE: usize = 0x40014000;
-
-        // Register offsets
+        const I2C1_BASE: usize = 0x4004_8000;
+        const IO_BANK0_BASE: usize = 0x4001_4000;
         const IC_CON: usize = 0x00;
         const IC_SAR: usize = 0x08;
         const IC_ENABLE: usize = 0x6C;
         const GPIO_CTRL_OFFSET: usize = 0x04;
+        const I2C_FUNCSEL: u32 = 3;
 
-        // Configure GPIO0 for I2C (function 3)
-        let gpio0_ctrl_addr = IO_BANK0_BASE + (0 * 8) + GPIO_CTRL_OFFSET;
-        let gpio0_ctrl = gpio0_ctrl_addr as *mut u32;
-        let val = core::ptr::read_volatile(gpio0_ctrl);
-        core::ptr::write_volatile(gpio0_ctrl, (val & !0x1F) | 3);
+        let gpio2_ctrl = (IO_BANK0_BASE + (2 * 8) + GPIO_CTRL_OFFSET) as *mut u32;
+        let gpio3_ctrl = (IO_BANK0_BASE + (3 * 8) + GPIO_CTRL_OFFSET) as *mut u32;
+        let gpio2_val = core::ptr::read_volatile(gpio2_ctrl);
+        let gpio3_val = core::ptr::read_volatile(gpio3_ctrl);
+        core::ptr::write_volatile(gpio2_ctrl, (gpio2_val & !0x1F) | I2C_FUNCSEL);
+        core::ptr::write_volatile(gpio3_ctrl, (gpio3_val & !0x1F) | I2C_FUNCSEL);
 
-        // Configure GPIO1 for I2C (function 3)
-        let gpio1_ctrl_addr = IO_BANK0_BASE + (1 * 8) + GPIO_CTRL_OFFSET;
-        let gpio1_ctrl = gpio1_ctrl_addr as *mut u32;
-        let val = core::ptr::read_volatile(gpio1_ctrl);
-        core::ptr::write_volatile(gpio1_ctrl, (val & !0x1F) | 3);
-
-        // Disable I2C before configuration
-        let ic_enable = (I2C0_BASE + IC_ENABLE) as *mut u32;
+        let ic_enable = (I2C1_BASE + IC_ENABLE) as *mut u32;
         core::ptr::write_volatile(ic_enable, 0);
 
-        // Configure I2C control register
-        let ic_con = (I2C0_BASE + IC_CON) as *mut u32;
-        // Clear master mode, set slave mode, set speed to 1 (standard 100kHz)
-        core::ptr::write_volatile(ic_con, 0x21); // slave_disable=0, master_mode=0, speed=1
+        let ic_con = (I2C1_BASE + IC_CON) as *mut u32;
+        core::ptr::write_volatile(ic_con, 0x21);
 
-        // Set slave address to 0x55
-        let ic_sar = (I2C0_BASE + IC_SAR) as *mut u32;
-        core::ptr::write_volatile(ic_sar, 0x55);
+        let ic_sar = (I2C1_BASE + IC_SAR) as *mut u32;
+        core::ptr::write_volatile(ic_sar, I2C_SLAVE_ADDR as u32);
 
-        // Enable I2C
         core::ptr::write_volatile(ic_enable, 1);
     }
 }
 
-pub fn init_upstream_spi<TX, RX>(
-    _spi1: embassy_rp::Peri<'static, embassy_rp::peripherals::SPI1>,
-    _sclk: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_10>,
-    _tx: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
-    _rx: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_12>,
-    _cs: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_13>,
-    _tx_dma: embassy_rp::Peri<'static, TX>,
-    _rx_dma: embassy_rp::Peri<'static, RX>,
-) -> UpstreamI2cDevice
-where
-    TX: embassy_rp::PeripheralType,
-    RX: embassy_rp::PeripheralType,
-{
+pub fn init_upstream_i2c(
+    _i2c1: Peri<'static, I2C1>,
+    _sda: Peri<'static, PIN_2>,
+    _scl: Peri<'static, PIN_3>,
+) -> UpstreamI2cDevice {
     UpstreamI2cDevice::new()
 }
 
+pub async fn run_client(
+    stack: Stack<'static>,
+    host: [u8; 4],
+    port: u16,
+    bridge_config: BridgeConfig,
+    runtime: BridgeRuntime<'_>,
+    i2c_rx: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+) -> Result<(), ()> {
+    let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
+    Timer::after_millis(runtime.startup_delay_ms).await;
 
+    loop {
+        let mut rx_buf = [0u8; 2048];
+        let mut tx_buf = [0u8; 2048];
+        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_keep_alive(Some(Duration::from_secs(5)));
+
+        runtime.link_active.store(false, Ordering::Relaxed);
+        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
+            .await
+            .is_err()
+        {
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
+        }
+        if exchange_link_handshake(
+            &mut socket,
+            true,
+            runtime.handshake_magic,
+            runtime.handshake_timeout_ms,
+        )
+        .await
+        .is_err()
+        {
+            socket.abort();
+            let _ = socket.flush().await;
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
+        }
+        runtime.link_active.store(true, Ordering::Relaxed);
+
+        let _ = session(
+            &mut socket,
+            bridge_config,
+            runtime.link_active,
+            i2c_rx,
+            i2c_tx,
+        )
+        .await;
+        socket.abort();
+        let _ = socket.flush().await;
+        runtime.link_active.store(false, Ordering::Relaxed);
+        Timer::after_millis(runtime.reconnect_delay_ms).await;
+    }
+}
+
+pub async fn run_server(
+    stack: Stack<'static>,
+    port: u16,
+    bridge_config: BridgeConfig,
+    runtime: BridgeRuntime<'_>,
+    i2c_rx: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+) -> Result<(), ()> {
+    loop {
+        let mut rx_buf = [0u8; 2048];
+        let mut tx_buf = [0u8; 2048];
+        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_keep_alive(Some(Duration::from_secs(5)));
+
+        socket.accept(port).await.map_err(|_| ())?;
+        if exchange_link_handshake(
+            &mut socket,
+            false,
+            runtime.handshake_magic,
+            runtime.handshake_timeout_ms,
+        )
+        .await
+        .is_err()
+        {
+            socket.abort();
+            let _ = socket.flush().await;
+            runtime.link_active.store(false, Ordering::Relaxed);
+            continue;
+        }
+        runtime.link_active.store(true, Ordering::Relaxed);
+
+        let _ = session(
+            &mut socket,
+            bridge_config,
+            runtime.link_active,
+            i2c_rx,
+            i2c_tx,
+        )
+        .await;
+        socket.abort();
+        let _ = socket.flush().await;
+        runtime.link_active.store(false, Ordering::Relaxed);
+    }
+}
+
+async fn session(
+    socket: &mut TcpSocket<'_>,
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    i2c_rx: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+) -> Result<(), ()> {
+    let mut net_buf = [0u8; 256];
+
+    loop {
+        match select(i2c_rx.receive(), socket.read(&mut net_buf)).await {
+            Either::First(frame) => {
+                handle_i2c_request(frame, socket, bridge_config, link_active, i2c_tx).await?;
+            }
+            Either::Second(Ok(net_n)) => {
+                if net_n == 0 {
+                    return Ok(());
+                }
+                let response = make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]);
+                i2c_tx.send(I2cFrame { data: response }).await;
+            }
+            Either::Second(Err(_)) => return Err(()),
+        }
+    }
+}
+
+async fn handle_i2c_request(
+    frame: I2cFrame,
+    socket: &mut TcpSocket<'_>,
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+) -> Result<(), ()> {
+    match parse_request_frame(&frame.data) {
+        Some(RequestFrame::Data(payload)) => {
+            if !payload.is_empty() {
+                write_socket(socket, payload).await?;
+            } else {
+                let response = make_response_frame(RESP_DATA_MAGIC, b"");
+                i2c_tx.send(I2cFrame { data: response }).await;
+            }
+            Ok(())
+        }
+        Some(RequestFrame::Command(payload)) => {
+            let line = trim_ascii_line(payload);
+            let response =
+                render_local_bridge_command(bridge_config, link_active, line);
+            let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
+            i2c_tx.send(I2cFrame { data: frame }).await;
+            Ok(())
+        }
+        None => {
+            let response = make_response_frame(RESP_COMMAND_MAGIC, b"error invalid i2c frame");
+            i2c_tx.send(I2cFrame { data: response }).await;
+            Ok(())
+        }
+    }
+}

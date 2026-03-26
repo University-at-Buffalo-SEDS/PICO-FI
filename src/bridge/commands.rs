@@ -1,4 +1,4 @@
-//! Local bridge command rendering shared by UART and SPI control paths.
+//! Local bridge command rendering shared by UART and I2C control paths.
 
 use crate::config::{BridgeConfig, render_config};
 use portable_atomic::{AtomicBool, Ordering};

@@ -39,26 +39,17 @@ def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
     """Extract data from frame"""
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
-    
     if is_garbage_frame(frame):
         return 0, 0, b""
-    
-    response_bytes = bytearray()
-    for byte_val in frame:
-        if byte_val == 0:
-            break
-        response_bytes.append(byte_val)
-    
-    if len(response_bytes) >= 2:
-        magic_val = response_bytes[0]
-        length = response_bytes[1]
-        if len(response_bytes) > 2:
-            body = bytes(response_bytes[2:2+length])
-        else:
-            body = b""
-        return magic_val, length, body
-    
-    return 0, 0, b""
+
+    magic_val = frame[0]
+    length = frame[1]
+    if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+        return 0, 0, b""
+    if length > PAYLOAD_MAX:
+        return 0, 0, b""
+    body = bytes(frame[2:2 + length])
+    return magic_val, length, body
 
 
 def format_bytes(data: bytes) -> str:
@@ -149,6 +140,8 @@ def main() -> int:
     cmd_parser.add_argument("text", help="Command text (e.g., /ping)")
     
     args = parser.parse_args()
+    global I2C_ADDR
+    I2C_ADDR = args.addr
     
     if args.command == "probe":
         failures = 0
@@ -170,5 +163,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

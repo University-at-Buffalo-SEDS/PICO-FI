@@ -39,8 +39,8 @@ pub enum BridgeMode {
 pub enum UpstreamMode {
     /// Uses the control UART as the upstream payload interface.
     Uart,
-    /// Uses the framed SPI slave transport as the upstream payload interface.
-    Spi,
+    /// Uses the framed I2C slave transport as the upstream payload interface.
+    I2c,
     /// Uses the simple TCP test mode instead of the normal bridge protocol.
     Test,
 }
@@ -117,7 +117,8 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
             port: parse_port(port)?,
         }),
         ["set", "upstream", "uart"] => Ok(Command::SetUpstream(UpstreamMode::Uart)),
-        ["set", "upstream", "spi"] => Ok(Command::SetUpstream(UpstreamMode::Spi)),
+        ["set", "upstream", "i2c"] => Ok(Command::SetUpstream(UpstreamMode::I2c)),
+        ["set", "upstream", "spi"] => Ok(Command::SetUpstream(UpstreamMode::I2c)),
         ["set", "upstream", "test"] => Ok(Command::SetUpstream(UpstreamMode::Test)),
         ["reset"] => Ok(Command::Reset),
         _ => Err("unknown command"),
@@ -194,8 +195,8 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         UpstreamMode::Uart => {
             let _ = out.push_str(" upstream=uart");
         }
-        UpstreamMode::Spi => {
-            let _ = out.push_str(" upstream=spi");
+        UpstreamMode::I2c => {
+            let _ = out.push_str(" upstream=i2c");
         }
         UpstreamMode::Test => {
             let _ = out.push_str(" upstream=test");
@@ -357,5 +358,21 @@ mod tests {
         let cmd = parse_command("set upstream test")
             .expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Test));
+    }
+
+    /// Verifies the upstream-mode shell command parser accepts I2C.
+    #[test]
+    fn parses_upstream_i2c() {
+        let cmd = parse_command("set upstream i2c")
+            .expect("upstream mode command should parse");
+        assert_eq!(cmd, Command::SetUpstream(UpstreamMode::I2c));
+    }
+
+    /// Verifies the legacy SPI shell command still maps to the I2C transport.
+    #[test]
+    fn parses_upstream_spi_alias() {
+        let cmd = parse_command("set upstream spi")
+            .expect("legacy upstream mode command should parse");
+        assert_eq!(cmd, Command::SetUpstream(UpstreamMode::I2c));
     }
 }

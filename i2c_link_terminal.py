@@ -53,17 +53,16 @@ def parse_frame(frame: bytes) -> tuple[int, bytes]:
     """Extract response from frame"""
     if len(frame) != FRAME_SIZE:
         return 0, b""
-    
     if is_garbage_frame(frame):
         return 0, b""
-    
-    response_bytes = bytearray()
-    for byte_val in frame:
-        if byte_val == 0:
-            break
-        response_bytes.append(byte_val)
-    
-    return 0, bytes(response_bytes)
+
+    magic = frame[0]
+    length = frame[1]
+    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC):
+        return 0, b""
+    if length > PAYLOAD_MAX:
+        return 0, b""
+    return magic, bytes(frame[2:2 + length])
 
 
 def print_payload(prompt: "PromptState", payload: bytes) -> None:
@@ -125,13 +124,11 @@ def exchange_frame(
                 print_payload(prompt, rx_payload)
             return
 
-        # For command responses, collect all bytes
-        response_bytes = bytearray()
-        if rx_payload:
-            response_bytes.extend(rx_payload)
-        
-        # Poll for remaining bytes
-        for poll_num in range(command_timeout_polls):
+        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
+            print_payload(prompt, rx_payload)
+            return
+
+        for _ in range(command_timeout_polls):
             time.sleep(poll_delay_s)
             tx_poll = build_frame(b"")
             
@@ -166,27 +163,11 @@ def exchange_frame(
             
             rx = bytes(rx[:FRAME_SIZE])
             rx_magic, rx_payload = parse_frame(rx)
-            
-            if rx_payload:
-                response_bytes.extend(rx_payload)
-            
-            # Check if we have complete response
-            if len(response_bytes) >= 2:
-                response_length = response_bytes[1]
-                if len(response_bytes) >= response_length + 2:
-                    break
-        
-        # Parse and print collected response
-        if len(response_bytes) >= 2:
-            response_magic = response_bytes[0]
-            response_length = response_bytes[1]
-            if response_magic == RESP_COMMAND_MAGIC:
-                if len(response_bytes) > 2:
-                    final_data = bytes(response_bytes[2:2+response_length])
-                    if final_data:
-                        print_payload(prompt, final_data)
+
+            if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
+                print_payload(prompt, rx_payload)
                 return
-        
+
         prompt.print_line("[pico] command timed out waiting for I2C reply")
     
     except Exception as e:
@@ -294,6 +275,8 @@ def main() -> int:
     parser.add_argument("--poll-ms", type=int, default=50, help="Poll delay in ms")
     parser.add_argument("--sender", default="", help="Sender label prepended to chat lines")
     args = parser.parse_args()
+    global I2C_ADDR
+    I2C_ADDR = args.addr
 
     try:
         bus = smbus.SMBus(args.bus)
@@ -301,7 +284,7 @@ def main() -> int:
         print(f"ERROR: Cannot open I2C bus {args.bus}: {e}")
         print("Make sure:")
         print(f"  1. I2C{args.bus} is enabled")
-        print("  2. Pico is connected (GPIO0↔SDA, GPIO1↔SCL)")
+        print("  2. Pico is connected (GPIO2↔SDA, GPIO3↔SCL)")
         print("  3. Running with sudo (if needed)")
         return 1
 
@@ -399,4 +382,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

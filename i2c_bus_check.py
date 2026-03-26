@@ -27,8 +27,7 @@ for bus in range(4):
             print(line)
 
 print("\nPossible issues:")
-print("1. GPIO0/1 not configured as I2C in firmware")
+print("1. GPIO2/3 not configured as I2C in firmware")
 print("2. I2C bus not enabled on Pi5")
 print("3. Pico not powered or not flashed with latest firmware")
-print("4. Wiring issue - check GPIO0↔SDA, GPIO1↔SCL connections")
-
+print("4. Wiring issue - check GPIO2↔SDA, GPIO3↔SCL connections")
