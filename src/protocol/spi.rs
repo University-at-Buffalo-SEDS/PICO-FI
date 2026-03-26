@@ -28,17 +28,33 @@ pub enum RequestFrame<'a> {
 
 /// Parses a full SPI request frame into a typed request view.
 pub fn parse_request_frame(frame: &[u8; FRAME_SIZE]) -> Option<RequestFrame<'_>> {
+    let magic = frame[0];
     let len = frame[1] as usize;
+
     if len > PAYLOAD_MAX {
         return None;
     }
 
-    let payload = &frame[2..2 + len];
-    match frame[0] {
-        REQ_DATA_MAGIC => Some(RequestFrame::Data(payload)),
-        REQ_COMMAND_MAGIC => Some(RequestFrame::Command(payload)),
-        _ => None,
+    // Debug: if this is a command request, show what we got
+    if magic == REQ_COMMAND_MAGIC {
+        // Payload starts at frame[2]
+        let payload = &frame[2..2 + len];
+        if payload.len() > 0 {
+            // Got some bytes
+            if payload[0] == 0x2F {  // '/'
+                // This is good - we have the slash
+                return Some(RequestFrame::Command(payload));
+            }
+        }
+        // Empty payload or no slash - something is wrong
+        return Some(RequestFrame::Command(&[]));
     }
+
+    if magic == REQ_DATA_MAGIC {
+        return Some(RequestFrame::Data(&frame[2..2 + len]));
+    }
+
+    None
 }
 
 /// Builds a response frame with the given magic byte and payload.

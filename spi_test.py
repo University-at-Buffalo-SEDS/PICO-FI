@@ -33,18 +33,19 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
 
 
 def parse_frame(frame: list[int]) -> tuple[int, int, bytes]:
-    """Parse a single-byte response from SPI transaction (due to 1-byte FIFO limit)"""
+    """Extract all non-zero bytes from RX buffer returned from one SPI transaction"""
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
     
-    # With 1-byte FIFO limit, each transaction returns 1 byte of the response
-    # Extract the first non-zero byte (or first byte if all zeros)
-    for byte_val in frame[:10]:  # Check first 10 bytes
-        if byte_val != 0:
-            return 0, 1, bytes([byte_val])
+    # Collect all consecutive non-zero bytes from the response
+    # The hardware FIFO fills up with bytes, and we extract all of them
+    response_bytes = bytearray()
+    for byte_val in frame:
+        if byte_val == 0:
+            break  # Stop at first zero (end of data in this transaction)
+        response_bytes.append(byte_val)
     
-    # All zeros - might be padding
-    return 0, 0, b""
+    return 0, len(response_bytes), bytes(response_bytes)
 
 
 def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
@@ -74,42 +75,48 @@ def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
 def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) -> int:
     tx = build_frame(payload, magic)
     orig = tx[:]
+    
+    # Send request and get first response transaction
     rx_first = spi.xfer2(tx)
-    magic_first, length_first, body_first = parse_frame(rx_first)
-
-    responses: list[tuple[int, list[int], int, bytes]] = []
-    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 50  # More polls to collect all bytes
+    magic_first, len_first, body_first = parse_frame(rx_first)
     
-    # Collect response bytes (1 byte per transaction due to 1-byte FIFO)
+    # Collect all response bytes across multiple transactions
     response_bytes = bytearray()
+    response_bytes.extend(body_first)  # Add bytes from first transaction
     
-    for idx in range(poll_count):
+    responses: list[tuple[int, list[int], int, bytes]] = []
+    responses.append((magic_first, rx_first, len_first, body_first))
+    
+    # For command responses, poll multiple times to collect all bytes
+    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 50
+    
+    for idx in range(poll_count - 1):  # -1 because we already have first response
         if magic == REQ_COMMAND_MAGIC:
-            time.sleep(0.01)  # Reduced sleep for faster collection
+            time.sleep(0.01)  # Small delay between polls
+        
         rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
         resp_magic, resp_len, resp_body = parse_frame(rx)
         responses.append((resp_magic, rx, resp_len, resp_body))
         
-        # Collect the byte from this transaction
-        if resp_body and len(resp_body) > 0:
+        if resp_body:
             response_bytes.extend(resp_body)
         
-        # Stop if we have collected enough bytes (assuming response < 50 bytes)
-        if len(response_bytes) > 1 and response_bytes[0] in (RESP_MAGIC, RESP_COMMAND_MAGIC):
-            # First byte is magic, second is length
-            response_length = response_bytes[1] if len(response_bytes) > 1 else 0
-            # Collect magic + length + response data
+        # Check if we have magic + length + all data
+        if len(response_bytes) >= 2:
+            response_magic = response_bytes[0]
+            response_length = response_bytes[1]
+            # If we have the full response (magic + length + data), we can stop
             if len(response_bytes) >= response_length + 2:
                 break
-
+    
     print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
     print(f"frame rx1: {format_bytes(rx_first[: min(24, len(rx_first))])} ...")
-    for idx, (resp_magic, rx, resp_len, _) in enumerate(responses, start=2):
+    for idx, (resp_magic, rx, resp_len, _) in enumerate(responses[1:], start=2):
         print(f"frame rx{idx}: {format_bytes(rx[: min(24, len(rx))])} ...")
     
     if magic == REQ_COMMAND_MAGIC:
         print(
-            f"first transfer response: magic=0x{magic_first:02x} len={length_first}"
+            f"first transfer response: magic=0x{magic_first:02x} len={len_first}"
             if magic_first
             else "first transfer response: invalid"
         )

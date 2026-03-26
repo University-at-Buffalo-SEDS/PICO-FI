@@ -297,21 +297,32 @@ async fn session(
 fn build_command_response_frame(command: &str, link_active: &AtomicBool) -> SpiFrame {
     let mut data = [0u8; FRAME_SIZE];
 
-    // Explicitly set response text based on command
-    let response_text: &[u8] = if command == "/ping" {
-        b"pong"
-    } else if command == "/link" {
-        if link_active.load(Ordering::Relaxed) {
-            b"link up"
+    // Diagnostic: show what we received
+    let cmd_bytes = command.as_bytes();
+
+    let response_text: &[u8] = if cmd_bytes.len() == 0 {
+        b"empty"
+    } else if cmd_bytes[0] == 0x2F {  // 0x2F = '/'
+        // Got a slash - show next byte
+        if cmd_bytes.len() > 1 {
+            match cmd_bytes[1] {
+                0x70 => b"got-p",   // 'p'
+                0x6C => b"got-l",   // 'l'
+                0x68 => b"got-h",   // 'h'
+                0x73 => b"got-s",   // 's'
+                _ => b"got-other"
+            }
         } else {
-            b"link down"
+            b"slash-only"
         }
-    } else if command == "/help" {
-        b"pico commands: /help /show /ping /link"
-    } else if command == "/show" {
-        b"config"
     } else {
-        b"error unknown pico command"
+        // First byte is not a slash - show what it is
+        match cmd_bytes[0] {
+            0x70 => b"no-slash-p",
+            0x6C => b"no-slash-l",
+            0x2f => b"slash",
+            _ => b"mystery"
+        }
     };
 
     // Set magic byte and length
@@ -407,13 +418,18 @@ impl UpstreamSpiDevice {
     /// Marks the currently pending frame as consumed by the bridge loop.
     pub fn clear_pending_frame(&mut self) {
         self.pending_frame = None;
+        // Clear the frame now that it's been consumed
+        self.rx_frame.fill(0);
+        self.rx_len = 0;
     }
 
     /// Reinitializes counters and preloads the next response bytes into the TX FIFO.
+    /// NOTE: Does NOT clear rx_frame or reset rx_len - bytes accumulate across transactions
+    /// until poll_transaction() returns a frame and it's consumed
     fn rearm_transaction(&mut self) {
         self.reset_hw_fifos();
-        self.rx_frame.fill(0);
-        self.rx_len = 0;
+        // Keep rx_frame and rx_len - they accumulate across multiple SPI transactions
+        // since each transaction with 1-byte FIFO only reads 1 byte at a time
         self.tx_len = 0;
         self.prefill_tx_fifo();
     }
@@ -423,15 +439,14 @@ impl UpstreamSpiDevice {
         self.rearm_transaction();
     }
 
-    /// Preloads 2 bytes into the hardware TX FIFO for chunked response transmission.
-    /// Each transaction sends 2 bytes from the response frame, advancing the offset.
+    /// Preloads bytes into the hardware TX FIFO for chunked response transmission.
+    /// Sends bytes until FIFO is full (max 8 bytes in hardware FIFO).
+    /// This allows the master to read multiple bytes per transaction.
     fn prefill_tx_fifo(&mut self) {
         let p = rp_pac::SPI1;
 
-        // Send 2 bytes per transaction (working within the 1-2 byte FIFO limit)
-        let chunks_to_send = 2;
-
-        for _ in 0..chunks_to_send {
+        // Fill FIFO until it's full (hardware SPI1 has 8-byte FIFO on RP2040)
+        loop {
             if self.tx_response_offset >= FRAME_SIZE {
                 // Response complete, cycle back to start
                 self.tx_response_offset = 0;
@@ -445,6 +460,7 @@ impl UpstreamSpiDevice {
                 self.tx_response_offset += 1;
                 self.tx_len += 1;
             } else {
+                // FIFO is full
                 break;
             }
         }

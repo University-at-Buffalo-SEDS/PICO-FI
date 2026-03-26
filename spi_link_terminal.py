@@ -42,16 +42,18 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
 
 
 def parse_frame(frame: list[int]) -> tuple[int, bytes]:
-    """Parse a single-byte response from SPI transaction (due to 1-byte FIFO limit)"""
-    if len(frame) != FRAME_SIZE or frame[0] not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+    """Extract all non-zero bytes from RX buffer returned from one SPI transaction"""
+    if len(frame) != FRAME_SIZE:
         return 0, b""
     
-    # With 1-byte FIFO limit, extract the first non-zero byte
-    for byte_val in frame[:10]:
-        if byte_val != 0:
-            return 0, bytes([byte_val])
+    # Collect all consecutive non-zero bytes from the response
+    response_bytes = bytearray()
+    for byte_val in frame:
+        if byte_val == 0:
+            break  # Stop at first zero (end of data in this transaction)
+        response_bytes.append(byte_val)
     
-    return 0, b""
+    return 0, bytes(response_bytes)
 
 
 def print_payload(prompt: "PromptState", payload: bytes) -> None:
@@ -77,10 +79,10 @@ def exchange_frame(
             print_payload(prompt, rx_payload)
         return
 
-    # For command responses, collect individual bytes across multiple transactions
+    # For command responses, collect all bytes across multiple transactions
     response_bytes = bytearray()
     
-    # Collect first response byte
+    # Add bytes from first response
     if rx_payload:
         response_bytes.extend(rx_payload)
     
