@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Quick I2C address detection and validation"""
-import smbus
 import sys
+
+from i2c_raw import open_bus
 
 bus_num = 1
 addr = 0x55
 
 try:
-    bus = smbus.SMBus(bus_num)
-    
-    # Try to read from device
+    bus = open_bus(bus_num)
+
     try:
-        data = bus.read_byte(addr)
+        data = bus.read(addr, 1)[0]
         print(f"✅ Device at 0x{addr:02x} responded with byte: 0x{data:02x}")
     except Exception as e:
         print(f"❌ Device at 0x{addr:02x} not responding: {e}")
@@ -25,5 +25,5 @@ try:
     
 except Exception as e:
     print(f"ERROR opening I2C bus {bus_num}: {e}")
-    print("Make sure I2C is enabled and smbus-cffi is installed")
+    print("Make sure I2C is enabled")
     sys.exit(1)

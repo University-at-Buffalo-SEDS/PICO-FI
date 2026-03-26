@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 I2C-based test tool for Pico-Fi communication
-Uses SMBus to communicate with Pico via I2C
+Uses raw Linux I2C_RDWR transfers to communicate with Pico
 """
 
 import argparse
-import sys
 import time
-import smbus
+
+from i2c_raw import CHUNK_SIZE, open_bus
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -60,40 +60,23 @@ def format_bytes(data: bytes) -> str:
 def i2c_exchange(bus_num: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
     """Send frame via I2C and receive response"""
     try:
-        bus = smbus.SMBus(bus_num)
+        bus = open_bus(bus_num)
         tx = build_frame(payload, magic)
         
         print(f"Sending to I2C addr 0x{I2C_ADDR:02x}...")
         print(f"Sent: {format_bytes(tx)}...")
         
-        # Send frame in 32-byte chunks
-        CHUNK_SIZE = 32
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-            chunk = tx[i:i+CHUNK_SIZE]
-            try:
-                bus.write_i2c_block_data(I2C_ADDR, 0, list(chunk))
-            except TypeError:
-                # Fallback: write byte by byte
-                for byte in chunk:
-                    bus.write_byte(I2C_ADDR, byte)
+            chunk = tx[i:i + CHUNK_SIZE]
+            bus.write(I2C_ADDR, chunk)
             time.sleep(0.01)
         
         time.sleep(0.1)
         
-        # Read response in 32-byte chunks and reassemble
         rx = bytearray()
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
             chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-            try:
-                chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
-            except (TypeError, OSError):
-                chunk = []
-                for _ in range(chunk_size):
-                    try:
-                        byte = bus.read_byte(I2C_ADDR)
-                        chunk.append(byte)
-                    except:
-                        chunk.append(0)
+            chunk = bus.read(I2C_ADDR, chunk_size)
             rx.extend(chunk)
             time.sleep(0.01)
         
@@ -163,4 +146,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

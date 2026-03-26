@@ -18,9 +18,9 @@ import tty
 from dataclasses import dataclass, field
 
 try:
-    import smbus
+    from i2c_raw import CHUNK_SIZE, open_bus
 except ImportError:
-    raise SystemExit("error: smbus-cffi is required. Install it with `pip install smbus-cffi`.")
+    raise SystemExit("error: raw I2C helpers unavailable.")
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -74,7 +74,7 @@ def print_payload(prompt: "PromptState", payload: bytes) -> None:
 
 
 def exchange_frame(
-    bus: smbus.SMBus,
+    bus,
     prompt: "PromptState",
     magic: int,
     payload: bytes,
@@ -85,34 +85,17 @@ def exchange_frame(
     try:
         tx = build_frame(payload, magic)
         
-        # Send in 32-byte chunks (SMBus limit)
-        CHUNK_SIZE = 32
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
             chunk = tx[i:i+CHUNK_SIZE]
-            try:
-                bus.write_i2c_block_data(I2C_ADDR, 0, list(chunk))
-            except TypeError:
-                # Fallback: write byte by byte
-                for byte in chunk:
-                    bus.write_byte(I2C_ADDR, byte)
+            bus.write(I2C_ADDR, chunk)
             time.sleep(0.01)
         
         time.sleep(0.05)
         
-        # Read response in chunks
         rx = bytearray()
         for i in range(0, FRAME_SIZE, CHUNK_SIZE):
             chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-            try:
-                chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
-            except (TypeError, OSError):
-                chunk = []
-                for _ in range(chunk_size):
-                    try:
-                        byte = bus.read_byte(I2C_ADDR)
-                        chunk.append(byte)
-                    except:
-                        chunk.append(0)
+            chunk = bus.read(I2C_ADDR, chunk_size)
             rx.extend(chunk)
             time.sleep(0.01)
         
@@ -132,32 +115,17 @@ def exchange_frame(
             time.sleep(poll_delay_s)
             tx_poll = build_frame(b"")
             
-            # Send poll
             for i in range(0, FRAME_SIZE, CHUNK_SIZE):
                 chunk = tx_poll[i:i+CHUNK_SIZE]
-                try:
-                    bus.write_i2c_block_data(I2C_ADDR, 0, list(chunk))
-                except TypeError:
-                    for byte in chunk:
-                        bus.write_byte(I2C_ADDR, byte)
+                bus.write(I2C_ADDR, chunk)
                 time.sleep(0.005)
             
             time.sleep(0.02)
             
-            # Read response
             rx = bytearray()
             for i in range(0, FRAME_SIZE, CHUNK_SIZE):
                 chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-                try:
-                    chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
-                except (TypeError, OSError):
-                    chunk = []
-                    for _ in range(chunk_size):
-                        try:
-                            byte = bus.read_byte(I2C_ADDR)
-                            chunk.append(byte)
-                        except:
-                            chunk.append(0)
+                chunk = bus.read(I2C_ADDR, chunk_size)
                 rx.extend(chunk)
                 time.sleep(0.005)
             
@@ -279,7 +247,7 @@ def main() -> int:
     I2C_ADDR = args.addr
 
     try:
-        bus = smbus.SMBus(args.bus)
+        bus = open_bus(args.bus)
     except Exception as e:
         print(f"ERROR: Cannot open I2C bus {args.bus}: {e}")
         print("Make sure:")
@@ -332,33 +300,17 @@ def main() -> int:
                 try:
                     tx = build_frame(b"")
                     
-                    # Send in 32-byte chunks
-                    CHUNK_SIZE = 32
                     for i in range(0, FRAME_SIZE, CHUNK_SIZE):
                         chunk = tx[i:i+CHUNK_SIZE]
-                        try:
-                            bus.write_i2c_block_data(args.addr, 0, list(chunk))
-                        except TypeError:
-                            for byte in chunk:
-                                bus.write_byte(args.addr, byte)
+                        bus.write(args.addr, chunk)
                         time.sleep(0.005)
                     
                     time.sleep(0.02)
                     
-                    # Read response in chunks
                     rx = bytearray()
                     for i in range(0, FRAME_SIZE, CHUNK_SIZE):
                         chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-                        try:
-                            chunk = bus.read_i2c_block_data(args.addr, 0, chunk_size)
-                        except (TypeError, OSError):
-                            chunk = []
-                            for _ in range(chunk_size):
-                                try:
-                                    byte = bus.read_byte(args.addr)
-                                    chunk.append(byte)
-                                except:
-                                    chunk.append(0)
+                        chunk = bus.read(args.addr, chunk_size)
                         rx.extend(chunk)
                         time.sleep(0.005)
                     
