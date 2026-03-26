@@ -34,6 +34,7 @@ pub async fn i2c_poll_task(
     let mut transaction_buf = [0u8; I2C_CHUNK_MAX];
     let mut rx_frame = [0u8; FRAME_SIZE];
     let mut rx_pos = 0usize;
+    let mut rx_expected = FRAME_SIZE;
     let mut tx_frame = make_response_frame(RESP_DATA_MAGIC, b"");
     let mut tx_pos = 0usize;
 
@@ -45,29 +46,43 @@ pub async fn i2c_poll_task(
 
         match i2c.listen(&mut transaction_buf).await {
             Ok(Command::Write(len)) => {
-                append_chunk(&transaction_buf[..len], &mut rx_frame, &mut rx_pos);
-                if rx_pos == FRAME_SIZE {
-                    if let Some(response) = handle_local_request(rx_frame, bridge_config, link_active) {
-                        tx_frame = response;
-                        tx_pos = 0;
-                    } else {
-                        tx.send(I2cFrame { data: rx_frame }).await;
-                    }
-                    rx_frame = [0u8; FRAME_SIZE];
-                    rx_pos = 0;
+                append_chunk(
+                    &transaction_buf[..len],
+                    &mut rx_frame,
+                    &mut rx_pos,
+                    &mut rx_expected,
+                );
+                if rx_complete(rx_pos, rx_expected) {
+                    process_complete_frame(
+                        rx_frame,
+                        bridge_config,
+                        link_active,
+                        &mut tx_frame,
+                        &mut tx_pos,
+                        tx,
+                    )
+                    .await;
+                    reset_rx_state(&mut rx_frame, &mut rx_pos, &mut rx_expected);
                 }
             }
             Ok(Command::WriteRead(len)) => {
-                append_chunk(&transaction_buf[..len], &mut rx_frame, &mut rx_pos);
-                if rx_pos == FRAME_SIZE {
-                    if let Some(response) = handle_local_request(rx_frame, bridge_config, link_active) {
-                        tx_frame = response;
-                        tx_pos = 0;
-                    } else {
-                        tx.send(I2cFrame { data: rx_frame }).await;
-                    }
-                    rx_frame = [0u8; FRAME_SIZE];
-                    rx_pos = 0;
+                append_chunk(
+                    &transaction_buf[..len],
+                    &mut rx_frame,
+                    &mut rx_pos,
+                    &mut rx_expected,
+                );
+                if rx_complete(rx_pos, rx_expected) {
+                    process_complete_frame(
+                        rx_frame,
+                        bridge_config,
+                        link_active,
+                        &mut tx_frame,
+                        &mut tx_pos,
+                        tx,
+                    )
+                    .await;
+                    reset_rx_state(&mut rx_frame, &mut rx_pos, &mut rx_expected);
                 }
                 await_response_frame(&rx_resp, &mut tx_frame, &mut tx_pos).await;
                 tx_pos = respond_chunk(i2c, &tx_frame, tx_pos).await;
@@ -79,13 +94,42 @@ pub async fn i2c_poll_task(
             Ok(Command::GeneralCall(_)) => {}
             Err(_) => {
                 i2c.reset();
-                rx_frame = [0u8; FRAME_SIZE];
-                rx_pos = 0;
+                reset_rx_state(&mut rx_frame, &mut rx_pos, &mut rx_expected);
                 tx_frame = make_response_frame(RESP_DATA_MAGIC, b"");
                 tx_pos = 0;
             }
         }
     }
+}
+
+async fn process_complete_frame(
+    frame: [u8; FRAME_SIZE],
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    tx_frame: &mut [u8; FRAME_SIZE],
+    tx_pos: &mut usize,
+    tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+) {
+    if let Some(response) = handle_local_request(frame, bridge_config, link_active) {
+        *tx_frame = response;
+        *tx_pos = 0;
+    } else {
+        tx.send(I2cFrame { data: frame }).await;
+    }
+}
+
+fn reset_rx_state(
+    rx_frame: &mut [u8; FRAME_SIZE],
+    rx_pos: &mut usize,
+    rx_expected: &mut usize,
+) {
+    *rx_frame = [0u8; FRAME_SIZE];
+    *rx_pos = 0;
+    *rx_expected = FRAME_SIZE;
+}
+
+fn rx_complete(rx_pos: usize, rx_expected: usize) -> bool {
+    rx_pos >= 2 && rx_pos >= rx_expected
 }
 
 fn handle_local_request(
@@ -127,7 +171,12 @@ async fn await_response_frame(
     }
 }
 
-fn append_chunk(chunk: &[u8], frame: &mut [u8; FRAME_SIZE], pos: &mut usize) {
+fn append_chunk(
+    chunk: &[u8],
+    frame: &mut [u8; FRAME_SIZE],
+    pos: &mut usize,
+    expected: &mut usize,
+) {
     if *pos >= FRAME_SIZE || chunk.is_empty() {
         return;
     }
@@ -136,6 +185,11 @@ fn append_chunk(chunk: &[u8], frame: &mut [u8; FRAME_SIZE], pos: &mut usize) {
     let take = remaining.min(chunk.len());
     frame[*pos..*pos + take].copy_from_slice(&chunk[..take]);
     *pos += take;
+
+    if *pos >= 2 {
+        let payload_len = frame[1] as usize;
+        *expected = (payload_len + 2).min(FRAME_SIZE);
+    }
 }
 
 async fn respond_chunk(
