@@ -33,30 +33,18 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
 
 
 def parse_frame(frame: list[int]) -> tuple[int, int, bytes]:
+    """Parse a single-byte response from SPI transaction (due to 1-byte FIFO limit)"""
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
-    magic = frame[0]
-    if magic not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
-        return 0, frame[1] if len(frame) > 1 else 0, b""
     
-    # Parse length byte - if it's 0xFF or clearly invalid, it might be uninitialized
-    length_byte = frame[1]
-    length = min(length_byte, PAYLOAD_MAX)
+    # With 1-byte FIFO limit, each transaction returns 1 byte of the response
+    # Extract the first non-zero byte (or first byte if all zeros)
+    for byte_val in frame[:10]:  # Check first 10 bytes
+        if byte_val != 0:
+            return 0, 1, bytes([byte_val])
     
-    # Extract payload and filter out invalid UTF-8
-    raw_payload = bytes(frame[2 : 2 + length])
-    
-    # If length is suspiciously large (0xFF) or all bytes are the same (0xFF pattern),
-    # try to detect actual end of valid data
-    if length_byte == 0xFF and raw_payload:
-        # Find the first null byte or pattern change
-        for i, byte_val in enumerate(raw_payload):
-            if byte_val == 0x00 or byte_val < 0x20 and byte_val != 0x0A and byte_val != 0x0D:
-                length = i
-                raw_payload = raw_payload[:i]
-                break
-    
-    return magic, length, raw_payload
+    # All zeros - might be padding
+    return 0, 0, b""
 
 
 def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
@@ -90,43 +78,35 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
     magic_first, length_first, body_first = parse_frame(rx_first)
 
     responses: list[tuple[int, list[int], int, bytes]] = []
-    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 20  # More polls for chunked responses
+    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 50  # More polls to collect all bytes
     
-    # Collect response chunks across multiple transactions
-    response_magic = 0
-    response_length = 0
-    response_data = bytearray()
-    got_header = False
+    # Collect response bytes (1 byte per transaction due to 1-byte FIFO)
+    response_bytes = bytearray()
     
-    for _ in range(poll_count):
+    for idx in range(poll_count):
         if magic == REQ_COMMAND_MAGIC:
-            time.sleep(0.02)
+            time.sleep(0.01)  # Reduced sleep for faster collection
         rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
         resp_magic, resp_len, resp_body = parse_frame(rx)
         responses.append((resp_magic, rx, resp_len, resp_body))
         
-        # Handle chunked response format: first frame has [magic, length], rest has data
-        if resp_magic == RESP_COMMAND_MAGIC or resp_magic == RESP_DATA_MAGIC:
-            if not got_header and resp_len >= 1 and resp_body:
-                # First frame: extract magic byte and length byte
-                response_magic = resp_magic
-                response_length = resp_body[0]
-                # Add any remaining bytes from first frame
-                if len(resp_body) > 1:
-                    response_data.extend(resp_body[1:])
-                got_header = True
-            elif got_header and resp_body:
-                # Subsequent frames: add all bytes as data
-                response_data.extend(resp_body)
+        # Collect the byte from this transaction
+        if resp_body and len(resp_body) > 0:
+            response_bytes.extend(resp_body)
         
-        # Stop if we have collected all response data
-        if got_header and len(response_data) >= response_length:
-            break
+        # Stop if we have collected enough bytes (assuming response < 50 bytes)
+        if len(response_bytes) > 1 and response_bytes[0] in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+            # First byte is magic, second is length
+            response_length = response_bytes[1] if len(response_bytes) > 1 else 0
+            # Collect magic + length + response data
+            if len(response_bytes) >= response_length + 2:
+                break
 
     print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
     print(f"frame rx1: {format_bytes(rx_first[: min(24, len(rx_first))])} ...")
     for idx, (resp_magic, rx, resp_len, _) in enumerate(responses, start=2):
         print(f"frame rx{idx}: {format_bytes(rx[: min(24, len(rx))])} ...")
+    
     if magic == REQ_COMMAND_MAGIC:
         print(
             f"first transfer response: magic=0x{magic_first:02x} len={length_first}"
@@ -134,9 +114,18 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
             else "first transfer response: invalid"
         )
     
-    # Validate response
-    valid = got_header and response_magic in (RESP_COMMAND_MAGIC, RESP_DATA_MAGIC)
-    final_body = bytes(response_data[:response_length])
+    # Parse collected response bytes
+    valid = False
+    response_magic = 0
+    response_length = 0
+    final_body = b""
+    
+    if len(response_bytes) >= 2:
+        response_magic = response_bytes[0]
+        response_length = response_bytes[1]
+        if len(response_bytes) > 2:
+            final_body = bytes(response_bytes[2:2 + response_length])
+        valid = response_magic in (RESP_MAGIC, RESP_COMMAND_MAGIC)
     
     print(f"valid response: {'yes' if valid else 'no'}")
     print(f"response magic: 0x{response_magic:02x}")
