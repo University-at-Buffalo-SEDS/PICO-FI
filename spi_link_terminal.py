@@ -76,6 +76,7 @@ def exchange_frame(
             print_payload(prompt, rx_payload)
         if rx_magic == RESP_COMMAND_MAGIC:
             return
+    prompt.print_line("[pico] command timed out waiting for SPI reply")
 
 
 def print_help() -> list[str]:

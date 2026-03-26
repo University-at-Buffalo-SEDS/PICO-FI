@@ -31,13 +31,13 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> list[int]:
     return frame
 
 
-def parse_frame(frame: list[int]) -> tuple[bool, int, bytes]:
+def parse_frame(frame: list[int]) -> tuple[int, int, bytes]:
     if len(frame) != FRAME_SIZE:
-        return False, 0, b""
+        return 0, 0, b""
     if frame[0] not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
-        return False, frame[1] if len(frame) > 1 else 0, b""
+        return 0, frame[1] if len(frame) > 1 else 0, b""
     length = min(frame[1], PAYLOAD_MAX)
-    return True, length, bytes(frame[2 : 2 + length])
+    return frame[0], length, bytes(frame[2 : 2 + length])
 
 
 def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
@@ -45,12 +45,13 @@ def framed_probe(spi: spidev.SpiDev, count: int, delay_s: float) -> int:
     for idx in range(count):
         tx = build_frame(b"", REQ_MAGIC)
         rx = spi.xfer2(tx)
-        ok, length, body = parse_frame(rx)
+        resp_magic, length, body = parse_frame(rx)
+        ok = resp_magic in (RESP_MAGIC, RESP_COMMAND_MAGIC)
         status = "ok" if ok else "bad"
         preview = format_bytes(rx[:16])
         if ok:
             print(
-                f"probe {idx + 1:02d}: {status} rx0=0x{rx[0]:02x} len={length} preview={preview}"
+                f"probe {idx + 1:02d}: {status} rx0=0x{resp_magic:02x} len={length} preview={preview}"
             )
             if body:
                 print(f"payload: {body.decode('utf-8', errors='replace')!r}")
@@ -67,29 +68,43 @@ def framed_exchange(spi: spidev.SpiDev, payload: bytes, magic: int = REQ_MAGIC) 
     tx = build_frame(payload, magic)
     orig = tx[:]
     rx_first = spi.xfer2(tx)
-    ok_first, length_first, body_first = parse_frame(rx_first)
+    magic_first, length_first, body_first = parse_frame(rx_first)
 
-    # The Pico receives the request during this transfer and stages its reply
-    # for the next CS-bounded transaction.
-    rx_second = spi.xfer2(build_frame(b"", REQ_MAGIC))
-    ok_second, length_second, body_second = parse_frame(rx_second)
+    responses: list[tuple[int, list[int], int, bytes]] = []
+    poll_count = 1 if magic != REQ_COMMAND_MAGIC else 10
+    for _ in range(poll_count):
+        rx = spi.xfer2(build_frame(b"", REQ_MAGIC))
+        resp_magic, resp_len, resp_body = parse_frame(rx)
+        responses.append((resp_magic, rx, resp_len, resp_body))
+        if magic == REQ_COMMAND_MAGIC:
+            if resp_magic == RESP_COMMAND_MAGIC:
+                break
+        elif resp_magic in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+            break
 
     print(f"frame tx: {format_bytes(orig[: min(24, len(orig))])} ...")
     print(f"frame rx1: {format_bytes(rx_first[: min(24, len(rx_first))])} ...")
-    print(f"frame rx2: {format_bytes(rx_second[: min(24, len(rx_second))])} ...")
-    print(f"valid response: {'yes' if ok_second else 'no'}")
-    print(f"declared length: {length_second}")
+    for idx, (resp_magic, rx, resp_len, _) in enumerate(responses, start=2):
+        print(f"frame rx{idx}: {format_bytes(rx[: min(24, len(rx))])} ...")
     if magic == REQ_COMMAND_MAGIC:
         print(
-            f"first transfer response: magic=0x{rx_first[0]:02x} len={length_first}"
-            if ok_first
+            f"first transfer response: magic=0x{magic_first:02x} len={length_first}"
+            if magic_first
             else "first transfer response: invalid"
         )
-    if body_second:
-        print(f"payload: {body_second.decode('utf-8', errors='replace')!r}")
+        final = next(((m, l, b) for m, _, l, b in responses if m == RESP_COMMAND_MAGIC), None)
+    else:
+        final = next(((m, l, b) for m, _, l, b in responses if m in (RESP_MAGIC, RESP_COMMAND_MAGIC)), None)
+    valid = final is not None
+    final_magic, final_len, final_body = final if final else (0, 0, b"")
+    print(f"valid response: {'yes' if valid else 'no'}")
+    print(f"response magic: 0x{final_magic:02x}")
+    print(f"declared length: {final_len}")
+    if final_body:
+        print(f"payload: {final_body.decode('utf-8', errors='replace')!r}")
     else:
         print("payload: b''")
-    return 0 if ok_second else 1
+    return 0 if valid else 1
 
 
 def encode_line_payload(text: str) -> bytes:
