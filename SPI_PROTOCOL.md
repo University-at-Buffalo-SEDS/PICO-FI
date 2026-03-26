@@ -9,15 +9,15 @@ The Pi 5 is the SPI master. The Pico is the SPI slave.
 The Pico uses `SPI1` on:
 
 - `GPIO10` = `SCK`
-- `GPIO11` = `MOSI` / slave RX
-- `GPIO12` = `MISO` / slave TX
+- `GPIO11` = peripheral `TX` / slave `MISO`
+- `GPIO12` = peripheral `RX` / slave `MOSI`
 - `GPIO13` = `CSn`
 
 Pi 5 wiring:
 
 - Pi pin `23` `GPIO11 / SPI0_SCLK` -> Pico `GPIO10`
-- Pi pin `19` `GPIO10 / SPI0_MOSI` -> Pico `GPIO11`
-- Pi pin `21` `GPIO9 / SPI0_MISO` <- Pico `GPIO12`
+- Pi pin `19` `GPIO10 / SPI0_MOSI` -> Pico `GPIO12`
+- Pi pin `21` `GPIO9 / SPI0_MISO` <- Pico `GPIO11`
 - Pi pin `24` `GPIO8 / SPI0_CE0` -> Pico `GPIO13`
 - Pi GND -> Pico GND
 

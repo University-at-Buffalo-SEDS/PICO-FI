@@ -47,6 +47,37 @@ def parse_frame(frame: list[int]) -> tuple[int, bytes]:
     return frame[0], bytes(frame[2 : 2 + length])
 
 
+def print_payload(prompt: "PromptState", payload: bytes) -> None:
+    text = payload.decode("utf-8", errors="replace").replace("\r", "")
+    for line in text.split("\n"):
+        if line:
+            prompt.print_line(line)
+
+
+def exchange_frame(
+    spi: spidev.SpiDev,
+    prompt: "PromptState",
+    magic: int,
+    payload: bytes,
+    poll_delay_s: float,
+    command_timeout_polls: int = 10,
+) -> None:
+    rx_magic, rx_payload = parse_frame(spi.xfer2(build_frame(payload, magic)))
+    if rx_payload:
+        print_payload(prompt, rx_payload)
+
+    if magic != REQ_COMMAND_MAGIC:
+        return
+
+    for _ in range(command_timeout_polls):
+        time.sleep(poll_delay_s)
+        rx_magic, rx_payload = parse_frame(spi.xfer2(build_frame(b"")))
+        if rx_payload:
+            print_payload(prompt, rx_payload)
+        if rx_magic == RESP_COMMAND_MAGIC:
+            return
+
+
 def print_help() -> list[str]:
     return [
         "chat mode:",
@@ -190,19 +221,17 @@ def main() -> int:
             except queue.Empty:
                 pass
 
+            poll_delay_s = args.poll_ms / 1000.0
             if pending:
                 magic, payload = pending.popleft()
-                tx = build_frame(payload, magic)
+                exchange_frame(spi, prompt, magic, payload, poll_delay_s)
             else:
-                tx = build_frame(b"")
-            rx = spi.xfer2(tx)
-            _, payload = parse_frame(rx)
-            if payload:
-                text = payload.decode("utf-8", errors="replace").replace("\r", "")
-                for line in text.split("\n"):
-                    if line:
-                        prompt.print_line(line)
-            time.sleep(args.poll_ms / 1000.0)
+                rx_magic, payload = parse_frame(spi.xfer2(build_frame(b"")))
+                if payload:
+                    print_payload(prompt, payload)
+                if rx_magic == RESP_COMMAND_MAGIC:
+                    continue
+                time.sleep(poll_delay_s)
     except KeyboardInterrupt:
         return 0
     finally:

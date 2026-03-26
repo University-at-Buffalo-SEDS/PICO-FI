@@ -46,15 +46,16 @@ pub struct UpstreamSpiDevice {
 pub fn init_upstream_spi<TX: ChannelInstance, RX: ChannelInstance>(
     spi1: Peri<'static, SPI1>,
     sclk: Peri<'static, PIN_10>,
-    mosi: Peri<'static, PIN_11>,
-    miso: Peri<'static, PIN_12>,
+    tx: Peri<'static, PIN_11>,
+    rx: Peri<'static, PIN_12>,
     cs: Peri<'static, PIN_13>,
     _tx_dma: Peri<'static, TX>,
     _rx_dma: Peri<'static, RX>,
 ) -> UpstreamSpiDevice {
     let mut spi_config = spi::Config::default();
     spi_config.frequency = 1_000_000;
-    let configured = spi::Spi::new_blocking(spi1, sclk, mosi, miso, spi_config);
+    // RP2040 SPI1 uses GPIO11 as the peripheral TX pin and GPIO12 as RX, even in slave mode.
+    let configured = spi::Spi::new_blocking(spi1, sclk, tx, rx, spi_config);
     let _cs = cs;
 
     rp_pac::IO_BANK0.gpio(13).ctrl().write(|w| {
