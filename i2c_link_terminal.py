@@ -85,11 +85,26 @@ def exchange_frame(
     """Send frame and collect response"""
     try:
         tx = build_frame(payload, magic)
-        bus.write_i2c_block_data(I2C_ADDR, 0, list(tx))
+        
+        # Send in 32-byte chunks (SMBus limit)
+        CHUNK_SIZE = 32
+        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+            chunk = list(tx[i:i+CHUNK_SIZE])
+            if chunk:
+                bus.write_i2c_block_data(I2C_ADDR, 0, chunk)
+            time.sleep(0.01)
+        
         time.sleep(0.05)
         
-        rx = bus.read_i2c_block_data(I2C_ADDR, 0, FRAME_SIZE)
-        rx = bytes(rx)
+        # Read response in chunks
+        rx = bytearray()
+        for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+            chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
+            chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
+            rx.extend(chunk)
+            time.sleep(0.01)
+        
+        rx = bytes(rx[:FRAME_SIZE])
         rx_magic, rx_payload = parse_frame(rx)
         
         if magic != REQ_COMMAND_MAGIC:
@@ -109,10 +124,25 @@ def exchange_frame(
         for poll_num in range(command_timeout_polls):
             time.sleep(poll_delay_s)
             tx_poll = build_frame(b"")
-            bus.write_i2c_block_data(I2C_ADDR, 0, list(tx_poll))
+            
+            # Send poll in chunks
+            for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+                chunk = list(tx_poll[i:i+CHUNK_SIZE])
+                if chunk:
+                    bus.write_i2c_block_data(I2C_ADDR, 0, chunk)
+                time.sleep(0.005)
+            
             time.sleep(0.02)
-            rx = bus.read_i2c_block_data(I2C_ADDR, 0, FRAME_SIZE)
-            rx = bytes(rx)
+            
+            # Read response
+            rx = bytearray()
+            for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+                chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
+                chunk = bus.read_i2c_block_data(I2C_ADDR, 0, chunk_size)
+                rx.extend(chunk)
+                time.sleep(0.005)
+            
+            rx = bytes(rx[:FRAME_SIZE])
             rx_magic, rx_payload = parse_frame(rx)
             
             if rx_payload:
@@ -297,14 +327,30 @@ def main() -> int:
                 # Poll for incoming data
                 try:
                     tx = build_frame(b"")
-                    bus.write_i2c_block_data(args.addr, 0, list(tx))
+                    
+                    # Send in 32-byte chunks
+                    CHUNK_SIZE = 32
+                    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+                        chunk = list(tx[i:i+CHUNK_SIZE])
+                        if chunk:
+                            bus.write_i2c_block_data(args.addr, 0, chunk)
+                        time.sleep(0.005)
+                    
                     time.sleep(0.02)
-                    rx = bus.read_i2c_block_data(args.addr, 0, FRAME_SIZE)
-                    rx = bytes(rx)
+                    
+                    # Read response in chunks
+                    rx = bytearray()
+                    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
+                        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
+                        chunk = bus.read_i2c_block_data(args.addr, 0, chunk_size)
+                        rx.extend(chunk)
+                        time.sleep(0.005)
+                    
+                    rx = bytes(rx[:FRAME_SIZE])
                     rx_magic, payload = parse_frame(rx)
                     if payload:
                         print_payload(prompt, payload)
-                except:
+                except Exception:
                     pass
                 
                 time.sleep(poll_delay_s)
