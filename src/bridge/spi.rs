@@ -3,7 +3,7 @@
 //! SPI slave mode on RP2040 is broken (known hardware issue since 2021)
 //! Now using I2C0 on GPIO0 (SDA) and GPIO1 (SCL) for reliable communication
 
-pub use crate::bridge::i2c::{UpstreamI2cDevice as UpstreamSpiDevice, I2cFrame, init_i2c_slave, init_upstream_spi};
+pub use crate::bridge::i2c::{UpstreamI2cDevice as UpstreamSpiDevice, I2cFrame, init_upstream_spi};
 pub use crate::bridge::i2c::*;
 
 // Re-export under "spi" names for compatibility
