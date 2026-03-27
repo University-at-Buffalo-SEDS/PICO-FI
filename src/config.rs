@@ -41,6 +41,8 @@ pub enum UpstreamMode {
     Uart,
     /// Uses the framed I2C slave transport as the upstream payload interface.
     I2c,
+    /// Uses the onboard USB CDC ACM port as the upstream payload interface.
+    Usb,
     /// Uses the framed SPI slave transport as the upstream payload interface.
     Spi,
     /// Uses the SPI transport in transaction-to-transaction echo mode for diagnostics.
@@ -62,6 +64,16 @@ pub struct BridgeConfig {
     pub bridge_mode: BridgeMode,
     /// Which local upstream transport should feed the TCP bridge.
     pub upstream_mode: UpstreamMode,
+}
+
+/// Compile-time USB CDC descriptor strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsbDeviceNames {
+    pub manufacturer: Option<&'static str>,
+    pub product: Option<&'static str>,
+    pub serial_number: Option<&'static str>,
+    pub comm_interface: Option<&'static str>,
+    pub data_interface: Option<&'static str>,
 }
 
 impl Default for BridgeConfig {
@@ -124,6 +136,7 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
         }),
         ["set", "upstream", "uart"] => Ok(Command::SetUpstream(UpstreamMode::Uart)),
         ["set", "upstream", "i2c"] => Ok(Command::SetUpstream(UpstreamMode::I2c)),
+        ["set", "upstream", "usb"] => Ok(Command::SetUpstream(UpstreamMode::Usb)),
         ["set", "upstream", "spi"] => Ok(Command::SetUpstream(UpstreamMode::Spi)),
         ["set", "upstream", "spi_echo"] | ["set", "upstream", "spiecho"] => {
             Ok(Command::SetUpstream(UpstreamMode::SpiEcho))
@@ -209,6 +222,9 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
         UpstreamMode::I2c => {
             let _ = out.push_str(" upstream=i2c");
+        }
+        UpstreamMode::Usb => {
+            let _ = out.push_str(" upstream=usb");
         }
         UpstreamMode::Spi => {
             let _ = out.push_str(" upstream=spi");
@@ -395,5 +411,13 @@ mod tests {
         let cmd = parse_command("set upstream spi")
             .expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Spi));
+    }
+
+    /// Verifies the upstream-mode shell command accepts USB CDC.
+    #[test]
+    fn parses_upstream_usb() {
+        let cmd = parse_command("set upstream usb")
+            .expect("upstream mode command should parse");
+        assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Usb));
     }
 }

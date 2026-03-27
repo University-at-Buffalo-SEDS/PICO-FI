@@ -18,6 +18,7 @@ embassy-net-wiznet = "0.3.0"
 embassy-rp = { version = "0.10.0", features = ["critical-section-impl", "time-driver", "rp2040"] }
 embassy-sync = "0.8.0"
 embassy-time = "0.5.1"
+embassy-usb = "0.5.1"
 embedded-hal = "1.0.0"
 embedded-hal-nb = "1.0.0"
 embedded-hal-bus = { version = "0.3.0", features = ["async"] }

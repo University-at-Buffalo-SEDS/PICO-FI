@@ -14,18 +14,22 @@ use bridge::i2c_task::{i2c_poll_task, I2cFrame};
 use bridge::spi_task::{spi_poll_task, SpiFrame};
 use bridge::runtime::BridgeRuntime;
 use bridge::commands::{set_led_state, take_led_activity, take_led_command};
-use config::{BridgeConfig, BridgeMode, UpstreamMode};
+use config::{BridgeConfig, BridgeMode, COMPILED_USB_DEVICE_NAMES, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c_slave::{Config as I2cSlaveConfig, I2cSlave};
 use embassy_rp::interrupt::InterruptExt as _;
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, UART0};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, UART0, USB};
 use embassy_rp::uart::{self, BufferedUart};
+use embassy_rp::usb;
 use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::Timer;
+use embassy_usb::Builder as UsbBuilder;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver as UsbReceiver, Sender as UsbSender, State as UsbCdcState};
+use embassy_usb::{Config as UsbConfig, UsbDevice};
 #[allow(unused_imports)]
 use panic_halt as _;
 use portable_atomic::{AtomicBool, Ordering};
@@ -39,6 +43,7 @@ bind_interrupts!(struct Irqs {
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
     PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
 
 /// Static TX buffer used by the boot/control UART.
@@ -46,6 +51,11 @@ static UART_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 
 /// Static RX buffer used by the boot/control UART.
 static UART_RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+static USB_CONFIG_DESC_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+static USB_BOS_DESC_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+static USB_MSOS_DESC_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+static USB_CONTROL_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+static USB_CDC_STATE: StaticCell<UsbCdcState<'static>> = StaticCell::new();
 
 /// Single-core Embassy executor used by the firmware.
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
@@ -75,6 +85,11 @@ const LINK_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
 
 /// Fixed magic exchanged by both peers to confirm protocol compatibility.
 const LINK_HANDSHAKE_MAGIC: &[u8] = b"PICOFI1";
+
+type UsbDriver = usb::Driver<'static, USB>;
+type UsbCdcSender = UsbSender<'static, UsbDriver>;
+type UsbCdcReceiver = UsbReceiver<'static, UsbDriver>;
+type PicoUsbDevice = UsbDevice<'static, UsbDriver>;
 
 fn disable_uart0() {
     let regs = rp_pac::UART0;
@@ -159,6 +174,11 @@ async fn heartbeat_task(mut led: Output<'static>) {
             Timer::after_millis(50).await;
         }
     }
+}
+
+#[embassy_executor::task]
+async fn usb_device_task(mut device: PicoUsbDevice) {
+    device.run().await;
 }
 
 /// Performs all peripheral setup and dispatches into the selected bridge role on core 0.
@@ -276,6 +296,42 @@ async fn app(spawner: Spawner) {
     } else {
         None
     };
+    let mut upstream_usb_sender = None;
+    let mut upstream_usb_receiver = None;
+    let upstream_usb = if matches!(bridge_config.upstream_mode, UpstreamMode::Usb) {
+        let driver = usb::Driver::new(p.USB, Irqs);
+        let mut config = UsbConfig::new(0x2e8a, 0x000a);
+        config.manufacturer = COMPILED_USB_DEVICE_NAMES.manufacturer;
+        config.product = COMPILED_USB_DEVICE_NAMES.product;
+        config.serial_number = COMPILED_USB_DEVICE_NAMES.serial_number;
+        config.max_power = 100;
+        config.max_packet_size_0 = 64;
+        config.device_class = 0xEF;
+        config.device_sub_class = 0x02;
+        config.device_protocol = 0x01;
+        config.composite_with_iads = true;
+
+        let mut builder = UsbBuilder::new(
+            driver,
+            config,
+            USB_CONFIG_DESC_BUF.init([0; 256]),
+            USB_BOS_DESC_BUF.init([0; 256]),
+            USB_MSOS_DESC_BUF.init([0; 256]),
+            USB_CONTROL_BUF.init([0; 128]),
+        );
+        let state = USB_CDC_STATE.init(UsbCdcState::new());
+        let class = CdcAcmClass::new(&mut builder, state, 64);
+        let (sender, receiver) = class.split();
+        let device = builder.build();
+        upstream_usb_sender = Some(sender);
+        upstream_usb_receiver = Some(receiver);
+        spawner.spawn(
+            usb_device_task(device).expect("usb device task token allocation failed"),
+        );
+        Some(())
+    } else {
+        None
+    };
 
     let stack = match net::bring_up_network(
         spawner,
@@ -305,6 +361,9 @@ async fn app(spawner: Spawner) {
         bridge_config,
         upstream_i2c.as_ref(),
         upstream_spi.as_ref(),
+        upstream_usb.as_ref(),
+        upstream_usb_sender.as_mut(),
+        upstream_usb_receiver.as_mut(),
         status_led.as_mut(),
         I2C_FRAME_CHANNEL.receiver(),
         I2C_RESPONSE_CHANNEL.sender(),
@@ -327,6 +386,9 @@ async fn run_bridge_mode(
     bridge_config: BridgeConfig,
     upstream_i2c_enabled: Option<&()>,
     upstream_spi_enabled: Option<&()>,
+    upstream_usb_enabled: Option<&()>,
+    usb_sender: Option<&mut UsbCdcSender>,
+    usb_receiver: Option<&mut UsbCdcReceiver>,
     status_led: Option<&mut Output<'static>>,
     i2c_rx: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
     i2c_tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
@@ -371,6 +433,26 @@ async fn run_bridge_mode(
         (BridgeMode::TcpServer { port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
             Some(_) => bridge::i2c::run_server(stack, port, bridge_config, runtime, i2c_rx, i2c_tx).await,
             None => Err(()),
+        },
+        (BridgeMode::TcpClient { host, port }, UpstreamMode::Usb) => match (
+            upstream_usb_enabled,
+            usb_sender,
+            usb_receiver,
+        ) {
+            (Some(_), Some(sender), Some(receiver)) => {
+                bridge::usb::run_client(sender, receiver, stack, host, port, bridge_config, runtime).await
+            }
+            _ => Err(()),
+        },
+        (BridgeMode::TcpServer { port }, UpstreamMode::Usb) => match (
+            upstream_usb_enabled,
+            usb_sender,
+            usb_receiver,
+        ) {
+            (Some(_), Some(sender), Some(receiver)) => {
+                bridge::usb::run_server(sender, receiver, stack, port, bridge_config, runtime).await
+            }
+            _ => Err(()),
         },
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Spi) => match upstream_spi_enabled {
             Some(_) => bridge::spi::run_client(

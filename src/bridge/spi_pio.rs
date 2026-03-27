@@ -35,7 +35,12 @@ impl Default for PioSpiPins {
 /// Result of one CS-bounded SPI transaction as seen by the future PIO backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionResult {
-    IdlePoll { received: usize, preview: [u8; 8] },
+    IdlePoll {
+        received: usize,
+        preview: [u8; 8],
+        raw_words: [u32; 4],
+        raw_word_count: usize,
+    },
     Partial { received: usize, expected: usize },
     Complete([u8; FRAME_SIZE]),
 }
@@ -45,6 +50,8 @@ pub enum TransactionResult {
 pub struct PioSpiTransportState {
     staged_tx: [u8; FRAME_SIZE],
     rx_frame: [u8; FRAME_SIZE],
+    rx_raw_words: [u32; 4],
+    rx_raw_word_count: usize,
     rx_pos: usize,
     rx_expected: usize,
     tx_pos: usize,
@@ -56,6 +63,8 @@ impl PioSpiTransportState {
         Self {
             staged_tx: make_response_frame(RESP_DATA_MAGIC, b""),
             rx_frame: [0; FRAME_SIZE],
+            rx_raw_words: [0; 4],
+            rx_raw_word_count: 0,
             rx_pos: 0,
             rx_expected: FRAME_SIZE,
             tx_pos: 0,
@@ -71,6 +80,8 @@ impl PioSpiTransportState {
     /// Starts a new CS-bounded transaction.
     pub fn begin_transaction(&mut self) {
         self.rx_frame = [0; FRAME_SIZE];
+        self.rx_raw_words = [0; 4];
+        self.rx_raw_word_count = 0;
         self.rx_pos = 0;
         self.rx_expected = FRAME_SIZE;
         self.tx_pos = 0;
@@ -121,6 +132,15 @@ impl PioSpiTransportState {
         }
     }
 
+    /// Records one raw RX FIFO word for diagnostics and captures the selected byte lane.
+    pub fn capture_rx_word(&mut self, word: u32) {
+        if self.rx_raw_word_count < self.rx_raw_words.len() {
+            self.rx_raw_words[self.rx_raw_word_count] = word;
+            self.rx_raw_word_count += 1;
+        }
+        self.capture_rx_byte(word as u8);
+    }
+
     /// Finalizes the current transaction and returns the captured result.
     pub fn finish_transaction(&mut self) -> TransactionResult {
         let tx_complete = self.tx_pos >= FRAME_SIZE;
@@ -132,6 +152,8 @@ impl PioSpiTransportState {
             TransactionResult::IdlePoll {
                 received: self.rx_pos,
                 preview,
+                raw_words: self.rx_raw_words,
+                raw_word_count: self.rx_raw_word_count,
             }
         } else if self.rx_complete() {
             TransactionResult::Complete(self.rx_frame)
@@ -167,7 +189,9 @@ mod tests {
             state.finish_transaction(),
             TransactionResult::IdlePoll {
                 received: 0,
-                preview: [0; 8]
+                preview: [0; 8],
+                raw_words: [0; 4],
+                raw_word_count: 0,
             }
         );
     }

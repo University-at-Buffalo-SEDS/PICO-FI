@@ -32,6 +32,16 @@ struct JsonBridgeConfig {
 #[derive(Deserialize)]
 struct JsonUpstreamConfig {
     transport: String,
+    usb: Option<JsonUsbConfig>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct JsonUsbConfig {
+    manufacturer: Option<String>,
+    product: Option<String>,
+    serial_number: Option<String>,
+    comm_interface: Option<String>,
+    data_interface: Option<String>,
 }
 
 fn main() {
@@ -66,9 +76,11 @@ fn render_generated_config(config: JsonConfig) -> String {
     let address_mode = render_address_mode(&config.network);
     let bridge_mode = render_bridge_mode(&config.bridge);
     let upstream = render_upstream_mode(&config.upstream);
+    let usb_names = render_usb_names(config.upstream.usb.as_ref());
 
     format!(
-        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n}};\n"
+        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n}};\n\
+pub const COMPILED_USB_DEVICE_NAMES: UsbDeviceNames = {usb_names};\n"
     )
 }
 
@@ -134,10 +146,30 @@ fn render_upstream_mode(upstream: &JsonUpstreamConfig) -> String {
         "uart" => "UpstreamMode::Uart".to_owned(),
         "i2c" => "UpstreamMode::I2c".to_owned(),
         "spi" => "UpstreamMode::Spi".to_owned(),
+        "usb" => "UpstreamMode::Usb".to_owned(),
         "spi_echo" | "spiecho" => "UpstreamMode::SpiEcho".to_owned(),
         "spi_static" | "spistatic" => "UpstreamMode::SpiStatic".to_owned(),
         "test" => "UpstreamMode::Test".to_owned(),
         other => panic!("unsupported upstream.transport: {other}"),
+    }
+}
+
+fn render_usb_names(usb: Option<&JsonUsbConfig>) -> String {
+    let usb = usb.cloned().unwrap_or_default();
+    format!(
+        "UsbDeviceNames {{ manufacturer: {manufacturer}, product: {product}, serial_number: {serial_number}, comm_interface: {comm_interface}, data_interface: {data_interface} }}",
+        manufacturer = render_optional_string(usb.manufacturer.as_deref(), Some("pico-fi")),
+        product = render_optional_string(usb.product.as_deref(), Some("pico-fi USB Bridge")),
+        serial_number = render_optional_string(usb.serial_number.as_deref(), Some("PICO-FI")),
+        comm_interface = render_optional_string(usb.comm_interface.as_deref(), Some("pico-fi CDC")),
+        data_interface = render_optional_string(usb.data_interface.as_deref(), Some("pico-fi data")),
+    )
+}
+
+fn render_optional_string(value: Option<&str>, default: Option<&str>) -> String {
+    match value.or(default) {
+        Some(value) => format!("Some({value:?})"),
+        None => "None".to_owned(),
     }
 }
 
