@@ -3,8 +3,8 @@
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
-    FRAME_SIZE, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame,
-    parse_request_frame,
+    FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
+    RequestFrame, make_response_frame, parse_request_frame,
 };
 use embassy_executor::Spawner;
 use embassy_rp::gpio::Level;
@@ -145,13 +145,21 @@ impl<'d> PioSpiSlaveProgram<'d> {
             r#"
                 .wrap_target
                 wait 0 gpio 13
+                wait 0 gpio 10
+            byteloop:
+                pull block
+                mov isr, null
+                set x, 7
             bitloop:
                 jmp pin done
                 out pins, 1
                 wait 1 gpio 10
+                nop [1]
                 in pins, 1
                 wait 0 gpio 10
-                jmp bitloop
+                jmp x-- bitloop
+                push block
+                jmp byteloop
             done:
                 irq 0 rel
                 wait 1 gpio 13
@@ -187,12 +195,12 @@ fn configure_pio_spi_slave<'d>(
     cfg.set_out_pins(&[&miso_pin]);
     cfg.set_in_pins(&[&mosi_pin]);
     cfg.set_jmp_pin(&cs_pin);
-    cfg.shift_in.auto_fill = true;
+    cfg.shift_in.auto_fill = false;
     cfg.shift_in.direction = ShiftDirection::Left;
-    cfg.shift_in.threshold = 8;
-    cfg.shift_out.auto_fill = true;
+    cfg.shift_in.threshold = 32;
+    cfg.shift_out.auto_fill = false;
     cfg.shift_out.direction = ShiftDirection::Left;
-    cfg.shift_out.threshold = 8;
+    cfg.shift_out.threshold = 32;
     cfg.clock_divider = 1u8.into();
     sm.set_config(&cfg);
     sm.set_pins(Level::Low, &[&miso_pin]);
@@ -246,7 +254,7 @@ fn service_pio_rx_fifo(
     let mut did_work = false;
     let rx = sm.rx();
     while let Some(word) = rx.try_pull() {
-        let byte = word as u8;
+        let byte = decode_spi_rx_byte(word);
         if *rx_pos < FRAME_SIZE {
             rx_frame[*rx_pos] = byte;
             rx_words[*rx_pos] = word;
@@ -264,8 +272,12 @@ async fn finalize_transaction(
     link_active: &AtomicBool,
     tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
 ) -> Option<[u8; FRAME_SIZE]> {
+    let frame = select_spi_frame_candidate(&frame, &rx_words);
+
     if frame[0] == 0 && frame[1] == 0 {
-        return Some(make_response_frame(RESP_DATA_MAGIC, b""));
+        if frame.iter().all(|&byte| byte == 0) {
+            return Some(make_response_frame(RESP_DATA_MAGIC, b""));
+        }
     }
 
     match parse_request_frame(&frame) {
@@ -275,14 +287,106 @@ async fn finalize_transaction(
             Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
         }
         Some(RequestFrame::Data(_)) => {
+            if let Some(payload) = recover_spi_command_payload(&frame) {
+                let line = trim_ascii_line(payload);
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+            }
             tx.send(SpiFrame { data: frame }).await;
             None
         }
-        None => Some(make_response_frame(
-            RESP_COMMAND_MAGIC,
-            render_spi_capture(&frame, &rx_words).as_bytes(),
-        )),
+        None => {
+            if let Some(payload) = recover_spi_command_payload(&frame) {
+                let line = trim_ascii_line(payload);
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
+            } else {
+                Some(make_response_frame(
+                    RESP_COMMAND_MAGIC,
+                    render_spi_capture(&frame, &rx_words).as_bytes(),
+                ))
+            }
+        }
     }
+}
+
+fn decode_spi_rx_byte(word: u32) -> u8 {
+    let bytes = word.to_be_bytes();
+    if bytes[0] != 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0 {
+        return bytes[0];
+    }
+    if bytes[3] != 0 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 {
+        return bytes[3];
+    }
+    for &byte in &bytes {
+        if byte != 0 {
+            return byte;
+        }
+    }
+    0
+}
+
+fn select_spi_frame_candidate(
+    default_frame: &[u8; FRAME_SIZE],
+    rx_words: &[u32; FRAME_SIZE],
+) -> [u8; FRAME_SIZE] {
+    let mut best = *default_frame;
+    if parse_request_frame(&best).is_some() || recover_spi_command_payload(&best).is_some() {
+        return best;
+    }
+
+    let shifts = [24u32, 16, 8, 0];
+    for shift in shifts {
+        let mut candidate = [0u8; FRAME_SIZE];
+        for (index, word) in rx_words.iter().enumerate() {
+            candidate[index] = ((word >> shift) & 0xff) as u8;
+        }
+        if parse_request_frame(&candidate).is_some()
+            || recover_spi_command_payload(&candidate).is_some()
+        {
+            return candidate;
+        }
+
+        // Prefer candidates with a plausible magic/len header over all-zero defaults.
+        if best[0] == 0
+            && best[1] == 0
+            && matches!(candidate[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC)
+            && (candidate[1] as usize) <= FRAME_SIZE - 2
+        {
+            best = candidate;
+        }
+    }
+
+    best
+}
+
+fn recover_spi_command_payload(frame: &[u8; FRAME_SIZE]) -> Option<&[u8]> {
+    let header_looks_corrupt = matches!(
+        (frame[0], frame[1]),
+        (REQ_DATA_MAGIC, 0) | (REQ_COMMAND_MAGIC, 0) | (0, 0)
+    );
+    if !header_looks_corrupt {
+        return None;
+    }
+
+    let slash_index = frame[2..]
+        .iter()
+        .position(|&byte| byte == b'/')
+        .map(|index| index + 2)?;
+    let end = frame[slash_index..]
+        .iter()
+        .position(|&byte| byte == 0)
+        .map(|index| slash_index + index)
+        .unwrap_or(FRAME_SIZE);
+    let payload = &frame[slash_index..end];
+    if payload.is_empty() {
+        return None;
+    }
+
+    let plausible = payload
+        .iter()
+        .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte));
+    if plausible { Some(payload) } else { None }
 }
 
 fn render_spi_capture(frame: &[u8; FRAME_SIZE], rx_words: &[u32; FRAME_SIZE]) -> String<192> {

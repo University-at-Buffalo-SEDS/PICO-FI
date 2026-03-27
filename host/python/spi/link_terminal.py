@@ -30,6 +30,7 @@ REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
 COMMAND_POLL_LIMIT = 50
+COMMAND_RETRY_LIMIT = 4
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -157,26 +158,40 @@ def is_plausible_command_payload(payload: bytes) -> bool:
     return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
 
 
+def flush_stale_command_frames(bus) -> None:
+    for _ in range(4):
+        rx_magic, rx_payload = parse_frame(bus.read_frame())
+        if rx_magic == RESP_DATA_MAGIC and not rx_payload:
+            return
+        if rx_magic == 0:
+            return
+
+
 def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_delay_s: float) -> None:
     try:
-        first_rx = bus.write_frame(build_frame(payload, magic))
-        rx_magic, rx_payload = parse_frame(first_rx)
         if magic != REQ_COMMAND_MAGIC:
+            first_rx = bus.write_frame(build_frame(payload, magic))
+            rx_magic, rx_payload = parse_frame(first_rx)
             if rx_magic == 0:
                 rx_magic, rx_payload = parse_frame(bus.read_frame())
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
                 print_payload(prompt, rx_payload)
             return
-        if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-            print_payload(prompt, rx_payload)
-            return
-        time.sleep(poll_delay_s)
-        for _ in range(COMMAND_POLL_LIMIT):
-            rx_magic, rx_payload = parse_frame(bus.read_frame())
+
+        for _ in range(COMMAND_RETRY_LIMIT):
+            flush_stale_command_frames(bus)
+            first_rx = bus.write_frame(build_frame(payload, magic))
+            rx_magic, rx_payload = parse_frame(first_rx)
             if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
                 print_payload(prompt, rx_payload)
                 return
             time.sleep(poll_delay_s)
+            for _ in range(COMMAND_POLL_LIMIT):
+                rx_magic, rx_payload = parse_frame(bus.read_frame())
+                if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+                    print_payload(prompt, rx_payload)
+                    return
+                time.sleep(poll_delay_s)
         prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")

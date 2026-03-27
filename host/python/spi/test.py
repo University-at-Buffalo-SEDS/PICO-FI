@@ -20,6 +20,7 @@ RESP_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
 STALE_POLL_LIMIT = 4
 COMMAND_POLL_LIMIT = 50
+COMMAND_RETRY_LIMIT = 4
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -73,20 +74,27 @@ def spi_exchange(
     bus = None
     try:
         bus = open_bus(bus_num, device, speed)
-        if magic == REQ_COMMAND_MAGIC:
-            flush_stale_command_frames(bus)
         tx = build_frame(payload, magic)
         print(f"Sending to SPI bus {bus_num}.{device} @ {speed} Hz...")
         print(f"Sent: {format_bytes(tx)}...")
-        first_rx = bus.write_frame(tx)
-        first_magic, first_length, first_body = parse_frame(first_rx)
-        if verbose_raw:
-            print(f"Write recv: {format_bytes(first_rx)}...")
 
-        rx = first_rx
-        magic_val, length, body = first_magic, first_length, first_body
-        if magic == REQ_COMMAND_MAGIC:
-            if not (magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body)):
+        rx = bytes(FRAME_SIZE)
+        magic_val, length, body = 0, 0, b""
+
+        attempts = COMMAND_RETRY_LIMIT if magic == REQ_COMMAND_MAGIC else 1
+        for attempt in range(attempts):
+            if magic == REQ_COMMAND_MAGIC:
+                flush_stale_command_frames(bus)
+            first_rx = bus.write_frame(tx)
+            first_magic, first_length, first_body = parse_frame(first_rx)
+            if verbose_raw:
+                print(f"Write recv[{attempt + 1}]: {format_bytes(first_rx)}...")
+
+            rx = first_rx
+            magic_val, length, body = first_magic, first_length, first_body
+            if magic == REQ_COMMAND_MAGIC:
+                if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
+                    break
                 time.sleep(0.01)
                 for _ in range(COMMAND_POLL_LIMIT):
                     rx = bus.read_frame()
@@ -94,9 +102,12 @@ def spi_exchange(
                     if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
                         break
                     time.sleep(0.01)
-        elif magic_val == 0:
-            rx = bus.read_frame()
-            magic_val, length, body = parse_frame(rx)
+                if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
+                    break
+            elif magic_val == 0:
+                rx = bus.read_frame()
+                magic_val, length, body = parse_frame(rx)
+                break
         print(f"Recv: {format_bytes(rx)}...")
         print(f"Magic: 0x{magic_val:02x}, Length: {length}")
         if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) and body:
