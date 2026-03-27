@@ -21,7 +21,7 @@ use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c_slave::{Config as I2cSlaveConfig, I2cSlave};
 use embassy_rp::interrupt::InterruptExt as _;
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, UART0};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, UART0};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -35,9 +35,10 @@ use storage::ConfigStorage;
 
 // Interrupt bindings required by the buffered UART driver.
 bind_interrupts!(struct Irqs {
-    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>, dma::InterruptHandler<DMA_CH2>, dma::InterruptHandler<DMA_CH3>;
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
 });
 
 /// Static TX buffer used by the boot/control UART.
@@ -235,6 +236,14 @@ async fn app(spawner: Spawner) {
     let upstream_spi = if matches!(bridge_config.upstream_mode, UpstreamMode::Spi) {
         spawner.spawn(
             spi_controller_task(
+                p.PIO1,
+                p.PIN_10,
+                p.PIN_11,
+                p.PIN_12,
+                p.PIN_13,
+                p.DMA_CH2,
+                p.DMA_CH3,
+                spawner,
                 bridge_config,
                 &LINK_ACTIVE,
                 SPI_FRAME_CHANNEL.sender(),
@@ -405,12 +414,34 @@ async fn i2c_controller_task(
 
 #[embassy_executor::task]
 async fn spi_controller_task(
+    pio1: embassy_rp::Peri<'static, PIO1>,
+    sclk: embassy_rp::Peri<'static, PIN_10>,
+    miso: embassy_rp::Peri<'static, PIN_11>,
+    mosi: embassy_rp::Peri<'static, PIN_12>,
+    cs: embassy_rp::Peri<'static, PIN_13>,
+    tx_dma: embassy_rp::Peri<'static, DMA_CH2>,
+    rx_dma: embassy_rp::Peri<'static, DMA_CH3>,
+    spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &'static AtomicBool,
     tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
 ) {
-    spi_poll_task(bridge_config, link_active, tx, rx_resp).await
+    spi_poll_task(
+        pio1,
+        sclk,
+        miso,
+        mosi,
+        cs,
+        tx_dma,
+        rx_dma,
+        spawner,
+        bridge_config,
+        link_active,
+        tx,
+        rx_resp,
+    )
+    .await
 }
 
 /// Starts the Embassy executor and launches the async application task.
@@ -421,4 +452,3 @@ fn main() -> ! {
         spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }
-

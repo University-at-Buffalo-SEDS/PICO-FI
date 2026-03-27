@@ -22,7 +22,7 @@ RESP_COMMAND_MAGIC = 0x5B
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
     payload = payload[:PAYLOAD_MAX]
-    frame = bytearray(2 + len(payload))
+    frame = bytearray(FRAME_SIZE)
     frame[0] = magic
     frame[1] = len(payload)
     frame[2:2 + len(payload)] = payload
