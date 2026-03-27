@@ -45,6 +45,8 @@ pub enum UpstreamMode {
     Spi,
     /// Uses the SPI transport in transaction-to-transaction echo mode for diagnostics.
     SpiEcho,
+    /// Uses the SPI transport to serve a fixed diagnostic response frame.
+    SpiStatic,
     /// Uses the simple TCP test mode instead of the normal bridge protocol.
     Test,
 }
@@ -125,6 +127,9 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
         ["set", "upstream", "spi"] => Ok(Command::SetUpstream(UpstreamMode::Spi)),
         ["set", "upstream", "spi_echo"] | ["set", "upstream", "spiecho"] => {
             Ok(Command::SetUpstream(UpstreamMode::SpiEcho))
+        }
+        ["set", "upstream", "spi_static"] | ["set", "upstream", "spistatic"] => {
+            Ok(Command::SetUpstream(UpstreamMode::SpiStatic))
         }
         ["set", "upstream", "test"] => Ok(Command::SetUpstream(UpstreamMode::Test)),
         ["reset"] => Ok(Command::Reset),
@@ -210,6 +215,9 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
         UpstreamMode::SpiEcho => {
             let _ = out.push_str(" upstream=spi_echo");
+        }
+        UpstreamMode::SpiStatic => {
+            let _ = out.push_str(" upstream=spi_static");
         }
         UpstreamMode::Test => {
             let _ = out.push_str(" upstream=test");

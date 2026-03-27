@@ -14,8 +14,6 @@ use std::time::Duration;
 
 const FRAME_SIZE: usize = 258;
 const PAYLOAD_MAX: usize = FRAME_SIZE - 2;
-const CHUNK_SIZE: usize = 32;
-
 const REQ_DATA_MAGIC: u8 = 0xA5;
 const REQ_COMMAND_MAGIC: u8 = 0xA6;
 const RESP_DATA_MAGIC: u8 = 0x5A;
@@ -178,28 +176,16 @@ impl SpiBackend {
     }
 
     fn write_request(&mut self, magic: u8, payload: &[u8]) -> Result<()> {
-        let payload = &payload[..payload.len().min(PAYLOAD_MAX)];
-        let mut frame = Vec::with_capacity(2 + payload.len());
-        frame.push(magic);
-        frame.push(payload.len() as u8);
-        frame.extend_from_slice(payload);
-
-        for chunk in frame.chunks(CHUNK_SIZE) {
-            let mut sink = vec![0u8; chunk.len()];
-            self.transfer(chunk, &mut sink)?;
-        }
+        let frame = build_request_frame(magic, payload);
+        let mut sink = [0u8; FRAME_SIZE];
+        self.transfer(&frame, &mut sink)?;
         Ok(())
     }
 
     fn read_frame(&mut self) -> Result<Frame> {
         let mut raw = [0u8; FRAME_SIZE];
-        let mut offset = 0usize;
-        while offset < FRAME_SIZE {
-            let len = (FRAME_SIZE - offset).min(CHUNK_SIZE);
-            let tx = vec![0u8; len];
-            self.transfer(&tx, &mut raw[offset..offset + len])?;
-            offset += len;
-        }
+        let tx = [0u8; FRAME_SIZE];
+        self.transfer(&tx, &mut raw)?;
         parse_response(&raw)
     }
 
@@ -259,6 +245,15 @@ fn parse_response(raw: &[u8; FRAME_SIZE]) -> Result<Frame> {
     }
 }
 
+fn build_request_frame(magic: u8, payload: &[u8]) -> [u8; FRAME_SIZE] {
+    let payload = &payload[..payload.len().min(PAYLOAD_MAX)];
+    let mut frame = [0u8; FRAME_SIZE];
+    frame[0] = magic;
+    frame[1] = payload.len() as u8;
+    frame[2..2 + payload.len()].copy_from_slice(payload);
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +265,15 @@ mod tests {
         raw[1] = 4;
         raw[2..6].copy_from_slice(b"pong");
         assert_eq!(parse_response(&raw).unwrap(), Frame::Command(b"pong".to_vec()));
+    }
+
+    #[test]
+    fn builds_full_sized_request_frame() {
+        let frame = build_request_frame(REQ_COMMAND_MAGIC, b"/ping\n");
+        assert_eq!(frame.len(), FRAME_SIZE);
+        assert_eq!(frame[0], REQ_COMMAND_MAGIC);
+        assert_eq!(frame[1], 6);
+        assert_eq!(&frame[2..8], b"/ping\n");
+        assert!(frame[8..].iter().all(|&byte| byte == 0));
     }
 }

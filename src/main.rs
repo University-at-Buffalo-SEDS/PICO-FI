@@ -181,7 +181,7 @@ async fn app(spawner: Spawner) {
     let compiled_config = BridgeConfig::default();
     let initial_config = if matches!(
         compiled_config.upstream_mode,
-        UpstreamMode::I2c | UpstreamMode::Spi | UpstreamMode::SpiEcho
+        UpstreamMode::I2c | UpstreamMode::Spi | UpstreamMode::SpiEcho | UpstreamMode::SpiStatic
     ) {
         compiled_config
     } else {
@@ -236,7 +236,10 @@ async fn app(spawner: Spawner) {
     } else {
         None
     };
-    let upstream_spi = if matches!(bridge_config.upstream_mode, UpstreamMode::Spi | UpstreamMode::SpiEcho) {
+    let upstream_spi = if matches!(
+        bridge_config.upstream_mode,
+        UpstreamMode::Spi | UpstreamMode::SpiEcho | UpstreamMode::SpiStatic
+    ) {
         spawner.spawn(
             spi_controller_task(
                 p.PIO1,
@@ -381,7 +384,7 @@ async fn run_bridge_mode(
             .await,
             None => Err(()),
         },
-        (_, UpstreamMode::SpiEcho) => loop {
+        (_, UpstreamMode::SpiEcho | UpstreamMode::SpiStatic) => loop {
             Timer::after_secs(1).await;
         },
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Test) => {

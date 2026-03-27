@@ -135,6 +135,7 @@ fn render_upstream_mode(upstream: &JsonUpstreamConfig) -> String {
         "i2c" => "UpstreamMode::I2c".to_owned(),
         "spi" => "UpstreamMode::Spi".to_owned(),
         "spi_echo" | "spiecho" => "UpstreamMode::SpiEcho".to_owned(),
+        "spi_static" | "spistatic" => "UpstreamMode::SpiStatic".to_owned(),
         "test" => "UpstreamMode::Test".to_owned(),
         other => panic!("unsupported upstream.transport: {other}"),
     }

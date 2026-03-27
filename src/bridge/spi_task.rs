@@ -1,4 +1,4 @@
-//! PIO-backed SPI slave task for framed upstream transfers.
+//! Hardware-SPI slave task for framed upstream transfers.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::config::BridgeConfig;
@@ -6,20 +6,24 @@ use crate::protocol::i2c::{
     FRAME_SIZE, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame,
     parse_request_frame,
 };
+use embedded_hal::spi::MODE_0;
+use embedded_hal_nb::spi::FullDuplex;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
-use embassy_rp::dma::Channel;
-use embassy_rp::gpio::{Input, Level, Pull};
 use embassy_rp::peripherals::{DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIO1};
-use embassy_rp::pio::{Common, Config, Direction, FifoJoin, Pio, ShiftDirection, StateMachine};
-use embassy_rp::{Peri, pio};
+use embassy_rp::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
 use heapless::String;
 use portable_atomic::AtomicBool;
+use rp2040_hal::gpio::{FunctionSpi, Pins};
+use rp2040_hal::pac;
+use rp2040_hal::sio::Sio;
+use rp2040_hal::spi::{Enabled, Spi, SpiDevice, ValidSpiPinout};
 
 const SPI_IDLE_BACKOFF: Duration = Duration::from_micros(5);
+const SPI_TRAILING_DRAIN_SPINS: usize = 128;
+const SPI_CS_PIN: usize = 13;
 
 /// Message type for framed SPI transfers passed between the bus task and bridge session.
 #[derive(Clone, Copy)]
@@ -27,155 +31,147 @@ pub struct SpiFrame {
     pub data: [u8; FRAME_SIZE],
 }
 
-/// Continuously services the PIO-based SPI slave bus and bridges framed requests.
+/// Continuously services the SPI1 slave bus and bridges framed requests.
 #[allow(clippy::too_many_arguments)]
 pub async fn spi_poll_task(
-    pio1: Peri<'static, PIO1>,
-    sclk: Peri<'static, PIN_10>,
-    miso: Peri<'static, PIN_11>,
-    mosi: Peri<'static, PIN_12>,
-    cs: Peri<'static, PIN_13>,
-    tx_dma: Peri<'static, DMA_CH2>,
-    rx_dma: Peri<'static, DMA_CH3>,
+    _pio1: Peri<'static, PIO1>,
+    _sclk: Peri<'static, PIN_10>,
+    _miso: Peri<'static, PIN_11>,
+    _mosi: Peri<'static, PIN_12>,
+    _cs: Peri<'static, PIN_13>,
+    _tx_dma: Peri<'static, DMA_CH2>,
+    _rx_dma: Peri<'static, DMA_CH3>,
     _spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
     tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
     rx_resp: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
 ) -> ! {
-    let Pio {
-        mut common,
-        sm0,
-        sm1,
-        ..
-    } = Pio::new(pio1, crate::Irqs);
+    let mut pac = unsafe { pac::Peripherals::steal() };
+    let sio = Sio::new(pac.SIO);
+    let pins = Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
+    let spi_pins = (
+        pins.gpio11.into_function::<FunctionSpi>(),
+        pins.gpio12.into_function::<FunctionSpi>(),
+        pins.gpio10.into_function::<FunctionSpi>(),
+        pins.gpio13.into_function::<FunctionSpi>(),
+    );
+    let mut spi = Spi::<_, _, _, 8>::new(pac.SPI1, spi_pins).init_slave(&mut pac.RESETS, MODE_0);
 
-    let (mut rx_sm, mut tx_sm) = configure_spi_slave_sms(&mut common, sm0, sm1, sclk, miso, mosi);
-    let mut tx_dma = Channel::new(tx_dma, crate::Irqs);
-    let mut rx_dma = Channel::new(rx_dma, crate::Irqs);
-    let cs = Input::new(cs, Pull::Up);
-
-    let mut staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
     let echo_mode = matches!(bridge_config.upstream_mode, crate::config::UpstreamMode::SpiEcho);
+    let static_mode = matches!(bridge_config.upstream_mode, crate::config::UpstreamMode::SpiStatic);
+    let mut staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
+    let mut staged_tx_pos = 0usize;
+    let static_frame = make_response_frame(RESP_COMMAND_MAGIC, b"pong");
 
     loop {
-        if !echo_mode {
+        if static_mode {
+            staged_tx = static_frame;
+            staged_tx_pos = 0;
+        } else if !echo_mode {
             if let Ok(resp) = rx_resp.try_receive() {
                 staged_tx = resp.data;
+                staged_tx_pos = 0;
             }
         }
 
-        let mut rx_words = [0u32; FRAME_SIZE];
-        rx_sm.clear_fifos();
-        tx_sm.clear_fifos();
-        rx_sm.restart();
-        tx_sm.restart();
-        rx_sm.set_enable(true);
-        tx_sm.set_enable(true);
-
-        {
-            let rx_transfer = rx_sm.rx().dma_pull(&mut rx_dma, &mut rx_words, false);
-            let tx_transfer = tx_sm.tx().dma_push(&mut tx_dma, &staged_tx, false);
-            join(tx_transfer, rx_transfer).await;
-        }
-
-        while cs.is_low() {
+        while !spi_cs_asserted() {
+            if static_mode {
+                staged_tx = static_frame;
+                staged_tx_pos = 0;
+            } else if !echo_mode {
+                if let Ok(resp) = rx_resp.try_receive() {
+                    staged_tx = resp.data;
+                    staged_tx_pos = 0;
+                }
+            }
+            service_spi_tx_fifo(&mut spi, &staged_tx, &mut staged_tx_pos);
             Timer::after(SPI_IDLE_BACKOFF).await;
         }
 
-        rx_sm.set_enable(false);
-        tx_sm.set_enable(false);
+        let mut rx_frame = [0u8; FRAME_SIZE];
+        let mut rx_words = [0u32; FRAME_SIZE];
+        let mut rx_pos = 0usize;
 
-        let tx_complete = true;
-        if tx_complete {
-            staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
+        while spi_cs_asserted() {
+            service_spi_tx_fifo(&mut spi, &staged_tx, &mut staged_tx_pos);
+            service_spi_rx_fifo(&mut spi, &mut rx_frame, &mut rx_words, &mut rx_pos);
+            core::hint::spin_loop();
         }
 
-        let mut rx_frame = [0u8; FRAME_SIZE];
-        for (dst, word) in rx_frame.iter_mut().zip(rx_words.iter()) {
-            *dst = *word as u8;
+        for _ in 0..SPI_TRAILING_DRAIN_SPINS {
+            let mut did_work = false;
+            did_work |= service_spi_tx_fifo(&mut spi, &staged_tx, &mut staged_tx_pos);
+            did_work |= service_spi_rx_fifo(&mut spi, &mut rx_frame, &mut rx_words, &mut rx_pos);
+            if !did_work && !spi.is_busy() {
+                break;
+            }
+        }
+
+        if staged_tx_pos >= FRAME_SIZE {
+            staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
+            staged_tx_pos = 0;
+        }
+
+        if static_mode {
+            continue;
         }
 
         if echo_mode {
             staged_tx = rx_frame;
+            staged_tx_pos = 0;
             continue;
         }
 
-        if let Some(next) = finalize_transaction(
-            rx_frame,
-            rx_words,
-            bridge_config,
-            link_active,
-            tx,
-        )
-        .await
+        if let Some(next) =
+            finalize_transaction(rx_frame, rx_words, bridge_config, link_active, tx).await
         {
             staged_tx = next;
+            staged_tx_pos = 0;
         }
     }
 }
 
-fn configure_spi_slave_sms(
-    common: &mut Common<'static, PIO1>,
-    mut rx_sm: StateMachine<'static, PIO1, 0>,
-    mut tx_sm: StateMachine<'static, PIO1, 1>,
-    sclk: Peri<'static, PIN_10>,
-    miso: Peri<'static, PIN_11>,
-    mosi: Peri<'static, PIN_12>,
-) -> (StateMachine<'static, PIO1, 0>, StateMachine<'static, PIO1, 1>) {
-    let rx_program = pio::program::pio_asm!(
-        ".wrap_target",
-        "wait 0 gpio 13",
-        "bitloop:",
-        "wait 1 gpio 10",
-        "in pins, 1",
-        "wait 0 gpio 10",
-        "jmp bitloop",
-        ".wrap",
-    );
-    let tx_program = pio::program::pio_asm!(
-        ".wrap_target",
-        "wait 0 gpio 13",
-        "bitloop:",
-        "out pins, 1",
-        "wait 1 gpio 10",
-        "wait 0 gpio 10",
-        "jmp bitloop",
-        ".wrap",
-    );
+fn service_spi_tx_fifo<D, P>(
+    spi: &mut Spi<Enabled, D, P, 8>,
+    staged_tx: &[u8; FRAME_SIZE],
+    tx_pos: &mut usize,
+) -> bool
+where
+    D: SpiDevice,
+    P: ValidSpiPinout<D>,
+{
+    let mut did_work = false;
+    while *tx_pos < FRAME_SIZE {
+        if spi.write(staged_tx[*tx_pos]).is_err() {
+            break;
+        }
+        *tx_pos += 1;
+        did_work = true;
+    }
+    did_work
+}
 
-    let loaded_rx = common.load_program(&rx_program.program);
-    let loaded_tx = common.load_program(&tx_program.program);
-    let _sclk_pin = common.make_pio_pin(sclk);
-    let mosi_pin = common.make_pio_pin(mosi);
-    let miso_pin = common.make_pio_pin(miso);
-
-    let mut rx_cfg = Config::default();
-    rx_cfg.use_program(&loaded_rx, &[]);
-    rx_cfg.set_in_pins(&[&mosi_pin]);
-    rx_cfg.fifo_join = FifoJoin::RxOnly;
-    rx_cfg.shift_in.auto_fill = true;
-    rx_cfg.shift_in.direction = ShiftDirection::Left;
-    rx_cfg.shift_in.threshold = 8;
-    rx_cfg.clock_divider = 1u8.into();
-    rx_sm.set_config(&rx_cfg);
-    rx_sm.set_pin_dirs(Direction::In, &[&mosi_pin]);
-    rx_sm.set_enable(false);
-
-    let mut tx_cfg = Config::default();
-    tx_cfg.use_program(&loaded_tx, &[]);
-    tx_cfg.set_out_pins(&[&miso_pin]);
-    tx_cfg.fifo_join = FifoJoin::TxOnly;
-    tx_cfg.shift_out.auto_fill = true;
-    tx_cfg.shift_out.direction = ShiftDirection::Left;
-    tx_cfg.shift_out.threshold = 8;
-    tx_cfg.clock_divider = 1u8.into();
-    tx_sm.set_config(&tx_cfg);
-    tx_sm.set_pins(Level::Low, &[&miso_pin]);
-    tx_sm.set_pin_dirs(Direction::Out, &[&miso_pin]);
-    tx_sm.set_enable(false);
-
-    (rx_sm, tx_sm)
+fn service_spi_rx_fifo<D, P>(
+    spi: &mut Spi<Enabled, D, P, 8>,
+    rx_frame: &mut [u8; FRAME_SIZE],
+    rx_words: &mut [u32; FRAME_SIZE],
+    rx_pos: &mut usize,
+) -> bool
+where
+    D: SpiDevice,
+    P: ValidSpiPinout<D>,
+{
+    let mut did_work = false;
+    while let Ok(byte) = spi.read() {
+        if *rx_pos < FRAME_SIZE {
+            rx_frame[*rx_pos] = byte;
+            rx_words[*rx_pos] = byte as u32;
+            *rx_pos += 1;
+        }
+        did_work = true;
+    }
+    did_work
 }
 
 async fn finalize_transaction(
@@ -213,10 +209,7 @@ async fn finalize_transaction(
     }
 }
 
-fn render_spi_capture(
-    frame: &[u8; FRAME_SIZE],
-    rx_words: &[u32; FRAME_SIZE],
-) -> String<192> {
+fn render_spi_capture(frame: &[u8; FRAME_SIZE], rx_words: &[u32; FRAME_SIZE]) -> String<192> {
     let mut out = String::<192>::new();
     let nonzero = frame.iter().filter(|&&b| b != 0).count();
     let _ = out.push_str("spi rx nz=");
@@ -244,6 +237,13 @@ fn push_hex(out: &mut String<192>, value: u8) {
     let _ = out.push(HEX[(value & 0x0f) as usize] as char);
 }
 
+fn push_hex32(out: &mut String<192>, value: u32) {
+    push_hex(out, ((value >> 24) & 0xff) as u8);
+    push_hex(out, ((value >> 16) & 0xff) as u8);
+    push_hex(out, ((value >> 8) & 0xff) as u8);
+    push_hex(out, (value & 0xff) as u8);
+}
+
 fn push_usize(out: &mut String<192>, mut value: usize) {
     if value == 0 {
         let _ = out.push('0');
@@ -264,9 +264,7 @@ fn push_usize(out: &mut String<192>, mut value: usize) {
     }
 }
 
-fn push_hex32(out: &mut String<192>, value: u32) {
-    push_hex(out, ((value >> 24) & 0xff) as u8);
-    push_hex(out, ((value >> 16) & 0xff) as u8);
-    push_hex(out, ((value >> 8) & 0xff) as u8);
-    push_hex(out, (value & 0xff) as u8);
+fn spi_cs_asserted() -> bool {
+    let bank0_inputs = rp_pac::SIO.gpio_in(0).read();
+    ((bank0_inputs >> SPI_CS_PIN) & 1) == 0
 }

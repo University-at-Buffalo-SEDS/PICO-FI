@@ -11,7 +11,6 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
     ) from exc
 
 FRAME_SIZE = 258
-CHUNK_SIZE = 32
 
 
 class RawSpiBus:
@@ -28,8 +27,8 @@ class RawSpiBus:
     def transfer(self, tx: bytes) -> bytes:
         return bytes(self.spi.xfer2(list(tx)))
 
-    def write_frame(self, frame: bytes) -> None:
-        self.transfer(frame)
+    def write_frame(self, frame: bytes) -> bytes:
+        return self.transfer(frame)
 
     def read_frame(self) -> bytes:
         return self.transfer(bytes(FRAME_SIZE))

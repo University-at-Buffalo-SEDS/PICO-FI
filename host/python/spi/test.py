@@ -57,9 +57,15 @@ def spi_exchange(
         tx = build_frame(payload, magic)
         print(f"Sending to SPI bus {bus_num}.{device} @ {speed} Hz...")
         print(f"Sent: {format_bytes(tx)}...")
-        bus.write_frame(tx)
-        rx = bus.read_frame()
-        magic_val, length, body = parse_frame(rx)
+        first_rx = bus.write_frame(tx)
+        first_magic, first_length, first_body = parse_frame(first_rx)
+        print(f"Write recv: {format_bytes(first_rx)}...")
+
+        rx = first_rx
+        magic_val, length, body = first_magic, first_length, first_body
+        if magic_val == 0:
+            rx = bus.read_frame()
+            magic_val, length, body = parse_frame(rx)
         if magic == REQ_COMMAND_MAGIC and magic_val != RESP_COMMAND_MAGIC:
             for _ in range(50):
                 time.sleep(0.01)
@@ -95,8 +101,7 @@ def spi_echo_test(bus_num: int, device: int, speed: int, payload: bytes) -> int:
         tx = build_frame(payload, REQ_COMMAND_MAGIC)
         print(f"Sending echo priming frame to SPI bus {bus_num}.{device} @ {speed} Hz...")
         print(f"Sent: {format_bytes(tx)}...")
-        bus.write_frame(tx)
-        first = bus.read_frame()
+        first = bus.write_frame(tx)
         print(f"Priming recv: {format_bytes(first)}...")
         second = bus.read_frame()
         print(f"Echo recv: {format_bytes(second)}...")

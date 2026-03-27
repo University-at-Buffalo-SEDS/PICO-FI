@@ -21,11 +21,13 @@ Pi wiring:
 
 ## Frame layout
 
-Requests are variable-length framed writes:
+Requests are sent as fixed `258` byte SPI transactions so they stay within a
+single Linux `spidev` chip-select window:
 
 - byte `0`: magic
 - byte `1`: payload length `N`
 - bytes `2..(2+N)`: payload
+- remaining bytes: zero padding
 
 Responses are clocked out as fixed `258` byte frames:
 
@@ -47,7 +49,11 @@ Constants:
 
 - `0xA5` requests carry raw bridged data.
 - `0xA6` requests carry local Pico commands such as `/ping` and `/show`.
-- SPI response polling is done by issuing a readback transfer with zero-filled MOSI bytes.
+- Each request must fit in one CS-bounded transfer. Splitting a frame across
+  multiple Linux `SPI_IOC_MESSAGE` calls will be seen by the Pico as multiple
+  independent transactions.
+- SPI response polling is done by issuing a full-frame readback transfer with
+  zero-filled MOSI bytes.
 
 ## References
 

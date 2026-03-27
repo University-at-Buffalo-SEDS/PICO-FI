@@ -43,11 +43,12 @@ Notes:
 - This module is for Linux hosts. It uses the `I2C_RDWR` ioctl directly.
 - `Frame::Data` is the streaming payload you would forward into the frontend.
 - `Frame::Command` is for local Pico command replies such as `/ping` and `/link`.
-- The backend mirrors the Python terminal behavior: writes are chunked to 32 bytes and reads pull a full 258-byte response frame.
+- The I2C backend mirrors the Python terminal behavior: writes are chunked to 32 bytes and reads pull a full 258-byte response frame.
 
 SPI notes:
 - The SPI backend uses `SPI_IOC_MESSAGE` on `/dev/spidev*`.
 - The Pico SPI slave path uses `SPI1` on `GPIO10`=`SCK`, `GPIO11`=`MOSI`, `GPIO12`=`MISO`, `GPIO13`=`CSn`.
+- SPI requests and polls are each sent as a single 258-byte full-duplex transaction so Linux keeps them within one chip-select window.
 - SPI reads are implemented as full-duplex transfers with zero-filled MOSI bytes while clocking data out of the Pico.
 
 Example Python entrypoints:

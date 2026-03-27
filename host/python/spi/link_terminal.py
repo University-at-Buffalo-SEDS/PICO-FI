@@ -152,8 +152,10 @@ def print_payload(prompt: PromptState, payload: bytes) -> None:
 
 def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_delay_s: float) -> None:
     try:
-        bus.write_frame(build_frame(payload, magic))
-        rx_magic, rx_payload = parse_frame(bus.read_frame())
+        first_rx = bus.write_frame(build_frame(payload, magic))
+        rx_magic, rx_payload = parse_frame(first_rx)
+        if rx_magic == 0:
+            rx_magic, rx_payload = parse_frame(bus.read_frame())
         if magic != REQ_COMMAND_MAGIC:
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
                 print_payload(prompt, rx_payload)
