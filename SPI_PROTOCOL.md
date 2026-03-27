@@ -7,15 +7,15 @@ This project uses a framed SPI protocol between a Linux SPI master and the Pico 
 The Pico upstream SPI slave uses:
 
 - `GPIO10` = `SPI1 SCK`
-- `GPIO11` = `SPI1 MOSI` input to Pico
-- `GPIO12` = `SPI1 MISO` output from Pico
+- `GPIO11` = `SPI1 TX` output from Pico
+- `GPIO12` = `SPI1 RX` input to Pico
 - `GPIO13` = `SPI1 CSn`
 
 Pi wiring:
 
 - Pi `SCLK` -> Pico `GPIO10`
-- Pi `MOSI` -> Pico `GPIO11`
-- Pi `MISO` <- Pico `GPIO12`
+- Pi `MOSI` -> Pico `GPIO12`
+- Pi `MISO` <- Pico `GPIO11`
 - Pi `CE0`/chip-select -> Pico `GPIO13`
 - Pi `GND` -> Pico `GND`
 

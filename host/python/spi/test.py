@@ -88,6 +88,34 @@ def spi_exchange(
                 pass
 
 
+def spi_echo_test(bus_num: int, device: int, speed: int, payload: bytes) -> int:
+    bus = None
+    try:
+        bus = open_bus(bus_num, device, speed)
+        tx = build_frame(payload, REQ_COMMAND_MAGIC)
+        print(f"Sending echo priming frame to SPI bus {bus_num}.{device} @ {speed} Hz...")
+        print(f"Sent: {format_bytes(tx)}...")
+        bus.write_frame(tx)
+        first = bus.read_frame()
+        print(f"Priming recv: {format_bytes(first)}...")
+        second = bus.read_frame()
+        print(f"Echo recv: {format_bytes(second)}...")
+        if second == tx:
+            print("Echo matched previous transaction exactly.")
+            return 0
+        print("Echo mismatch.")
+        return 1
+    except Exception as exc:
+        print(f"ERROR: SPI error - {exc}")
+        return 1
+    finally:
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="SPI test tool for Pico-Fi")
     parser.add_argument("--bus", type=int, default=0, help="SPI bus number")
@@ -98,6 +126,13 @@ def main() -> int:
     probe_parser.add_argument("--count", type=int, default=10)
     cmd_parser = subparsers.add_parser("command", help="Send command")
     cmd_parser.add_argument("text", help="Command text (e.g., /ping)")
+    echo_parser = subparsers.add_parser("echo", help="Send a frame and verify it is echoed back on the next transfer")
+    echo_parser.add_argument(
+        "text",
+        nargs="?",
+        default="/ping",
+        help="Payload text to embed in the echoed frame",
+    )
     led_parser = subparsers.add_parser("led", help="Send LED diagnostic commands")
     led_parser.add_argument(
         "action",
@@ -126,6 +161,13 @@ def main() -> int:
             args.speed,
             (args.text + "\n").encode(),
             REQ_COMMAND_MAGIC,
+        )
+    if args.command == "echo":
+        return spi_echo_test(
+            args.bus,
+            args.device,
+            args.speed,
+            (args.text + "\n").encode(),
         )
     if args.command == "led":
         return spi_exchange(

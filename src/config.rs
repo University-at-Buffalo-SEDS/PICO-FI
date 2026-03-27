@@ -43,6 +43,8 @@ pub enum UpstreamMode {
     I2c,
     /// Uses the framed SPI slave transport as the upstream payload interface.
     Spi,
+    /// Uses the SPI transport in transaction-to-transaction echo mode for diagnostics.
+    SpiEcho,
     /// Uses the simple TCP test mode instead of the normal bridge protocol.
     Test,
 }
@@ -121,6 +123,9 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
         ["set", "upstream", "uart"] => Ok(Command::SetUpstream(UpstreamMode::Uart)),
         ["set", "upstream", "i2c"] => Ok(Command::SetUpstream(UpstreamMode::I2c)),
         ["set", "upstream", "spi"] => Ok(Command::SetUpstream(UpstreamMode::Spi)),
+        ["set", "upstream", "spi_echo"] | ["set", "upstream", "spiecho"] => {
+            Ok(Command::SetUpstream(UpstreamMode::SpiEcho))
+        }
         ["set", "upstream", "test"] => Ok(Command::SetUpstream(UpstreamMode::Test)),
         ["reset"] => Ok(Command::Reset),
         _ => Err("unknown command"),
@@ -202,6 +207,9 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
         UpstreamMode::Spi => {
             let _ = out.push_str(" upstream=spi");
+        }
+        UpstreamMode::SpiEcho => {
+            let _ = out.push_str(" upstream=spi_echo");
         }
         UpstreamMode::Test => {
             let _ = out.push_str(" upstream=test");

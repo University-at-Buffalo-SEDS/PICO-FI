@@ -133,6 +133,7 @@ fn decode_record(buf: &[u8; RECORD_SIZE]) -> Option<BridgeConfig> {
         1 => UpstreamMode::I2c,
         2 => UpstreamMode::Test,
         3 => UpstreamMode::Spi,
+        4 => UpstreamMode::SpiEcho,
         _ => return None,
     };
 
@@ -167,6 +168,7 @@ fn encode_upstream_mode(mode: UpstreamMode) -> u8 {
         UpstreamMode::I2c => 1,
         UpstreamMode::Test => 2,
         UpstreamMode::Spi => 3,
+        UpstreamMode::SpiEcho => 4,
     }
 }
 
