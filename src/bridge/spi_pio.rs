@@ -35,7 +35,7 @@ impl Default for PioSpiPins {
 /// Result of one CS-bounded SPI transaction as seen by the future PIO backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionResult {
-    IdlePoll,
+    IdlePoll { received: usize, preview: [u8; 8] },
     Partial { received: usize, expected: usize },
     Complete([u8; FRAME_SIZE]),
 }
@@ -89,6 +89,27 @@ impl PioSpiTransportState {
         byte
     }
 
+    /// Returns the next byte with a one-bit lead applied across the staged bitstream.
+    ///
+    /// This compensates for a slave TX path that presents each bit one clock late on MISO.
+    pub fn next_tx_byte_shifted_left_1(&mut self) -> u8 {
+        let byte = if self.tx_pos < FRAME_SIZE {
+            let current = self.staged_tx[self.tx_pos];
+            let next = if self.tx_pos + 1 < FRAME_SIZE {
+                self.staged_tx[self.tx_pos + 1]
+            } else {
+                0
+            };
+            (current << 1) | (next >> 7)
+        } else {
+            0
+        };
+        if self.tx_pos < FRAME_SIZE {
+            self.tx_pos += 1;
+        }
+        byte
+    }
+
     /// Captures one received MOSI byte.
     pub fn capture_rx_byte(&mut self, byte: u8) {
         if self.rx_pos < FRAME_SIZE {
@@ -103,8 +124,15 @@ impl PioSpiTransportState {
     /// Finalizes the current transaction and returns the captured result.
     pub fn finish_transaction(&mut self) -> TransactionResult {
         let tx_complete = self.tx_pos >= FRAME_SIZE;
-        let result = if self.rx_pos == 0 || (self.rx_frame[0] == 0 && self.rx_frame[1] == 0) {
-            TransactionResult::IdlePoll
+        let received_any_nonzero = self.rx_frame[..self.rx_pos].iter().any(|&byte| byte != 0);
+        let mut preview = [0u8; 8];
+        let preview_len = self.rx_pos.min(preview.len());
+        preview[..preview_len].copy_from_slice(&self.rx_frame[..preview_len]);
+        let result = if self.rx_pos == 0 || !received_any_nonzero {
+            TransactionResult::IdlePoll {
+                received: self.rx_pos,
+                preview,
+            }
         } else if self.rx_complete() {
             TransactionResult::Complete(self.rx_frame)
         } else {
@@ -135,7 +163,13 @@ mod tests {
     fn default_state_returns_idle_poll() {
         let mut state = PioSpiTransportState::new();
         state.begin_transaction();
-        assert_eq!(state.finish_transaction(), TransactionResult::IdlePoll);
+        assert_eq!(
+            state.finish_transaction(),
+            TransactionResult::IdlePoll {
+                received: 0,
+                preview: [0; 8]
+            }
+        );
     }
 
     #[test]

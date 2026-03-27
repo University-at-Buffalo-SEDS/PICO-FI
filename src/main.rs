@@ -13,7 +13,7 @@ mod storage;
 use bridge::i2c_task::{i2c_poll_task, I2cFrame};
 use bridge::spi_task::{spi_poll_task, SpiFrame};
 use bridge::runtime::BridgeRuntime;
-use bridge::commands::{set_led_state, take_led_command};
+use bridge::commands::{set_led_state, take_led_activity, take_led_command};
 use config::{BridgeConfig, BridgeMode, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
@@ -104,6 +104,21 @@ async fn heartbeat_task(mut led: Output<'static>) {
     let mut auto_mode = true;
     let mut led_on = false;
     loop {
+        if take_led_activity() {
+            let restore_on = led_on;
+            led.set_high();
+            set_led_state(true);
+            Timer::after_millis(60).await;
+            if restore_on {
+                led.set_high();
+                set_led_state(true);
+            } else {
+                led.set_low();
+                set_led_state(false);
+            }
+            continue;
+        }
+
         if let Some(command) = take_led_command() {
             match command {
                 1 => {

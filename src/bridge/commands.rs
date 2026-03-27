@@ -11,6 +11,7 @@ const LED_MODE_TOGGLE: u8 = 3;
 
 static LED_COMMAND: AtomicU8 = AtomicU8::new(LED_MODE_AUTO);
 static LED_STATE: AtomicU8 = AtomicU8::new(LED_MODE_OFF);
+static LED_ACTIVITY_PULSES: AtomicU8 = AtomicU8::new(0);
 
 pub fn take_led_command() -> Option<u8> {
     match LED_COMMAND.swap(LED_MODE_AUTO, Ordering::AcqRel) {
@@ -21,6 +22,18 @@ pub fn take_led_command() -> Option<u8> {
 
 pub fn set_led_state(on: bool) {
     LED_STATE.store(if on { LED_MODE_ON } else { LED_MODE_OFF }, Ordering::Relaxed);
+}
+
+pub fn signal_led_activity() {
+    let _ = LED_ACTIVITY_PULSES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        Some(count.saturating_add(1))
+    });
+}
+
+pub fn take_led_activity() -> bool {
+    LED_ACTIVITY_PULSES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1))
+        .is_ok()
 }
 
 fn led_status_text() -> &'static str {
