@@ -4,9 +4,12 @@ use crate::config::{BridgeConfig, Command, apply_command, parse_command, render_
 use crate::storage::ConfigStorage;
 use embassy_futures::select::{Either, select};
 use embassy_rp::uart::BufferedUart;
-use embassy_time::Timer;
+use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
 use heapless::String;
+
+/// Maximum time the boot-time configuration shell is allowed to delay startup.
+const SHELL_WINDOW_MS: u64 = 3_000;
 
 /// Writes the boot banner and pre-start command summary.
 pub async fn write_banner(uart: &mut BufferedUart) -> Result<(), ()> {
@@ -31,10 +34,11 @@ pub async fn configuration_shell(
     initial_config: BridgeConfig,
 ) -> BridgeConfig {
     let mut config = initial_config;
+    let deadline = Instant::now() + Duration::from_millis(SHELL_WINDOW_MS);
 
-    for _ in 0..30 {
+    while Instant::now() < deadline {
         let mut line = String::<128>::new();
-        match read_line_with_timeout(uart, &mut line, 100).await {
+        match read_line_with_timeout(uart, &mut line, 100, deadline).await {
             Ok(true) => {}
             Ok(false) => continue,
             Err(()) => {
@@ -85,6 +89,7 @@ pub async fn read_line_with_timeout(
     uart: &mut BufferedUart,
     line: &mut String<128>,
     timeout_ms: u64,
+    deadline: Instant,
 ) -> Result<bool, ()> {
     let mut byte = [0u8; 1];
 
@@ -108,6 +113,10 @@ pub async fn read_line_with_timeout(
             },
             Either::First(Err(_)) => return Err(()),
             Either::Second(_) => {
+                if Instant::now() >= deadline {
+                    line.clear();
+                    return Ok(false);
+                }
                 if line.is_empty() {
                     return Ok(false);
                 }

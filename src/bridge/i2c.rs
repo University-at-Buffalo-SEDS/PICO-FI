@@ -36,21 +36,12 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        match select(
-            i2c_rx.receive(),
-            connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
-        )
-        .await
+        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
+            .await
+            .is_err()
         {
-            Either::First(frame) => {
-                handle_i2c_request(frame, None, bridge_config, runtime.link_active, i2c_tx).await?;
-                continue;
-            }
-            Either::Second(Err(_)) => {
-                Timer::after_millis(runtime.reconnect_delay_ms).await;
-                continue;
-            }
-            Either::Second(Ok(())) => {}
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
         }
         if exchange_link_handshake(
             &mut socket,
@@ -97,13 +88,8 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        match select(i2c_rx.receive(), socket.accept(port)).await {
-            Either::First(frame) => {
-                handle_i2c_request(frame, None, bridge_config, runtime.link_active, i2c_tx).await?;
-                continue;
-            }
-            Either::Second(Err(_)) => return Err(()),
-            Either::Second(Ok(())) => {}
+        if socket.accept(port).await.is_err() {
+            return Err(());
         }
         if exchange_link_handshake(
             &mut socket,

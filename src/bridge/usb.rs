@@ -16,6 +16,22 @@ use embassy_usb::class::cdc_acm::{Receiver, Sender};
 use heapless::String;
 use portable_atomic::{AtomicBool, Ordering};
 
+struct LocalCommandState {
+    at_line_start: bool,
+    active: bool,
+    buf: String<256>,
+}
+
+impl LocalCommandState {
+    fn new() -> Self {
+        Self {
+            at_line_start: true,
+            active: false,
+            buf: String::new(),
+        }
+    }
+}
+
 async fn write_usb_packet(
     sender: &mut Sender<'static, Driver<'static, USB>>,
     bytes: &[u8],
@@ -57,27 +73,77 @@ async fn handle_usb_input(
     bytes: &[u8],
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    line_buf: &mut String<256>,
+    command_state: &mut LocalCommandState,
     mut socket: Option<&mut TcpSocket<'_>>,
 ) -> Result<(), ()> {
     for &byte in bytes {
-        match byte {
-            b'\r' => {}
-            b'\n' => {
-                if handle_local_command(sender, bridge_config, link_active, line_buf.as_str()).await? {
-                    line_buf.clear();
-                    continue;
+        if command_state.active {
+            match byte {
+                b'\r' => {}
+                b'\n' => {
+                    let _ = handle_local_command(
+                        sender,
+                        bridge_config,
+                        link_active,
+                        command_state.buf.as_str(),
+                    )
+                    .await?;
+                    command_state.buf.clear();
+                    command_state.active = false;
+                    command_state.at_line_start = true;
                 }
-                if let Some(socket) = socket.as_deref_mut() {
-                    crate::net::write_socket(socket, line_buf.as_bytes()).await?;
-                    crate::net::write_socket(socket, b"\n").await?;
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    if command_state.buf.push(byte as char).is_err() {
+                        flush_command_bytes(command_state, socket.as_deref_mut()).await?;
+                        forward_usb_bytes(socket.as_deref_mut(), &[byte]).await?;
+                        command_state.at_line_start = false;
+                    }
                 }
-                line_buf.clear();
+                _ => {
+                    flush_command_bytes(command_state, socket.as_deref_mut()).await?;
+                    forward_usb_bytes(socket.as_deref_mut(), &[byte]).await?;
+                    command_state.at_line_start = false;
+                }
             }
-            byte if byte.is_ascii() => {
-                let _ = line_buf.push(byte as char);
-            }
-            _ => {}
+            continue;
+        }
+
+        if command_state.at_line_start && byte == b'/' {
+            command_state.active = true;
+            command_state.buf.clear();
+            let _ = command_state.buf.push('/');
+            continue;
+        }
+
+        forward_usb_bytes(socket.as_deref_mut(), &[byte]).await?;
+        if byte == b'\n' {
+            command_state.at_line_start = true;
+        } else if byte != b'\r' {
+            command_state.at_line_start = false;
+        }
+    }
+    Ok(())
+}
+
+async fn flush_command_bytes(
+    command_state: &mut LocalCommandState,
+    socket: Option<&mut TcpSocket<'_>>,
+) -> Result<(), ()> {
+    if !command_state.buf.is_empty() {
+        forward_usb_bytes(socket, command_state.buf.as_bytes()).await?;
+        command_state.buf.clear();
+    }
+    command_state.active = false;
+    Ok(())
+}
+
+async fn forward_usb_bytes(
+    socket: Option<&mut TcpSocket<'_>>,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    if let Some(socket) = socket {
+        if !bytes.is_empty() {
+            crate::net::write_socket(socket, bytes).await?;
         }
     }
     Ok(())
@@ -92,7 +158,7 @@ async fn session(
 ) -> Result<(), ()> {
     let mut usb_buf = [0u8; 256];
     let mut net_buf = [0u8; 256];
-    let mut line_buf = String::<256>::new();
+    let mut command_state = LocalCommandState::new();
 
     loop {
         match select(receiver.read_packet(&mut usb_buf), socket.read(&mut net_buf)).await {
@@ -106,7 +172,7 @@ async fn session(
                     &usb_buf[..usb_n],
                     bridge_config,
                     link_active,
-                    &mut line_buf,
+                    &mut command_state,
                     Some(socket),
                 )
                 .await?;
@@ -134,8 +200,6 @@ pub async fn run_client(
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     Timer::after_millis(runtime.startup_delay_ms).await;
-    let mut usb_buf = [0u8; 256];
-    let mut line_buf = String::<256>::new();
 
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -144,30 +208,12 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        match select(
-            receiver.read_packet(&mut usb_buf),
-            connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
-        )
-        .await
+        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
+            .await
+            .is_err()
         {
-            Either::First(Ok(usb_n)) => {
-                handle_usb_input(
-                    sender,
-                    &usb_buf[..usb_n],
-                    bridge_config,
-                    runtime.link_active,
-                    &mut line_buf,
-                    None,
-                )
-                .await?;
-                continue;
-            }
-            Either::First(Err(_)) => return Err(()),
-            Either::Second(Err(_)) => {
-                Timer::after_millis(runtime.reconnect_delay_ms).await;
-                continue;
-            }
-            Either::Second(Ok(())) => {}
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
         }
         if exchange_link_handshake(
             &mut socket,
@@ -201,30 +247,14 @@ pub async fn run_server(
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
-    let mut usb_buf = [0u8; 256];
-    let mut line_buf = String::<256>::new();
     loop {
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        match select(receiver.read_packet(&mut usb_buf), socket.accept(port)).await {
-            Either::First(Ok(usb_n)) => {
-                handle_usb_input(
-                    sender,
-                    &usb_buf[..usb_n],
-                    bridge_config,
-                    runtime.link_active,
-                    &mut line_buf,
-                    None,
-                )
-                .await?;
-                continue;
-            }
-            Either::First(Err(_)) => return Err(()),
-            Either::Second(Err(_)) => return Err(()),
-            Either::Second(Ok(())) => {}
+        if socket.accept(port).await.is_err() {
+            return Err(());
         }
         if exchange_link_handshake(
             &mut socket,

@@ -40,22 +40,13 @@ pub async fn run_client(
 
         runtime.link_active.store(false, Ordering::Relaxed);
         let _ = writeln_line(uart, "spi client: connecting").await;
-        match select(
-            spi_rx.receive(),
-            connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
-        )
-        .await
+        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
+            .await
+            .is_err()
         {
-            Either::First(frame) => {
-                handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx).await?;
-                continue;
-            }
-            Either::Second(Err(_)) => {
-                let _ = writeln_line(uart, "spi client: connect failed").await;
-                Timer::after_millis(runtime.reconnect_delay_ms).await;
-                continue;
-            }
-            Either::Second(Ok(())) => {}
+            let _ = writeln_line(uart, "spi client: connect failed").await;
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
         }
         let _ = writeln_line(uart, "spi client: connected").await;
         if exchange_link_handshake(
@@ -108,13 +99,8 @@ pub async fn run_server(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         let _ = writeln_line(uart, "spi server: listening").await;
-        match select(spi_rx.receive(), socket.accept(port)).await {
-            Either::First(frame) => {
-                handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx).await?;
-                continue;
-            }
-            Either::Second(Err(_)) => return Err(()),
-            Either::Second(Ok(())) => {}
+        if socket.accept(port).await.is_err() {
+            return Err(());
         }
         let _ = writeln_line(uart, "spi server: accepted").await;
         if exchange_link_handshake(
