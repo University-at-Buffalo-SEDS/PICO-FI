@@ -5,6 +5,7 @@ use crate::bridge::runtime::BridgeRuntime;
 use crate::bridge::spi_task::SpiFrame;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
+use crate::shell::writeln_line;
 use crate::protocol::i2c::{
     RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame, parse_request_frame,
 };
@@ -12,12 +13,14 @@ use embassy_futures::select::{Either, select};
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
+use embassy_rp::uart::BufferedUart;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
 use portable_atomic::{AtomicBool, Ordering};
 
 pub async fn run_client(
+    uart: &mut BufferedUart,
     stack: Stack<'static>,
     host: [u8; 4],
     port: u16,
@@ -36,6 +39,7 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
+        let _ = writeln_line(uart, "spi client: connecting").await;
         match select(
             spi_rx.receive(),
             connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
@@ -47,11 +51,13 @@ pub async fn run_client(
                 continue;
             }
             Either::Second(Err(_)) => {
+                let _ = writeln_line(uart, "spi client: connect failed").await;
                 Timer::after_millis(runtime.reconnect_delay_ms).await;
                 continue;
             }
             Either::Second(Ok(())) => {}
         }
+        let _ = writeln_line(uart, "spi client: connected").await;
         if exchange_link_handshake(
             &mut socket,
             true,
@@ -61,11 +67,13 @@ pub async fn run_client(
         .await
         .is_err()
         {
+            let _ = writeln_line(uart, "spi client: handshake failed").await;
             socket.abort();
             let _ = socket.flush().await;
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
+        let _ = writeln_line(uart, "spi client: handshake ok").await;
         runtime.link_active.store(true, Ordering::Relaxed);
 
         let _ = session(
@@ -76,6 +84,7 @@ pub async fn run_client(
             spi_tx,
         )
         .await;
+        let _ = writeln_line(uart, "spi client: session closed").await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -84,6 +93,7 @@ pub async fn run_client(
 }
 
 pub async fn run_server(
+    uart: &mut BufferedUart,
     stack: Stack<'static>,
     port: u16,
     bridge_config: BridgeConfig,
@@ -97,6 +107,7 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
+        let _ = writeln_line(uart, "spi server: listening").await;
         match select(spi_rx.receive(), socket.accept(port)).await {
             Either::First(frame) => {
                 handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx).await?;
@@ -105,6 +116,7 @@ pub async fn run_server(
             Either::Second(Err(_)) => return Err(()),
             Either::Second(Ok(())) => {}
         }
+        let _ = writeln_line(uart, "spi server: accepted").await;
         if exchange_link_handshake(
             &mut socket,
             false,
@@ -114,11 +126,13 @@ pub async fn run_server(
         .await
         .is_err()
         {
+            let _ = writeln_line(uart, "spi server: handshake failed").await;
             socket.abort();
             let _ = socket.flush().await;
             runtime.link_active.store(false, Ordering::Relaxed);
             continue;
         }
+        let _ = writeln_line(uart, "spi server: handshake ok").await;
         runtime.link_active.store(true, Ordering::Relaxed);
 
         let _ = session(
@@ -129,6 +143,7 @@ pub async fn run_server(
             spi_tx,
         )
         .await;
+        let _ = writeln_line(uart, "spi server: session closed").await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);

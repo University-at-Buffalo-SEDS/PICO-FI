@@ -13,6 +13,7 @@ mod storage;
 use bridge::i2c_task::{i2c_poll_task, I2cFrame};
 use bridge::spi_task::{spi_poll_task, SpiFrame};
 use bridge::runtime::BridgeRuntime;
+use bridge::commands::{set_led_state, take_led_command};
 use config::{BridgeConfig, BridgeMode, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
@@ -96,16 +97,50 @@ fn disable_uart0() {
     embassy_rp::interrupt::Interrupt::UART0_IRQ.unpend();
 }
 
-/// Blinks the onboard LED while a bridge link is active.
+/// Drives the onboard LED from either heartbeat mode or explicit local commands.
 #[embassy_executor::task]
 async fn heartbeat_task(mut led: Output<'static>) {
+    let mut auto_mode = true;
+    let mut led_on = false;
     loop {
-        if LINK_ACTIVE.load(Ordering::Relaxed) {
-            led.toggle();
-            Timer::after_millis(500).await;
+        if let Some(command) = take_led_command() {
+            match command {
+                1 => {
+                    auto_mode = false;
+                    led.set_low();
+                    led_on = false;
+                }
+                2 => {
+                    auto_mode = false;
+                    led.set_high();
+                    led_on = true;
+                }
+                3 => {
+                    auto_mode = false;
+                    led.toggle();
+                    led_on = !led_on;
+                }
+                _ => {
+                    auto_mode = true;
+                }
+            }
+            set_led_state(led_on);
+        }
+
+        if auto_mode {
+            if LINK_ACTIVE.load(Ordering::Relaxed) {
+                led.toggle();
+                led_on = !led_on;
+                set_led_state(led_on);
+                Timer::after_millis(500).await;
+            } else {
+                led.set_low();
+                led_on = false;
+                set_led_state(false);
+                Timer::after_millis(200).await;
+            }
         } else {
-            led.set_low();
-            Timer::after_millis(200).await;
+            Timer::after_millis(50).await;
         }
     }
 }
@@ -308,11 +343,30 @@ async fn run_bridge_mode(
             None => Err(()),
         },
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Spi) => match upstream_spi_enabled {
-            Some(_) => bridge::spi::run_client(stack, host, port, bridge_config, runtime, spi_rx, spi_tx).await,
+            Some(_) => bridge::spi::run_client(
+                uart.expect("spi mode keeps boot UART for diagnostics"),
+                stack,
+                host,
+                port,
+                bridge_config,
+                runtime,
+                spi_rx,
+                spi_tx,
+            )
+            .await,
             None => Err(()),
         },
         (BridgeMode::TcpServer { port }, UpstreamMode::Spi) => match upstream_spi_enabled {
-            Some(_) => bridge::spi::run_server(stack, port, bridge_config, runtime, spi_rx, spi_tx).await,
+            Some(_) => bridge::spi::run_server(
+                uart.expect("spi mode keeps boot UART for diagnostics"),
+                stack,
+                port,
+                bridge_config,
+                runtime,
+                spi_rx,
+                spi_tx,
+            )
+            .await,
             None => Err(()),
         },
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Test) => {
@@ -367,6 +421,4 @@ fn main() -> ! {
         spawner.spawn(app(spawner).expect("app task token allocation failed"));
     })
 }
-
-
 

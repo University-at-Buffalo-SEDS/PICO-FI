@@ -43,7 +43,14 @@ def format_bytes(data: bytes) -> str:
     return " ".join(f"{b:02x}" for b in data[:16])
 
 
-def spi_exchange(bus_num: int, device: int, speed: int, payload: bytes, magic: int = REQ_MAGIC) -> int:
+def spi_exchange(
+    bus_num: int,
+    device: int,
+    speed: int,
+    payload: bytes,
+    magic: int = REQ_MAGIC,
+    require_valid_response: bool = True,
+) -> int:
     bus = None
     try:
         bus = open_bus(bus_num, device, speed)
@@ -67,7 +74,9 @@ def spi_exchange(bus_num: int, device: int, speed: int, payload: bytes, magic: i
                 print(f"Response: {body.decode('utf-8', errors='replace')!r}")
             except Exception:
                 print(f"Response: {body.hex()}")
-        return 0 if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) else 1
+        if require_valid_response:
+            return 0 if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) else 1
+        return 0
     except Exception as exc:
         print(f"ERROR: SPI error - {exc}")
         return 1
@@ -89,6 +98,17 @@ def main() -> int:
     probe_parser.add_argument("--count", type=int, default=10)
     cmd_parser = subparsers.add_parser("command", help="Send command")
     cmd_parser.add_argument("text", help="Command text (e.g., /ping)")
+    led_parser = subparsers.add_parser("led", help="Send LED diagnostic commands")
+    led_parser.add_argument(
+        "action",
+        choices=["on", "off", "toggle", "auto", "status"],
+        help="LED action to request on the Pico",
+    )
+    led_parser.add_argument(
+        "--fire-and-forget",
+        action="store_true",
+        help="Only verify the command was sent; do not require a valid response frame.",
+    )
     args = parser.parse_args()
     if args.command == "probe":
         failures = 0
@@ -106,6 +126,15 @@ def main() -> int:
             args.speed,
             (args.text + "\n").encode(),
             REQ_COMMAND_MAGIC,
+        )
+    if args.command == "led":
+        return spi_exchange(
+            args.bus,
+            args.device,
+            args.speed,
+            (f"/led {args.action}\n").encode(),
+            REQ_COMMAND_MAGIC,
+            require_valid_response=not args.fire_and_forget,
         )
     return 1
 

@@ -1,4 +1,4 @@
-//! Dedicated SPI slave polling task for framed upstream transfers.
+//! Dedicated SPI slave task for framed upstream transfers.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::config::BridgeConfig;
@@ -8,7 +8,7 @@ use crate::protocol::i2c::{
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
-use embassy_futures::yield_now;
+use embassy_time::{Duration, Timer};
 use embedded_hal::spi::MODE_0;
 use embedded_hal_nb::spi::FullDuplex;
 use heapless::String;
@@ -17,7 +17,6 @@ use rp2040_hal::gpio::{FunctionSpi, Pins};
 use rp2040_hal::pac;
 use rp2040_hal::sio::Sio;
 use rp2040_hal::spi::{Enabled, Spi, SpiDevice, ValidSpiPinout};
-use embassy_time::{Duration, Timer};
 
 const SPI_CHUNK_PAD: u8 = 0x00;
 const SPI_CS_PIN: usize = 13;
@@ -29,6 +28,7 @@ const SPI_DEBUG_FLAG_COMMAND: u8 = 1 << 1;
 const SPI_DEBUG_FLAG_DATA: u8 = 1 << 2;
 const SPI_DEBUG_FLAG_INVALID: u8 = 1 << 3;
 const SPI_DEBUG_FLAG_POLL: u8 = 1 << 4;
+const SPI_DEBUG_FLAG_PARTIAL: u8 = 1 << 5;
 
 static SPI_DEBUG_MAGIC: AtomicU8 = AtomicU8::new(0);
 static SPI_DEBUG_LEN: AtomicU8 = AtomicU8::new(0);
@@ -98,109 +98,87 @@ pub async fn spi_poll_task(
         pins.gpio10.into_function::<FunctionSpi>(),
         pins.gpio13.into_function::<FunctionSpi>(),
     );
-    // In slave mode the RP2040 must match the master's wire format, but it does not own the bus
-    // clock rate. The Pi master provides SCK; only CPOL/CPHA and data size are configured here.
     let mut spi =
         Spi::<_, _, _, 8>::new(pac.SPI1, spi_pins).init_slave(&mut pac.RESETS, SPI_FRAME_FORMAT);
 
-    let mut rx_frame = [0u8; FRAME_SIZE];
-    let mut rx_pos = 0usize;
-    let mut rx_expected = FRAME_SIZE;
-    let mut tx_frame = make_response_frame(RESP_DATA_MAGIC, b"");
-    let mut tx_pos = 0usize;
-    let mut cs_active = false;
+    let mut staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
 
     loop {
         if let Ok(resp) = rx_resp.try_receive() {
-            tx_frame = resp.data;
-            tx_pos = 0;
+            staged_tx = resp.data;
         }
 
+        if !spi_cs_asserted() {
+            Timer::after(SPI_IDLE_BACKOFF).await;
+            continue;
+        }
+
+        let (captured, rx_pos, rx_expected, tx_complete) = service_transaction(&mut spi, &staged_tx);
+
+        if tx_complete {
+            staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
+        }
+
+        let next = finalize_transaction(captured, rx_pos, rx_expected, bridge_config, link_active, tx).await;
+        if let Some(frame) = next {
+            staged_tx = frame;
+        }
+    }
+}
+
+fn service_transaction<S: SpiSlaveBus>(
+    spi: &mut S,
+    tx_frame: &[u8; FRAME_SIZE],
+) -> ([u8; FRAME_SIZE], usize, usize, bool) {
+    let mut rx_frame = [0u8; FRAME_SIZE];
+    let mut rx_pos = 0usize;
+    let mut rx_expected = FRAME_SIZE;
+    let mut tx_pos = 0usize;
+
+    fill_tx_fifo(spi, tx_frame, &mut tx_pos);
+
+    while spi_cs_asserted() {
         let mut did_work = false;
-        let cs_low = spi_cs_asserted();
-
-        if cs_low && !cs_active {
-            cs_active = true;
-            rx_pos = 0;
-            rx_expected = FRAME_SIZE;
-            tx_pos = 0;
-            did_work |= read_rx_fifo(&mut spi, &mut rx_frame, &mut rx_pos, &mut rx_expected);
-            did_work |= fill_tx_fifo(&mut spi, &tx_frame, &mut tx_pos);
-        }
-
-        if cs_low {
-            did_work |= read_rx_fifo(&mut spi, &mut rx_frame, &mut rx_pos, &mut rx_expected);
-            did_work |= fill_tx_fifo(&mut spi, &tx_frame, &mut tx_pos);
-        } else if cs_active {
-            cs_active = false;
-            did_work |= drain_transaction_end(&mut spi, &mut rx_frame, &mut rx_pos, &mut rx_expected);
-
-            if rx_complete(rx_pos, rx_expected) {
-                record_spi_debug_frame(&rx_frame, rx_pos, rx_expected, SPI_DEBUG_FLAG_COMPLETE);
-                process_complete_frame(
-                    rx_frame,
-                    bridge_config,
-                    link_active,
-                    &mut tx_frame,
-                    &mut tx_pos,
-                    tx,
-                )
-                .await;
-                did_work = true;
-            }
-
-            if tx_pos >= FRAME_SIZE {
-                tx_frame = make_response_frame(RESP_DATA_MAGIC, b"");
-                tx_pos = 0;
-            }
-
-            rx_frame = [0u8; FRAME_SIZE];
-            rx_pos = 0;
-            rx_expected = FRAME_SIZE;
-        }
-
+        did_work |= fill_tx_fifo(spi, tx_frame, &mut tx_pos);
+        did_work |= read_rx_fifo(spi, &mut rx_frame, &mut rx_pos, &mut rx_expected);
         if !did_work {
-            if cs_active || spi_cs_asserted() {
-                yield_now().await;
-            } else {
-                Timer::after(SPI_IDLE_BACKOFF).await;
-            }
+            core::hint::spin_loop();
         }
     }
+
+    drain_transaction_end(spi, &mut rx_frame, &mut rx_pos, &mut rx_expected);
+    (rx_frame, rx_pos, rx_expected, tx_pos >= FRAME_SIZE)
 }
 
-async fn process_complete_frame(
+async fn finalize_transaction(
     frame: [u8; FRAME_SIZE],
+    rx_pos: usize,
+    rx_expected: usize,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx_frame: &mut [u8; FRAME_SIZE],
-    tx_pos: &mut usize,
     tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-) {
-    // SPI read polls clock data out by sending zero-filled MOSI bytes.
-    // Do not treat that readback transaction as a new upstream request.
-    if frame[0] == 0 && frame[1] == 0 {
-        SPI_DEBUG_FLAGS.store(SPI_DEBUG_FLAG_COMPLETE | SPI_DEBUG_FLAG_POLL, Ordering::Relaxed);
-        return;
-    }
-
-    if let Some(response) = handle_local_request(frame, bridge_config, link_active) {
-        *tx_frame = response;
-        *tx_pos = 0;
-    } else {
-        tx.send(SpiFrame { data: frame }).await;
-    }
-}
-
-fn handle_local_request(
-    frame: [u8; FRAME_SIZE],
-    bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
 ) -> Option<[u8; FRAME_SIZE]> {
+    if rx_pos == 0 {
+        return None;
+    }
+
+    let is_poll = frame[0] == 0 && frame[1] == 0;
+    if is_poll {
+        record_spi_debug_frame(&frame, rx_pos, rx_expected, SPI_DEBUG_FLAG_POLL);
+        return None;
+    }
+
+    if !rx_complete(rx_pos, rx_expected) {
+        record_spi_debug_frame(&frame, rx_pos, rx_expected, SPI_DEBUG_FLAG_PARTIAL);
+        return Some(make_response_frame(RESP_COMMAND_MAGIC, render_spi_debug().as_bytes()));
+    }
+
+    record_spi_debug_frame(&frame, rx_pos, rx_expected, SPI_DEBUG_FLAG_COMPLETE);
+
     match parse_request_frame(&frame) {
         Some(RequestFrame::Command(payload)) => {
-            let line = trim_ascii_line(payload);
             SPI_DEBUG_FLAGS.store(SPI_DEBUG_FLAG_COMPLETE | SPI_DEBUG_FLAG_COMMAND, Ordering::Relaxed);
+            let line = trim_ascii_line(payload);
             let response = if line == "/spidbg" {
                 render_spi_debug()
             } else {
@@ -210,11 +188,12 @@ fn handle_local_request(
         }
         Some(RequestFrame::Data(_)) => {
             SPI_DEBUG_FLAGS.store(SPI_DEBUG_FLAG_COMPLETE | SPI_DEBUG_FLAG_DATA, Ordering::Relaxed);
+            tx.send(SpiFrame { data: frame }).await;
             None
         }
         None => {
             SPI_DEBUG_FLAGS.store(SPI_DEBUG_FLAG_COMPLETE | SPI_DEBUG_FLAG_INVALID, Ordering::Relaxed);
-            None
+            Some(make_response_frame(RESP_COMMAND_MAGIC, render_spi_debug().as_bytes()))
         }
     }
 }
@@ -231,38 +210,6 @@ fn read_rx_fifo<S: SpiSlaveBus>(
         did_work = true;
     }
     did_work
-}
-
-fn drain_transaction_end<S: SpiSlaveBus>(
-    spi: &mut S,
-    frame: &mut [u8; FRAME_SIZE],
-    pos: &mut usize,
-    expected: &mut usize,
-) -> bool {
-    let mut did_work = read_rx_fifo(spi, frame, pos, expected);
-    for _ in 0..64 {
-        let drained = read_rx_fifo(spi, frame, pos, expected);
-        did_work |= drained;
-        if rx_complete(*pos, *expected) || (!spi.is_busy() && !drained) {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    did_work
-}
-
-fn append_byte(byte: u8, frame: &mut [u8; FRAME_SIZE], pos: &mut usize, expected: &mut usize) {
-    if *pos < FRAME_SIZE {
-        frame[*pos] = byte;
-        *pos += 1;
-        if *pos >= 2 {
-            *expected = (frame[1] as usize + 2).min(FRAME_SIZE);
-        }
-    }
-}
-
-fn rx_complete(rx_pos: usize, rx_expected: usize) -> bool {
-    rx_pos >= 2 && rx_pos >= rx_expected
 }
 
 fn fill_tx_fifo<S: SpiSlaveBus>(spi: &mut S, frame: &[u8; FRAME_SIZE], tx_pos: &mut usize) -> bool {
@@ -284,17 +231,41 @@ fn fill_tx_fifo<S: SpiSlaveBus>(spi: &mut S, frame: &[u8; FRAME_SIZE], tx_pos: &
     did_work
 }
 
+fn drain_transaction_end<S: SpiSlaveBus>(
+    spi: &mut S,
+    frame: &mut [u8; FRAME_SIZE],
+    pos: &mut usize,
+    expected: &mut usize,
+) {
+    for _ in 0..128 {
+        let drained = read_rx_fifo(spi, frame, pos, expected);
+        if rx_complete(*pos, *expected) || (!spi.is_busy() && !drained) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn append_byte(byte: u8, frame: &mut [u8; FRAME_SIZE], pos: &mut usize, expected: &mut usize) {
+    if *pos < FRAME_SIZE {
+        frame[*pos] = byte;
+        *pos += 1;
+        if *pos >= 2 {
+            *expected = (frame[1] as usize + 2).min(FRAME_SIZE);
+        }
+    }
+}
+
+fn rx_complete(rx_pos: usize, rx_expected: usize) -> bool {
+    rx_pos >= 2 && rx_pos >= rx_expected
+}
+
 fn spi_cs_asserted() -> bool {
     let bank0_inputs = rp2040_hal::sio::Sio::read_bank0();
     ((bank0_inputs >> SPI_CS_PIN) & 1) == 0
 }
 
-fn record_spi_debug_frame(
-    frame: &[u8; FRAME_SIZE],
-    pos: usize,
-    expected: usize,
-    flags: u8,
-) {
+fn record_spi_debug_frame(frame: &[u8; FRAME_SIZE], pos: usize, expected: usize, flags: u8) {
     SPI_DEBUG_MAGIC.store(frame[0], Ordering::Relaxed);
     SPI_DEBUG_LEN.store(frame[1], Ordering::Relaxed);
     SPI_DEBUG_POS.store(pos, Ordering::Relaxed);
@@ -316,7 +287,7 @@ fn render_spi_debug() -> String<192> {
     let _ = out.push_str("m=");
     push_hex_u8(&mut out, SPI_DEBUG_MAGIC.load(Ordering::Relaxed));
     let _ = out.push_str(" len=");
-    push_u8_dec(&mut out, SPI_DEBUG_LEN.load(Ordering::Relaxed));
+    push_usize_dec(&mut out, SPI_DEBUG_LEN.load(Ordering::Relaxed) as usize);
     let _ = out.push_str(" pos=");
     push_usize_dec(&mut out, SPI_DEBUG_POS.load(Ordering::Relaxed));
     let _ = out.push_str(" exp=");
@@ -330,6 +301,8 @@ fn render_spi_debug() -> String<192> {
         let _ = out.push_str("data");
     } else if flags & SPI_DEBUG_FLAG_INVALID != 0 {
         let _ = out.push_str("invalid");
+    } else if flags & SPI_DEBUG_FLAG_PARTIAL != 0 {
+        let _ = out.push_str("partial");
     } else if flags & SPI_DEBUG_FLAG_COMPLETE != 0 {
         let _ = out.push_str("complete");
     } else {
@@ -362,10 +335,6 @@ fn push_hex_u8(out: &mut String<192>, value: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let _ = out.push(HEX[(value >> 4) as usize] as char);
     let _ = out.push(HEX[(value & 0x0f) as usize] as char);
-}
-
-fn push_u8_dec(out: &mut String<192>, value: u8) {
-    push_usize_dec(out, value as usize);
 }
 
 fn push_usize_dec(out: &mut String<192>, mut value: usize) {
