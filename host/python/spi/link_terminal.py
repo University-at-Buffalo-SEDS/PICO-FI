@@ -167,6 +167,9 @@ def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_de
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
                 print_payload(prompt, rx_payload)
             return
+        if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+            print_payload(prompt, rx_payload)
+            return
         time.sleep(poll_delay_s)
         for _ in range(COMMAND_POLL_LIMIT):
             rx_magic, rx_payload = parse_frame(bus.read_frame())

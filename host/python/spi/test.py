@@ -86,13 +86,14 @@ def spi_exchange(
         rx = first_rx
         magic_val, length, body = first_magic, first_length, first_body
         if magic == REQ_COMMAND_MAGIC:
-            time.sleep(0.01)
-            for _ in range(COMMAND_POLL_LIMIT):
-                rx = bus.read_frame()
-                magic_val, length, body = parse_frame(rx)
-                if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
-                    break
+            if not (magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body)):
                 time.sleep(0.01)
+                for _ in range(COMMAND_POLL_LIMIT):
+                    rx = bus.read_frame()
+                    magic_val, length, body = parse_frame(rx)
+                    if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
+                        break
+                    time.sleep(0.01)
         elif magic_val == 0:
             rx = bus.read_frame()
             magic_val, length, body = parse_frame(rx)
