@@ -1,20 +1,22 @@
 //! Hardware-SPI slave task for framed upstream transfers.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
-    FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
-    RequestFrame, make_response_frame, parse_request_frame,
+    make_response_frame, parse_request_frame, RequestFrame, FRAME_SIZE, REQ_COMMAND_MAGIC,
+    REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
 use embassy_executor::Spawner;
 use embassy_rp::gpio::Level;
 use embassy_rp::peripherals::{DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIO1};
-use embassy_rp::pio::{Common, Config as PioConfig, Direction as PioDirection, Pio, ShiftDirection, StateMachine};
+use embassy_rp::pio::{
+    Common, Config as PioConfig, Direction as PioDirection, Pio, ShiftDirection, StateMachine,
+};
 use embassy_rp::Peri;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
-use heapless::String;
 use portable_atomic::AtomicBool;
 
 const SPI_IDLE_BACKOFF: Duration = Duration::from_micros(5);
@@ -52,58 +54,56 @@ pub async fn spi_poll_task(
 
     configure_pio_spi_slave(&mut common, &mut sm, _sclk, _miso, _mosi, _cs, &program);
 
-    let echo_mode = matches!(bridge_config.upstream_mode, crate::config::UpstreamMode::SpiEcho);
-    let static_mode = matches!(bridge_config.upstream_mode, crate::config::UpstreamMode::SpiStatic);
-    let mut staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
+    let echo_mode = matches!(
+        bridge_config.upstream_mode,
+        crate::config::UpstreamMode::SpiEcho
+    );
+    let static_mode = matches!(
+        bridge_config.upstream_mode,
+        crate::config::UpstreamMode::SpiStatic
+    );
     let static_frame = make_response_frame(RESP_COMMAND_MAGIC, b"pong");
+    let mut transport = PioSpiTransportState::new();
     let mut transaction_armed = false;
-    let mut armed_tx_pos = 0usize;
 
     loop {
         if static_mode {
-            staged_tx = static_frame;
+            transport.stage_response(static_frame);
             transaction_armed = false;
         } else if !echo_mode {
             if let Ok(resp) = rx_resp.try_receive() {
-                staged_tx = resp.data;
+                transport.stage_response(resp.data);
                 transaction_armed = false;
             }
         }
 
         while !spi_cs_asserted() {
             if static_mode {
-                staged_tx = static_frame;
+                transport.stage_response(static_frame);
                 transaction_armed = false;
             } else if !echo_mode {
                 if let Ok(resp) = rx_resp.try_receive() {
-                    staged_tx = resp.data;
+                    transport.stage_response(resp.data);
                     transaction_armed = false;
                 }
             }
             if !transaction_armed {
-                armed_tx_pos = arm_pio_spi_transaction(&mut sm, &staged_tx);
+                arm_pio_spi_transaction(&mut sm, &mut transport);
                 transaction_armed = true;
             }
             Timer::after(SPI_IDLE_BACKOFF).await;
         }
 
-        let mut rx_frame = [0u8; FRAME_SIZE];
-        let mut rx_words = [0u32; FRAME_SIZE];
-        let mut rx_pos = 0usize;
-        let mut tx_pos = armed_tx_pos;
-
         while spi_cs_asserted() {
-            tx_pos = service_pio_tx_fifo(&mut sm, &staged_tx, tx_pos);
-            service_pio_rx_fifo(&mut sm, &mut rx_frame, &mut rx_words, &mut rx_pos);
+            service_pio_tx_fifo(&mut sm, &mut transport);
+            service_pio_rx_fifo(&mut sm, &mut transport);
             core::hint::spin_loop();
         }
 
         for _ in 0..SPI_TRAILING_DRAIN_SPINS {
             let mut did_work = false;
-            let next_tx_pos = service_pio_tx_fifo(&mut sm, &staged_tx, tx_pos);
-            did_work |= next_tx_pos != tx_pos;
-            tx_pos = next_tx_pos;
-            did_work |= service_pio_rx_fifo(&mut sm, &mut rx_frame, &mut rx_words, &mut rx_pos);
+            did_work |= service_pio_tx_fifo(&mut sm, &mut transport);
+            did_work |= service_pio_rx_fifo(&mut sm, &mut transport);
             if !did_work {
                 break;
             }
@@ -114,23 +114,23 @@ pub async fn spi_poll_task(
         sm.restart();
         transaction_armed = false;
 
-        if tx_pos >= FRAME_SIZE {
-            staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
-        }
-
         if static_mode {
             continue;
         }
 
         if echo_mode {
-            staged_tx = rx_frame;
+            match transport.finish_transaction() {
+                TransactionResult::Complete(frame) => transport.stage_response(frame),
+                TransactionResult::IdlePoll => transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b"")),
+                TransactionResult::Partial { .. } => {
+                    transport.stage_response(make_response_frame(RESP_COMMAND_MAGIC, b"error partial spi frame"))
+                }
+            }
             continue;
         }
 
-        if let Some(next) =
-            finalize_transaction(rx_frame, rx_words, bridge_config, link_active, tx).await
-        {
-            staged_tx = next;
+        if let Some(next) = finalize_transaction(transport.finish_transaction(), bridge_config, link_active, tx).await {
+            transport.stage_response(next);
         }
     }
 }
@@ -186,21 +186,20 @@ fn configure_pio_spi_slave<'d>(
     let mosi_pin = common.make_pio_pin(mosi);
     let cs_pin = common.make_pio_pin(cs);
 
-    let bypass_mask =
-        (1u32 << SPI_SCK_PIN) | (1u32 << SPI_CS_PIN) | (1u32 << (SPI_SCK_PIN + 2));
+    let bypass_mask = (1u32 << SPI_SCK_PIN) | (1u32 << SPI_CS_PIN) | (1u32 << (SPI_SCK_PIN + 2));
     common.set_input_sync_bypass(bypass_mask, bypass_mask);
 
-    let mut cfg = PioConfig::default();
+        let mut cfg = PioConfig::default();
     cfg.use_program(&program.loaded, &[]);
     cfg.set_out_pins(&[&miso_pin]);
     cfg.set_in_pins(&[&mosi_pin]);
     cfg.set_jmp_pin(&cs_pin);
-    cfg.shift_in.auto_fill = false;
+    cfg.shift_in.auto_fill = true;
     cfg.shift_in.direction = ShiftDirection::Left;
-    cfg.shift_in.threshold = 32;
-    cfg.shift_out.auto_fill = false;
+    cfg.shift_in.threshold = 8;
+    cfg.shift_out.auto_fill = true;
     cfg.shift_out.direction = ShiftDirection::Left;
-    cfg.shift_out.threshold = 32;
+    cfg.shift_out.threshold = 8;
     cfg.clock_divider = 1u8.into();
     sm.set_config(&cfg);
     sm.set_pins(Level::Low, &[&miso_pin]);
@@ -211,74 +210,65 @@ fn configure_pio_spi_slave<'d>(
 
 fn arm_pio_spi_transaction(
     sm: &mut StateMachine<'_, PIO1, SPI_PIO_SM>,
-    staged_tx: &[u8; FRAME_SIZE],
-) -> usize {
+    transport: &mut PioSpiTransportState,
+) {
     sm.set_enable(false);
     sm.clear_fifos();
     sm.restart();
-    let tx_pos = preload_pio_tx_fifo(sm, staged_tx, 0);
+    transport.begin_transaction();
+    preload_pio_tx_fifo(sm, transport);
     sm.set_enable(true);
-    tx_pos
 }
 
 fn preload_pio_tx_fifo(
     sm: &mut StateMachine<'_, PIO1, SPI_PIO_SM>,
-    staged_tx: &[u8; FRAME_SIZE],
-    tx_pos: usize,
-) -> usize {
-    service_pio_tx_fifo(sm, staged_tx, tx_pos)
+    transport: &mut PioSpiTransportState,
+) {
+    let _ = service_pio_tx_fifo(sm, transport);
 }
 
 fn service_pio_tx_fifo(
     sm: &mut StateMachine<'_, PIO1, SPI_PIO_SM>,
-    staged_tx: &[u8; FRAME_SIZE],
-    mut tx_pos: usize,
-) -> usize {
-    let tx = sm.tx();
-    while tx_pos < FRAME_SIZE {
-        let word = u32::from_be_bytes([staged_tx[tx_pos], 0, 0, 0]);
-        if !tx.try_push(word) {
-            break;
-        }
-        tx_pos += 1;
-    }
-    tx_pos
-}
-
-fn service_pio_rx_fifo(
-    sm: &mut StateMachine<'_, PIO1, SPI_PIO_SM>,
-    rx_frame: &mut [u8; FRAME_SIZE],
-    rx_words: &mut [u32; FRAME_SIZE],
-    rx_pos: &mut usize,
+    transport: &mut PioSpiTransportState,
 ) -> bool {
     let mut did_work = false;
-    let rx = sm.rx();
-    while let Some(word) = rx.try_pull() {
-        let byte = decode_spi_rx_byte(word);
-        if *rx_pos < FRAME_SIZE {
-            rx_frame[*rx_pos] = byte;
-            rx_words[*rx_pos] = word;
-            *rx_pos += 1;
+    let tx = sm.tx();
+    while !tx.full() {
+        let word = u32::from_be_bytes([transport.next_tx_byte(), 0, 0, 0]);
+        if !tx.try_push(word) {
+            break;
         }
         did_work = true;
     }
     did_work
 }
 
+fn service_pio_rx_fifo(
+    sm: &mut StateMachine<'_, PIO1, SPI_PIO_SM>,
+    transport: &mut PioSpiTransportState,
+) -> bool {
+    let mut did_work = false;
+    let rx = sm.rx();
+    while let Some(word) = rx.try_pull() {
+        transport.capture_rx_byte(word as u8);
+        did_work = true;
+    }
+    did_work
+}
+
 async fn finalize_transaction(
-    frame: [u8; FRAME_SIZE],
-    rx_words: [u32; FRAME_SIZE],
+    result: TransactionResult,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
     tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
 ) -> Option<[u8; FRAME_SIZE]> {
-    let frame = select_spi_frame_candidate(&frame, &rx_words);
-
-    if frame[0] == 0 && frame[1] == 0 {
-        if frame.iter().all(|&byte| byte == 0) {
-            return Some(make_response_frame(RESP_DATA_MAGIC, b""));
+    let frame = match result {
+        TransactionResult::IdlePoll => return Some(make_response_frame(RESP_DATA_MAGIC, b"")),
+        TransactionResult::Partial { .. } => {
+            return Some(make_response_frame(RESP_COMMAND_MAGIC, b"error partial spi frame"));
         }
-    }
+        TransactionResult::Complete(frame) => frame,
+    };
 
     if let Some(payload) = extract_local_command_payload(&frame) {
         let line = trim_ascii_line(payload);
@@ -287,17 +277,14 @@ async fn finalize_transaction(
     }
 
     match parse_request_frame(&frame) {
-        Some(RequestFrame::Command(_payload)) => unreachable!("handled by extract_local_command_payload"),
+        Some(RequestFrame::Command(_payload)) => {
+            unreachable!("handled by extract_local_command_payload")
+        }
         Some(RequestFrame::Data(_)) => {
             tx.send(SpiFrame { data: frame }).await;
             None
         }
-        None => {
-            Some(make_response_frame(
-                RESP_COMMAND_MAGIC,
-                render_spi_capture(&frame, &rx_words).as_bytes(),
-            ))
-        }
+        None => Some(make_response_frame(RESP_COMMAND_MAGIC, b"error invalid spi frame")),
     }
 }
 
@@ -324,56 +311,6 @@ fn is_plausible_local_command(payload: &[u8]) -> bool {
         && payload
             .iter()
             .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
-}
-
-fn decode_spi_rx_byte(word: u32) -> u8 {
-    let bytes = word.to_be_bytes();
-    if bytes[0] != 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0 {
-        return bytes[0];
-    }
-    if bytes[3] != 0 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 {
-        return bytes[3];
-    }
-    for &byte in &bytes {
-        if byte != 0 {
-            return byte;
-        }
-    }
-    0
-}
-
-fn select_spi_frame_candidate(
-    default_frame: &[u8; FRAME_SIZE],
-    rx_words: &[u32; FRAME_SIZE],
-) -> [u8; FRAME_SIZE] {
-    let mut best = *default_frame;
-    if parse_request_frame(&best).is_some() || recover_spi_command_payload(&best).is_some() {
-        return best;
-    }
-
-    let shifts = [24u32, 16, 8, 0];
-    for shift in shifts {
-        let mut candidate = [0u8; FRAME_SIZE];
-        for (index, word) in rx_words.iter().enumerate() {
-            candidate[index] = ((word >> shift) & 0xff) as u8;
-        }
-        if parse_request_frame(&candidate).is_some()
-            || recover_spi_command_payload(&candidate).is_some()
-        {
-            return candidate;
-        }
-
-        // Prefer candidates with a plausible magic/len header over all-zero defaults.
-        if best[0] == 0
-            && best[1] == 0
-            && matches!(candidate[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC)
-            && (candidate[1] as usize) <= FRAME_SIZE - 2
-        {
-            best = candidate;
-        }
-    }
-
-    best
 }
 
 fn recover_spi_command_payload(frame: &[u8; FRAME_SIZE]) -> Option<&[u8]> {
@@ -405,60 +342,6 @@ fn recover_spi_command_payload(frame: &[u8; FRAME_SIZE]) -> Option<&[u8]> {
     if plausible { Some(payload) } else { None }
 }
 
-fn render_spi_capture(frame: &[u8; FRAME_SIZE], rx_words: &[u32; FRAME_SIZE]) -> String<192> {
-    let mut out = String::<192>::new();
-    let nonzero = frame.iter().filter(|&&b| b != 0).count();
-    let _ = out.push_str("spi rx nz=");
-    push_usize(&mut out, nonzero);
-    let _ = out.push_str(" b=");
-    for (index, byte) in frame.iter().take(8).enumerate() {
-        if index != 0 {
-            let _ = out.push('-');
-        }
-        push_hex(&mut out, *byte);
-    }
-    let _ = out.push_str(" w=");
-    for (index, word) in rx_words.iter().take(4).enumerate() {
-        if index != 0 {
-            let _ = out.push('-');
-        }
-        push_hex32(&mut out, *word);
-    }
-    out
-}
-
-fn push_hex(out: &mut String<192>, value: u8) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let _ = out.push(HEX[(value >> 4) as usize] as char);
-    let _ = out.push(HEX[(value & 0x0f) as usize] as char);
-}
-
-fn push_hex32(out: &mut String<192>, value: u32) {
-    push_hex(out, ((value >> 24) & 0xff) as u8);
-    push_hex(out, ((value >> 16) & 0xff) as u8);
-    push_hex(out, ((value >> 8) & 0xff) as u8);
-    push_hex(out, (value & 0xff) as u8);
-}
-
-fn push_usize(out: &mut String<192>, mut value: usize) {
-    if value == 0 {
-        let _ = out.push('0');
-        return;
-    }
-
-    let mut digits = [0u8; 20];
-    let mut len = 0usize;
-    while value > 0 {
-        digits[len] = (value % 10) as u8;
-        len += 1;
-        value /= 10;
-    }
-
-    while len > 0 {
-        len -= 1;
-        let _ = out.push((b'0' + digits[len]) as char);
-    }
-}
 
 fn spi_cs_asserted() -> bool {
     let bank0_inputs = rp_pac::SIO.gpio_in(0).read();

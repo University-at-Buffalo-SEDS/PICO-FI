@@ -127,6 +127,31 @@ class PromptState:
             return None
 
 
+@dataclass
+class StreamPrinter:
+    prompt: PromptState
+    pending: str = ""
+
+    def feed(self, payload: bytes) -> None:
+        text = payload.decode("utf-8", errors="replace").replace("\r", "")
+        if not text:
+            return
+        self.pending += text
+        while True:
+            newline = self.pending.find("\n")
+            if newline < 0:
+                break
+            line = self.pending[:newline]
+            self.pending = self.pending[newline + 1 :]
+            if line:
+                self.prompt.print_line(line)
+
+    def flush_partial(self) -> None:
+        if self.pending:
+            self.prompt.print_line(self.pending)
+            self.pending = ""
+
+
 def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -138,18 +163,19 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
             if not ready:
                 continue
             ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                ready, _, _ = select.select([fd], [], [], 0.01)
+                if ready:
+                    sys.stdin.read(1)
+                    ready, _, _ = select.select([fd], [], [], 0.01)
+                    if ready:
+                        sys.stdin.read(1)
+                continue
             line = prompt.handle_key(ch)
             if line is not None:
                 outbound.put(line)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def print_payload(prompt: PromptState, payload: bytes) -> None:
-    text = payload.decode("utf-8", errors="replace").replace("\r", "")
-    for line in text.split("\n"):
-        if line:
-            prompt.print_line(line)
 
 
 def is_plausible_command_payload(payload: bytes) -> bool:
@@ -167,7 +193,14 @@ def flush_stale_command_frames(bus) -> None:
             return
 
 
-def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_delay_s: float) -> None:
+def exchange_frame(
+    bus,
+    prompt: PromptState,
+    stream_printer: StreamPrinter,
+    magic: int,
+    payload: bytes,
+    poll_delay_s: float,
+) -> None:
     try:
         if magic != REQ_COMMAND_MAGIC:
             first_rx = bus.write_frame(build_frame(payload, magic))
@@ -175,7 +208,7 @@ def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_de
             if rx_magic == 0:
                 rx_magic, rx_payload = parse_frame(bus.read_frame())
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
-                print_payload(prompt, rx_payload)
+                stream_printer.feed(rx_payload)
             return
 
         for _ in range(COMMAND_RETRY_LIMIT):
@@ -183,13 +216,15 @@ def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_de
             first_rx = bus.write_frame(build_frame(payload, magic))
             rx_magic, rx_payload = parse_frame(first_rx)
             if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-                print_payload(prompt, rx_payload)
+                stream_printer.feed(rx_payload)
+                stream_printer.flush_partial()
                 return
             time.sleep(poll_delay_s)
             for _ in range(COMMAND_POLL_LIMIT):
                 rx_magic, rx_payload = parse_frame(bus.read_frame())
                 if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-                    print_payload(prompt, rx_payload)
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
                     return
                 time.sleep(poll_delay_s)
         prompt.print_line("[pico] command timed out waiting for SPI reply")
@@ -213,6 +248,7 @@ def main() -> int:
         return 1
     sender = args.sender or default_sender_label()
     prompt = PromptState(sender=sender)
+    stream_printer = StreamPrinter(prompt=prompt)
     outbound: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=input_loop, args=(outbound, prompt), daemon=True).start()
     print(
@@ -247,12 +283,12 @@ def main() -> int:
             poll_delay_s = args.poll_ms / 1000.0
             if pending:
                 magic, payload = pending.popleft()
-                exchange_frame(bus, prompt, magic, payload, poll_delay_s)
+                exchange_frame(bus, prompt, stream_printer, magic, payload, poll_delay_s)
             else:
                 try:
                     rx_magic, payload = parse_frame(bus.read_frame())
                     if rx_magic == RESP_DATA_MAGIC and payload:
-                        print_payload(prompt, payload)
+                        stream_printer.feed(payload)
                 except Exception:
                     pass
                 time.sleep(poll_delay_s)
