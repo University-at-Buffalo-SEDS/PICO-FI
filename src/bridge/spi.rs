@@ -185,6 +185,13 @@ async fn handle_spi_request(
 ) -> Result<(), ()> {
     match parse_request_frame(&frame.data) {
         Some(RequestFrame::Data(payload)) => {
+            if looks_like_local_command(payload) {
+                let line = trim_ascii_line(payload);
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
+                spi_tx.send(SpiFrame { data: frame }).await;
+                return Ok(());
+            }
             if let Some(socket) = socket {
                 if !payload.is_empty() {
                     write_socket(socket, payload).await?;
@@ -210,4 +217,11 @@ async fn handle_spi_request(
             Ok(())
         }
     }
+}
+
+fn looks_like_local_command(payload: &[u8]) -> bool {
+    payload.first() == Some(&b'/')
+        && payload
+            .iter()
+            .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
 }

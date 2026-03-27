@@ -21,6 +21,7 @@ RESP_COMMAND_MAGIC = 0x5B
 STALE_POLL_LIMIT = 4
 COMMAND_POLL_LIMIT = 50
 COMMAND_RETRY_LIMIT = 4
+PROBE_PAUSE_S = 0.02
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -196,7 +197,7 @@ def main() -> int:
             print(f"\n--- Probe {i + 1} ---")
             if spi_exchange(args.bus, args.device, args.speed, b"", verbose_raw=args.verbose_raw) != 0:
                 failures += 1
-            time.sleep(0.2)
+            time.sleep(PROBE_PAUSE_S)
         print(f"\nProbe: {args.count - failures}/{args.count} successful")
         return 0 if failures == 0 else 1
     if args.command == "command":

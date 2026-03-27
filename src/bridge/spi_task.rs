@@ -280,34 +280,50 @@ async fn finalize_transaction(
         }
     }
 
+    if let Some(payload) = extract_local_command_payload(&frame) {
+        let line = trim_ascii_line(payload);
+        let response = render_local_bridge_command(bridge_config, link_active, line);
+        return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+    }
+
     match parse_request_frame(&frame) {
-        Some(RequestFrame::Command(payload)) => {
-            let line = trim_ascii_line(payload);
-            let response = render_local_bridge_command(bridge_config, link_active, line);
-            Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
-        }
+        Some(RequestFrame::Command(_payload)) => unreachable!("handled by extract_local_command_payload"),
         Some(RequestFrame::Data(_)) => {
-            if let Some(payload) = recover_spi_command_payload(&frame) {
-                let line = trim_ascii_line(payload);
-                let response = render_local_bridge_command(bridge_config, link_active, line);
-                return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
-            }
             tx.send(SpiFrame { data: frame }).await;
             None
         }
         None => {
-            if let Some(payload) = recover_spi_command_payload(&frame) {
-                let line = trim_ascii_line(payload);
-                let response = render_local_bridge_command(bridge_config, link_active, line);
-                Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
-            } else {
-                Some(make_response_frame(
-                    RESP_COMMAND_MAGIC,
-                    render_spi_capture(&frame, &rx_words).as_bytes(),
-                ))
-            }
+            Some(make_response_frame(
+                RESP_COMMAND_MAGIC,
+                render_spi_capture(&frame, &rx_words).as_bytes(),
+            ))
         }
     }
+}
+
+fn extract_local_command_payload(frame: &[u8; FRAME_SIZE]) -> Option<&[u8]> {
+    match parse_request_frame(frame) {
+        Some(RequestFrame::Command(payload)) => {
+            if is_plausible_local_command(payload) {
+                return Some(payload);
+            }
+        }
+        Some(RequestFrame::Data(payload)) => {
+            if is_plausible_local_command(payload) {
+                return Some(payload);
+            }
+        }
+        None => {}
+    }
+
+    recover_spi_command_payload(frame).filter(|payload| is_plausible_local_command(payload))
+}
+
+fn is_plausible_local_command(payload: &[u8]) -> bool {
+    payload.first() == Some(&b'/')
+        && payload
+            .iter()
+            .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
 }
 
 fn decode_spi_rx_byte(word: u32) -> u8 {
