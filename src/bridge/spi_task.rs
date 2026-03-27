@@ -265,14 +265,7 @@ async fn finalize_transaction(
     tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
 ) -> Option<[u8; FRAME_SIZE]> {
     if frame[0] == 0 && frame[1] == 0 {
-        let nonzero = frame.iter().filter(|&&b| b != 0).count();
-        if nonzero == 0 {
-            return Some(make_response_frame(
-                RESP_COMMAND_MAGIC,
-                render_spi_capture(&frame, &rx_words).as_bytes(),
-            ));
-        }
-        return None;
+        return Some(make_response_frame(RESP_DATA_MAGIC, b""));
     }
 
     match parse_request_frame(&frame) {

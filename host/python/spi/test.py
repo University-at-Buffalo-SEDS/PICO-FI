@@ -19,6 +19,7 @@ REQ_COMMAND_MAGIC = 0xA6
 RESP_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
 STALE_POLL_LIMIT = 4
+COMMAND_POLL_LIMIT = 50
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -42,6 +43,12 @@ def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
 
 def format_bytes(data: bytes) -> str:
     return " ".join(f"{b:02x}" for b in data[:16])
+
+
+def is_plausible_command_payload(payload: bytes) -> bool:
+    if not payload:
+        return True
+    return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
 
 
 def flush_stale_command_frames(bus) -> None:
@@ -79,10 +86,11 @@ def spi_exchange(
         rx = first_rx
         magic_val, length, body = first_magic, first_length, first_body
         if magic == REQ_COMMAND_MAGIC:
-            for _ in range(50):
+            time.sleep(0.01)
+            for _ in range(COMMAND_POLL_LIMIT):
                 rx = bus.read_frame()
                 magic_val, length, body = parse_frame(rx)
-                if magic_val == RESP_COMMAND_MAGIC:
+                if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
                     break
                 time.sleep(0.01)
         elif magic_val == 0:
