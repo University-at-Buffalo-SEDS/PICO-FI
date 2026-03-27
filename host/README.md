@@ -47,7 +47,7 @@ Notes:
 
 SPI notes:
 - The SPI backend uses `SPI_IOC_MESSAGE` on `/dev/spidev*`.
-- The Pico SPI slave path uses `SPI1` on `GPIO10`=`SCK`, `GPIO11`=`MISO`, `GPIO12`=`MOSI`, `GPIO13`=`CSn`.
+- The Pico SPI slave path uses `SPI1` on `GPIO10`=`SCK`, `GPIO11`=`MOSI`, `GPIO12`=`MISO`, `GPIO13`=`CSn`.
 - SPI reads are implemented as full-duplex transfers with zero-filled MOSI bytes while clocking data out of the Pico.
 
 Example Python entrypoints:

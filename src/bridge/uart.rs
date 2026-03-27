@@ -26,6 +26,8 @@ pub async fn run_client(
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     Timer::after_millis(runtime.startup_delay_ms).await;
+    let mut uart_buf = [0u8; 256];
+    let mut line_buf = String::<256>::new();
 
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -34,12 +36,30 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
-            .await
-            .is_err()
+        match select(
+            uart.read(&mut uart_buf),
+            connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
+        )
+        .await
         {
-            Timer::after_millis(runtime.reconnect_delay_ms).await;
-            continue;
+            Either::First(Ok(uart_n)) => {
+                handle_uart_input(
+                    uart,
+                    &uart_buf[..uart_n],
+                    bridge_config,
+                    runtime.link_active,
+                    &mut line_buf,
+                    None,
+                )
+                .await?;
+                continue;
+            }
+            Either::First(Err(_)) => return Err(()),
+            Either::Second(Err(_)) => {
+                Timer::after_millis(runtime.reconnect_delay_ms).await;
+                continue;
+            }
+            Either::Second(Ok(())) => {}
         }
         if exchange_link_handshake(
             &mut socket,
@@ -73,13 +93,31 @@ pub async fn run_server(
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
 ) -> Result<(), ()> {
+    let mut uart_buf = [0u8; 256];
+    let mut line_buf = String::<256>::new();
     loop {
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        socket.accept(port).await.map_err(|_| ())?;
+        match select(uart.read(&mut uart_buf), socket.accept(port)).await {
+            Either::First(Ok(uart_n)) => {
+                handle_uart_input(
+                    uart,
+                    &uart_buf[..uart_n],
+                    bridge_config,
+                    runtime.link_active,
+                    &mut line_buf,
+                    None,
+                )
+                .await?;
+                continue;
+            }
+            Either::First(Err(_)) => return Err(()),
+            Either::Second(Err(_)) => return Err(()),
+            Either::Second(Ok(())) => {}
+        }
         if exchange_link_handshake(
             &mut socket,
             false,
@@ -121,26 +159,15 @@ async fn session(
                     yield_now().await;
                     continue;
                 }
-                for &byte in &uart_buf[..uart_n] {
-                    match byte {
-                        b'\r' => {}
-                        b'\n' => {
-                            if handle_local_command(uart, bridge_config, link_active, line_buf.as_str())
-                                .await?
-                            {
-                                line_buf.clear();
-                                continue;
-                            }
-                            write_socket(socket, line_buf.as_bytes()).await?;
-                            write_socket(socket, b"\n").await?;
-                            line_buf.clear();
-                        }
-                        byte if byte.is_ascii() => {
-                            let _ = line_buf.push(byte as char);
-                        }
-                        _ => {}
-                    }
-                }
+                handle_uart_input(
+                    uart,
+                    &uart_buf[..uart_n],
+                    bridge_config,
+                    link_active,
+                    &mut line_buf,
+                    Some(socket),
+                )
+                .await?;
             }
             Either::First(Err(_)) => return Err(()),
             Either::Second(Ok(net_n)) => {
@@ -169,4 +196,35 @@ async fn handle_local_command(
     let response = render_local_bridge_command(bridge_config, link_active, line);
     crate::shell::writeln_line(uart, response.as_str()).await?;
     Ok(true)
+}
+
+async fn handle_uart_input(
+    uart: &mut BufferedUart,
+    bytes: &[u8],
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    line_buf: &mut String<256>,
+    mut socket: Option<&mut TcpSocket<'_>>,
+) -> Result<(), ()> {
+    for &byte in bytes {
+        match byte {
+            b'\r' => {}
+            b'\n' => {
+                if handle_local_command(uart, bridge_config, link_active, line_buf.as_str()).await? {
+                    line_buf.clear();
+                    continue;
+                }
+                if let Some(socket) = socket.as_deref_mut() {
+                    write_socket(socket, line_buf.as_bytes()).await?;
+                    write_socket(socket, b"\n").await?;
+                }
+                line_buf.clear();
+            }
+            byte if byte.is_ascii() => {
+                let _ = line_buf.push(byte as char);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
