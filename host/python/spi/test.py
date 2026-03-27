@@ -65,16 +65,16 @@ def spi_exchange(
 
         rx = first_rx
         magic_val, length, body = first_magic, first_length, first_body
-        if magic_val == 0:
-            rx = bus.read_frame()
-            magic_val, length, body = parse_frame(rx)
-        if magic == REQ_COMMAND_MAGIC and magic_val != RESP_COMMAND_MAGIC:
+        if magic == REQ_COMMAND_MAGIC:
             for _ in range(50):
-                time.sleep(0.01)
                 rx = bus.read_frame()
                 magic_val, length, body = parse_frame(rx)
                 if magic_val == RESP_COMMAND_MAGIC:
                     break
+                time.sleep(0.01)
+        elif magic_val == 0:
+            rx = bus.read_frame()
+            magic_val, length, body = parse_frame(rx)
         print(f"Recv: {format_bytes(rx)}...")
         print(f"Magic: 0x{magic_val:02x}, Length: {length}")
         if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) and body:
@@ -127,7 +127,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="SPI test tool for Pico-Fi")
     parser.add_argument("--bus", type=int, default=0, help="SPI bus number")
     parser.add_argument("--device", type=int, default=0, help="SPI device number")
-    parser.add_argument("--speed", type=int, default=1_000_000, help="SPI speed in Hz")
+    parser.add_argument("--speed", type=int, default=100_000, help="SPI speed in Hz")
     parser.add_argument(
         "--verbose-raw",
         action="store_true",

@@ -154,21 +154,18 @@ def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_de
     try:
         first_rx = bus.write_frame(build_frame(payload, magic))
         rx_magic, rx_payload = parse_frame(first_rx)
-        if rx_magic == 0:
-            rx_magic, rx_payload = parse_frame(bus.read_frame())
         if magic != REQ_COMMAND_MAGIC:
+            if rx_magic == 0:
+                rx_magic, rx_payload = parse_frame(bus.read_frame())
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
                 print_payload(prompt, rx_payload)
             return
-        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
-            print_payload(prompt, rx_payload)
-            return
         for _ in range(50):
-            time.sleep(poll_delay_s)
             rx_magic, rx_payload = parse_frame(bus.read_frame())
             if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
                 print_payload(prompt, rx_payload)
                 return
+            time.sleep(poll_delay_s)
         prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")
@@ -178,7 +175,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Interactive SPI terminal for Pico-Fi")
     parser.add_argument("--bus", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--speed", type=int, default=1_000_000)
+    parser.add_argument("--speed", type=int, default=100_000)
     parser.add_argument("--poll-ms", type=int, default=50)
     parser.add_argument("--sender", default="")
     args = parser.parse_args()
