@@ -18,6 +18,7 @@ REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
+STALE_POLL_LIMIT = 4
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -43,6 +44,16 @@ def format_bytes(data: bytes) -> str:
     return " ".join(f"{b:02x}" for b in data[:16])
 
 
+def flush_stale_command_frames(bus) -> None:
+    for _ in range(STALE_POLL_LIMIT):
+        frame = bus.read_frame()
+        magic_val, length, body = parse_frame(frame)
+        if magic_val == RESP_MAGIC and length == 0:
+            return
+        if magic_val == 0:
+            return
+
+
 def spi_exchange(
     bus_num: int,
     device: int,
@@ -55,6 +66,8 @@ def spi_exchange(
     bus = None
     try:
         bus = open_bus(bus_num, device, speed)
+        if magic == REQ_COMMAND_MAGIC:
+            flush_stale_command_frames(bus)
         tx = build_frame(payload, magic)
         print(f"Sending to SPI bus {bus_num}.{device} @ {speed} Hz...")
         print(f"Sent: {format_bytes(tx)}...")
