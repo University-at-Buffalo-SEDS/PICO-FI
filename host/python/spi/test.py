@@ -50,6 +50,7 @@ def spi_exchange(
     payload: bytes,
     magic: int = REQ_MAGIC,
     require_valid_response: bool = True,
+    verbose_raw: bool = False,
 ) -> int:
     bus = None
     try:
@@ -59,7 +60,8 @@ def spi_exchange(
         print(f"Sent: {format_bytes(tx)}...")
         first_rx = bus.write_frame(tx)
         first_magic, first_length, first_body = parse_frame(first_rx)
-        print(f"Write recv: {format_bytes(first_rx)}...")
+        if verbose_raw:
+            print(f"Write recv: {format_bytes(first_rx)}...")
 
         rx = first_rx
         magic_val, length, body = first_magic, first_length, first_body
@@ -126,6 +128,11 @@ def main() -> int:
     parser.add_argument("--bus", type=int, default=0, help="SPI bus number")
     parser.add_argument("--device", type=int, default=0, help="SPI device number")
     parser.add_argument("--speed", type=int, default=1_000_000, help="SPI speed in Hz")
+    parser.add_argument(
+        "--verbose-raw",
+        action="store_true",
+        help="Print raw write-phase readback as well as the resolved response frame.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     probe_parser = subparsers.add_parser("probe", help="Probe with empty frames")
     probe_parser.add_argument("--count", type=int, default=10)
@@ -154,7 +161,7 @@ def main() -> int:
         failures = 0
         for i in range(args.count):
             print(f"\n--- Probe {i + 1} ---")
-            if spi_exchange(args.bus, args.device, args.speed, b"") != 0:
+            if spi_exchange(args.bus, args.device, args.speed, b"", verbose_raw=args.verbose_raw) != 0:
                 failures += 1
             time.sleep(0.2)
         print(f"\nProbe: {args.count - failures}/{args.count} successful")
@@ -166,6 +173,7 @@ def main() -> int:
             args.speed,
             (args.text + "\n").encode(),
             REQ_COMMAND_MAGIC,
+            verbose_raw=args.verbose_raw,
         )
     if args.command == "echo":
         return spi_echo_test(
@@ -182,6 +190,7 @@ def main() -> int:
             (f"/led {args.action}\n").encode(),
             REQ_COMMAND_MAGIC,
             require_valid_response=not args.fire_and_forget,
+            verbose_raw=args.verbose_raw,
         )
     return 1
 

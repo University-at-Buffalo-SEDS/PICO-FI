@@ -189,7 +189,9 @@ async fn handle_spi_request(
                 if !payload.is_empty() {
                     write_socket(socket, payload).await?;
                 }
-            } else if !payload.is_empty() {
+                let response = make_response_frame(RESP_DATA_MAGIC, b"");
+                spi_tx.send(SpiFrame { data: response }).await;
+            } else {
                 let response = make_response_frame(RESP_DATA_MAGIC, b"");
                 spi_tx.send(SpiFrame { data: response }).await;
             }
