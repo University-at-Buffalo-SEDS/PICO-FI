@@ -11,6 +11,7 @@ mod shell;
 mod storage;
 
 use bridge::i2c_task::{i2c_poll_task, I2cFrame};
+use bridge::overwrite_queue::OverwriteQueue;
 use bridge::spi_task::{spi_poll_task, SpiFrame};
 use bridge::runtime::BridgeRuntime;
 use bridge::commands::{set_led_state, take_led_activity, take_led_command};
@@ -24,8 +25,6 @@ use embassy_rp::interrupt::InterruptExt as _;
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, UART0, USB};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb;
-use embassy_sync::channel::Channel;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::Timer;
 use embassy_usb::Builder as UsbBuilder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver as UsbReceiver, Sender as UsbSender, State as UsbCdcState};
@@ -61,12 +60,10 @@ static USB_CDC_STATE: StaticCell<UsbCdcState<'static>> = StaticCell::new();
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 /// Channel for I2C frames from polling task to bridge session.
-static I2C_FRAME_CHANNEL: Channel<CriticalSectionRawMutex, I2cFrame, 4> = Channel::new();
-
-/// Channel for response frames from bridge session back to the I2C polling task.
-static I2C_RESPONSE_CHANNEL: Channel<CriticalSectionRawMutex, I2cFrame, 4> = Channel::new();
-static SPI_FRAME_CHANNEL: Channel<CriticalSectionRawMutex, SpiFrame, 4> = Channel::new();
-static SPI_RESPONSE_CHANNEL: Channel<CriticalSectionRawMutex, SpiFrame, 4> = Channel::new();
+static I2C_FRAME_QUEUE: OverwriteQueue<I2cFrame, 8> = OverwriteQueue::new();
+static I2C_RESPONSE_QUEUE: OverwriteQueue<I2cFrame, 8> = OverwriteQueue::new();
+static SPI_FRAME_QUEUE: OverwriteQueue<SpiFrame, 8> = OverwriteQueue::new();
+static SPI_RESPONSE_QUEUE: OverwriteQueue<SpiFrame, 8> = OverwriteQueue::new();
 
 /// Shared link-state flag consumed by status reporting and heartbeat LED behavior.
 static LINK_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -247,8 +244,8 @@ async fn app(spawner: Spawner) {
         let mut i2c_config = I2cSlaveConfig::default();
         i2c_config.addr = 0x55;
         i2c_config.general_call = false;
-        i2c_config.sda_pullup = false;
-        i2c_config.scl_pullup = false;
+        i2c_config.sda_pullup = true;
+        i2c_config.scl_pullup = true;
         let i2c = I2cSlave::new(
             p.I2C0,
             unsafe { embassy_rp::peripherals::PIN_1::steal() },
@@ -258,13 +255,13 @@ async fn app(spawner: Spawner) {
         );
         // Spawn dedicated I2C polling task.
         spawner.spawn(
-            i2c_controller_task(
-                i2c,
-                bridge_config,
-                &LINK_ACTIVE,
-                I2C_FRAME_CHANNEL.sender(),
-                I2C_RESPONSE_CHANNEL.receiver(),
-            )
+                i2c_controller_task(
+                    i2c,
+                    bridge_config,
+                    &LINK_ACTIVE,
+                    &I2C_FRAME_QUEUE,
+                    &I2C_RESPONSE_QUEUE,
+                )
                 .expect("i2c controller task token allocation failed"),
         );
         Some(())
@@ -287,8 +284,8 @@ async fn app(spawner: Spawner) {
                 spawner,
                 bridge_config,
                 &LINK_ACTIVE,
-                SPI_FRAME_CHANNEL.sender(),
-                SPI_RESPONSE_CHANNEL.receiver(),
+                &SPI_FRAME_QUEUE,
+                &SPI_RESPONSE_QUEUE,
             )
             .expect("spi controller task token allocation failed"),
         );
@@ -365,10 +362,10 @@ async fn app(spawner: Spawner) {
         upstream_usb_sender.as_mut(),
         upstream_usb_receiver.as_mut(),
         status_led.as_mut(),
-        I2C_FRAME_CHANNEL.receiver(),
-        I2C_RESPONSE_CHANNEL.sender(),
-        SPI_FRAME_CHANNEL.receiver(),
-        SPI_RESPONSE_CHANNEL.sender(),
+        &I2C_FRAME_QUEUE,
+        &I2C_RESPONSE_QUEUE,
+        &SPI_FRAME_QUEUE,
+        &SPI_RESPONSE_QUEUE,
     )
     .await;
 
@@ -390,10 +387,10 @@ async fn run_bridge_mode(
     usb_sender: Option<&mut UsbCdcSender>,
     usb_receiver: Option<&mut UsbCdcReceiver>,
     status_led: Option<&mut Output<'static>>,
-    i2c_rx: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    i2c_tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    spi_rx: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    spi_tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    i2c_rx: &'static OverwriteQueue<I2cFrame, 8>,
+    i2c_tx: &'static OverwriteQueue<I2cFrame, 8>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Result<(), ()> {
     let runtime = BridgeRuntime {
         link_active: &LINK_ACTIVE,
@@ -512,8 +509,8 @@ async fn i2c_controller_task(
     mut i2c: I2cSlave<'static, I2C0>,
     bridge_config: BridgeConfig,
     link_active: &'static AtomicBool,
-    tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    tx: &'static OverwriteQueue<I2cFrame, 8>,
+    rx_resp: &'static OverwriteQueue<I2cFrame, 8>,
 ) {
     i2c_poll_task(&mut i2c, bridge_config, link_active, tx, rx_resp).await
 }
@@ -530,8 +527,8 @@ async fn spi_controller_task(
     spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &'static AtomicBool,
-    tx: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    rx_resp: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    tx: &'static OverwriteQueue<SpiFrame, 8>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
 ) {
     spi_poll_task(
         pio1,

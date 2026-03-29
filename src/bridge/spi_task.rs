@@ -1,6 +1,7 @@
 //! Hardware-SPI slave task for framed upstream transfers.
 
 use crate::bridge::commands::{render_local_bridge_command, signal_led_activity, trim_ascii_line};
+use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
@@ -15,8 +16,6 @@ use embassy_rp::pio::{
     StateMachine,
 };
 use embassy_rp::Peri;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
 use portable_atomic::AtomicBool;
 
@@ -46,8 +45,8 @@ pub async fn spi_poll_task(
     _spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    rx_resp: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    tx: &'static OverwriteQueue<SpiFrame, 8>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> ! {
     let _tx_dma = _tx_dma;
     let _rx_dma = _rx_dma;
@@ -86,7 +85,7 @@ pub async fn spi_poll_task(
             transport.stage_response(static_frame);
             transaction_armed = false;
         } else if !echo_mode {
-            if let Ok(resp) = rx_resp.try_receive() {
+            if let Some(resp) = rx_resp.try_pop() {
                 transport.stage_response(resp.data);
                 transaction_armed = false;
             }
@@ -97,7 +96,7 @@ pub async fn spi_poll_task(
                 transport.stage_response(static_frame);
                 transaction_armed = false;
             } else if !echo_mode {
-                if let Ok(resp) = rx_resp.try_receive() {
+                if let Some(resp) = rx_resp.try_pop() {
                     transport.stage_response(resp.data);
                     transaction_armed = false;
                 }
@@ -303,7 +302,7 @@ async fn finalize_transaction(
     result: TransactionResult,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Option<[u8; FRAME_SIZE]> {
     let frame = match result {
         TransactionResult::IdlePoll {
@@ -340,7 +339,7 @@ async fn finalize_transaction(
             unreachable!("handled by extract_local_command_payload")
         }
         Some(RequestFrame::Data(_)) => {
-            tx.send(SpiFrame { data: frame }).await;
+            tx.push_overwrite(SpiFrame { data: frame });
             None
         }
         None => Some(make_response_frame(RESP_COMMAND_MAGIC, b"error invalid spi frame")),

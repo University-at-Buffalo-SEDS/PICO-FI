@@ -1,6 +1,7 @@
 //! SPI upstream bridge implementation.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::bridge::spi_task::SpiFrame;
 use crate::config::BridgeConfig;
@@ -14,8 +15,6 @@ use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
 use embassy_rp::uart::BufferedUart;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
 use portable_atomic::{AtomicBool, Ordering};
 
@@ -26,8 +25,8 @@ pub async fn run_client(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     Timer::after_millis(runtime.startup_delay_ms).await;
@@ -89,8 +88,8 @@ pub async fn run_server(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -140,13 +139,13 @@ async fn session(
     socket: &mut TcpSocket<'_>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    spi_rx: Receiver<'static, CriticalSectionRawMutex, SpiFrame, 4>,
-    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; 256];
 
     loop {
-        match select(spi_rx.receive(), socket.read(&mut net_buf)).await {
+        match select(spi_rx.pop(), socket.read(&mut net_buf)).await {
             Either::First(frame) => {
                 handle_spi_request(frame, Some(socket), bridge_config, link_active, spi_tx).await?;
             }
@@ -155,7 +154,7 @@ async fn session(
                     return Ok(());
                 }
                 let response = make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]);
-                spi_tx.send(SpiFrame { data: response }).await;
+                spi_tx.push_overwrite(SpiFrame { data: response });
             }
             Either::Second(Err(_)) => return Err(()),
         }
@@ -167,7 +166,7 @@ async fn handle_spi_request(
     socket: Option<&mut TcpSocket<'_>>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    spi_tx: Sender<'static, CriticalSectionRawMutex, SpiFrame, 4>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Result<(), ()> {
     match parse_request_frame(&frame.data) {
         Some(RequestFrame::Data(payload)) => {
@@ -175,7 +174,7 @@ async fn handle_spi_request(
                 let line = trim_ascii_line(payload);
                 let response = render_local_bridge_command(bridge_config, link_active, line);
                 let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
-                spi_tx.send(SpiFrame { data: frame }).await;
+                spi_tx.push_overwrite(SpiFrame { data: frame });
                 return Ok(());
             }
             if let Some(socket) = socket {
@@ -183,10 +182,10 @@ async fn handle_spi_request(
                     write_socket(socket, payload).await?;
                 }
                 let response = make_response_frame(RESP_DATA_MAGIC, b"");
-                spi_tx.send(SpiFrame { data: response }).await;
+                spi_tx.push_overwrite(SpiFrame { data: response });
             } else {
                 let response = make_response_frame(RESP_DATA_MAGIC, b"");
-                spi_tx.send(SpiFrame { data: response }).await;
+                spi_tx.push_overwrite(SpiFrame { data: response });
             }
             Ok(())
         }
@@ -194,12 +193,12 @@ async fn handle_spi_request(
             let line = trim_ascii_line(payload);
             let response = render_local_bridge_command(bridge_config, link_active, line);
             let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
-            spi_tx.send(SpiFrame { data: frame }).await;
+            spi_tx.push_overwrite(SpiFrame { data: frame });
             Ok(())
         }
         None => {
             let response = make_response_frame(RESP_COMMAND_MAGIC, b"error invalid spi frame");
-            spi_tx.send(SpiFrame { data: response }).await;
+            spi_tx.push_overwrite(SpiFrame { data: response });
             Ok(())
         }
     }

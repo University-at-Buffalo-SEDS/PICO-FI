@@ -1,6 +1,7 @@
 //! Dedicated I2C polling task built on the embassy-rp slave driver.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
+use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
     FRAME_SIZE, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame,
@@ -9,8 +10,6 @@ use crate::protocol::i2c::{
 use embassy_futures::select::{Either, select};
 use embassy_rp::i2c_slave::{Command, I2cSlave, ReadStatus};
 use embassy_rp::peripherals::I2C0;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::Timer;
 use portable_atomic::AtomicBool;
 
@@ -28,8 +27,8 @@ pub async fn i2c_poll_task(
     i2c: &mut I2cSlave<'static, I2C0>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    rx_resp: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    tx: &'static OverwriteQueue<I2cFrame, 8>,
+    rx_resp: &'static OverwriteQueue<I2cFrame, 8>,
 ) -> ! {
     let mut transaction_buf = [0u8; I2C_CHUNK_MAX];
     let mut rx_frame = [0u8; FRAME_SIZE];
@@ -39,7 +38,7 @@ pub async fn i2c_poll_task(
     let mut tx_pos = 0usize;
 
     loop {
-        if let Ok(resp) = rx_resp.try_receive() {
+        if let Some(resp) = rx_resp.try_pop() {
             tx_frame = resp.data;
             tx_pos = 0;
         }
@@ -108,13 +107,13 @@ async fn process_complete_frame(
     link_active: &AtomicBool,
     tx_frame: &mut [u8; FRAME_SIZE],
     tx_pos: &mut usize,
-    tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    tx: &'static OverwriteQueue<I2cFrame, 8>,
 ) {
     if let Some(response) = handle_local_request(frame, bridge_config, link_active) {
         *tx_frame = response;
         *tx_pos = 0;
     } else {
-        tx.send(I2cFrame { data: frame }).await;
+        tx.push_overwrite(I2cFrame { data: frame });
     }
 }
 
@@ -148,7 +147,7 @@ fn handle_local_request(
 }
 
 async fn await_response_frame(
-    rx_resp: &Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    rx_resp: &'static OverwriteQueue<I2cFrame, 8>,
     tx_frame: &mut [u8; FRAME_SIZE],
     tx_pos: &mut usize,
 ) {
@@ -156,13 +155,13 @@ async fn await_response_frame(
         return;
     }
 
-    if let Ok(resp) = rx_resp.try_receive() {
+    if let Some(resp) = rx_resp.try_pop() {
         *tx_frame = resp.data;
         *tx_pos = 0;
         return;
     }
 
-    match select(rx_resp.receive(), Timer::after_millis(RESPONSE_WAIT_MS)).await {
+    match select(rx_resp.pop(), Timer::after_millis(RESPONSE_WAIT_MS)).await {
         Either::First(resp) => {
             *tx_frame = resp.data;
             *tx_pos = 0;

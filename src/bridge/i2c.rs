@@ -2,6 +2,7 @@
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::i2c_task::I2cFrame;
+use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
@@ -12,8 +13,6 @@ use embassy_futures::select::{Either, select};
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Timer};
 use portable_atomic::{AtomicBool, Ordering};
 
@@ -23,8 +22,8 @@ pub async fn run_client(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    i2c_rx: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_rx: &'static OverwriteQueue<I2cFrame, 8>,
+    i2c_tx: &'static OverwriteQueue<I2cFrame, 8>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     Timer::after_millis(runtime.startup_delay_ms).await;
@@ -79,8 +78,8 @@ pub async fn run_server(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    i2c_rx: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_rx: &'static OverwriteQueue<I2cFrame, 8>,
+    i2c_tx: &'static OverwriteQueue<I2cFrame, 8>,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -125,13 +124,13 @@ async fn session(
     socket: &mut TcpSocket<'_>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    i2c_rx: Receiver<'static, CriticalSectionRawMutex, I2cFrame, 4>,
-    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_rx: &'static OverwriteQueue<I2cFrame, 8>,
+    i2c_tx: &'static OverwriteQueue<I2cFrame, 8>,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; 256];
 
     loop {
-        match select(i2c_rx.receive(), socket.read(&mut net_buf)).await {
+        match select(i2c_rx.pop(), socket.read(&mut net_buf)).await {
             Either::First(frame) => {
                 handle_i2c_request(frame, Some(socket), bridge_config, link_active, i2c_tx).await?;
             }
@@ -140,7 +139,7 @@ async fn session(
                     return Ok(());
                 }
                 let response = make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]);
-                i2c_tx.send(I2cFrame { data: response }).await;
+                i2c_tx.push_overwrite(I2cFrame { data: response });
             }
             Either::Second(Err(_)) => return Err(()),
         }
@@ -152,17 +151,26 @@ async fn handle_i2c_request(
     socket: Option<&mut TcpSocket<'_>>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    i2c_tx: Sender<'static, CriticalSectionRawMutex, I2cFrame, 4>,
+    i2c_tx: &'static OverwriteQueue<I2cFrame, 8>,
 ) -> Result<(), ()> {
     match parse_request_frame(&frame.data) {
         Some(RequestFrame::Data(payload)) => {
+            if looks_like_local_command(payload) {
+                let line = trim_ascii_line(payload);
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
+                i2c_tx.push_overwrite(I2cFrame { data: frame });
+                return Ok(());
+            }
             if let Some(socket) = socket {
                 if !payload.is_empty() {
                     write_socket(socket, payload).await?;
                 }
+                let response = make_response_frame(RESP_DATA_MAGIC, b"");
+                i2c_tx.push_overwrite(I2cFrame { data: response });
             } else if !payload.is_empty() {
                 let response = make_response_frame(RESP_DATA_MAGIC, b"");
-                i2c_tx.send(I2cFrame { data: response }).await;
+                i2c_tx.push_overwrite(I2cFrame { data: response });
             }
             Ok(())
         }
@@ -171,13 +179,20 @@ async fn handle_i2c_request(
             let response =
                 render_local_bridge_command(bridge_config, link_active, line);
             let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
-            i2c_tx.send(I2cFrame { data: frame }).await;
+            i2c_tx.push_overwrite(I2cFrame { data: frame });
             Ok(())
         }
         None => {
             let response = make_response_frame(RESP_COMMAND_MAGIC, b"error invalid i2c frame");
-            i2c_tx.send(I2cFrame { data: response }).await;
+            i2c_tx.push_overwrite(I2cFrame { data: response });
             Ok(())
         }
     }
+}
+
+fn looks_like_local_command(payload: &[u8]) -> bool {
+    payload.first() == Some(&b'/')
+        && payload
+            .iter()
+            .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
 }

@@ -3,6 +3,7 @@
 pub mod commands;
 pub mod i2c;
 pub mod i2c_task;
+pub mod overwrite_queue;
 pub mod runtime;
 pub mod spi;
 pub mod spi_pio;

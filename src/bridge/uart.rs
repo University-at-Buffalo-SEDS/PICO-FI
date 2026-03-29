@@ -1,10 +1,11 @@
 //! UART upstream bridge implementation.
 
-use crate::bridge::commands::render_local_bridge_command;
+use crate::bridge::commands::signal_led_activity;
+use crate::bridge::overwrite_queue::OverwriteByteRing;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
@@ -12,24 +13,9 @@ use embassy_net::tcp::TcpSocket;
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read, Write};
-use heapless::String;
 use portable_atomic::{AtomicBool, Ordering};
-
-struct LocalCommandState {
-    at_line_start: bool,
-    active: bool,
-    buf: String<256>,
-}
-
-impl LocalCommandState {
-    fn new() -> Self {
-        Self {
-            at_line_start: true,
-            active: false,
-            buf: String::new(),
-        }
-    }
-}
+const UART_EGRESS_RING_BYTES: usize = 2048;
+const UART_EGRESS_CHUNK_BYTES: usize = 256;
 
 /// Runs the UART bridge in TCP client mode with reconnect behavior.
 pub async fn run_client(
@@ -125,126 +111,78 @@ pub async fn run_server(
 async fn session(
     uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
-    bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
+    _bridge_config: BridgeConfig,
+    _link_active: &AtomicBool,
 ) -> Result<(), ()> {
-    let mut uart_buf = [0u8; 256];
+    let mut uart_buf = [0u8; 1024];
     let mut net_buf = [0u8; 256];
-    let mut command_state = LocalCommandState::new();
+    let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
+    let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
+    let mut tx_chunk_len = 0usize;
+    let mut tx_chunk_pos = 0usize;
+    let (uart_tx, uart_rx) = uart.split_ref();
 
     loop {
-        match select(uart.read(&mut uart_buf), socket.read(&mut net_buf)).await {
-            Either::First(Ok(uart_n)) => {
-                if uart_n == 0 {
-                    yield_now().await;
-                    continue;
-                }
-                handle_uart_input(
-                    uart,
-                    &uart_buf[..uart_n],
-                    bridge_config,
-                    link_active,
-                    &mut command_state,
-                    Some(socket),
-                )
-                .await?;
-            }
-            Either::First(Err(_)) => return Err(()),
-            Either::Second(Ok(net_n)) => {
-                if net_n == 0 {
-                    return Ok(());
-                }
-                uart.write_all(&net_buf[..net_n]).await.map_err(|_| ())?;
-                uart.flush().await.map_err(|_| ())?;
-            }
-            Either::Second(Err(_)) => return Err(()),
+        if tx_chunk_pos >= tx_chunk_len && !egress_ring.is_empty() {
+            tx_chunk_len = egress_ring.pop_into(&mut tx_chunk);
+            tx_chunk_pos = 0;
         }
-    }
-}
 
-/// Handles a slash-prefixed local bridge command on the UART control path.
-async fn handle_local_command(
-    uart: &mut BufferedUart,
-    bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
-    line: &str,
-) -> Result<bool, ()> {
-    if !line.starts_with('/') {
-        return Ok(false);
-    }
-
-    let response = render_local_bridge_command(bridge_config, link_active, line);
-    crate::shell::writeln_line(uart, response.as_str()).await?;
-    Ok(true)
-}
-
-async fn handle_uart_input(
-    uart: &mut BufferedUart,
-    bytes: &[u8],
-    bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
-    command_state: &mut LocalCommandState,
-    mut socket: Option<&mut TcpSocket<'_>>,
-) -> Result<(), ()> {
-    for &byte in bytes {
-        if command_state.active {
-            match byte {
-                b'\r' => {}
-                b'\n' => {
-                    let _ = handle_local_command(
-                        uart,
-                        bridge_config,
-                        link_active,
-                        command_state.buf.as_str(),
-                    )
-                    .await?;
-                    command_state.buf.clear();
-                    command_state.active = false;
-                    command_state.at_line_start = true;
+        if tx_chunk_pos < tx_chunk_len {
+            match select3(
+                uart_rx.read(&mut uart_buf),
+                socket.read(&mut net_buf),
+                uart_tx.write(&tx_chunk[tx_chunk_pos..tx_chunk_len]),
+            )
+            .await
+            {
+                Either3::First(Ok(uart_n)) => {
+                    if uart_n == 0 {
+                        yield_now().await;
+                        continue;
+                    }
+                    forward_uart_bytes(Some(socket), &uart_buf[..uart_n]).await?;
                 }
-                byte if byte.is_ascii_graphic() || byte == b' ' => {
-                    if command_state.buf.push(byte as char).is_err() {
-                        flush_command_bytes(command_state, socket.as_deref_mut()).await?;
-                        forward_uart_bytes(socket.as_deref_mut(), &[byte]).await?;
-                        command_state.at_line_start = false;
+                Either3::First(Err(_)) => return Err(()),
+                Either3::Second(Ok(net_n)) => {
+                    if net_n == 0 {
+                        return Ok(());
+                    }
+                    egress_ring.push_overwrite_slice(&net_buf[..net_n]);
+                }
+                Either3::Second(Err(_)) => return Err(()),
+                Either3::Third(Ok(written)) => {
+                    if written == 0 {
+                        return Err(());
+                    }
+                    tx_chunk_pos = (tx_chunk_pos + written).min(tx_chunk_len);
+                    if tx_chunk_pos >= tx_chunk_len {
+                        tx_chunk_pos = 0;
+                        tx_chunk_len = 0;
                     }
                 }
-                _ => {
-                    flush_command_bytes(command_state, socket.as_deref_mut()).await?;
-                    forward_uart_bytes(socket.as_deref_mut(), &[byte]).await?;
-                    command_state.at_line_start = false;
-                }
+                Either3::Third(Err(_)) => return Err(()),
             }
-            continue;
-        }
-
-        if command_state.at_line_start && byte == b'/' {
-            command_state.active = true;
-            command_state.buf.clear();
-            let _ = command_state.buf.push('/');
-            continue;
-        }
-
-        forward_uart_bytes(socket.as_deref_mut(), &[byte]).await?;
-        if byte == b'\n' {
-            command_state.at_line_start = true;
-        } else if byte != b'\r' {
-            command_state.at_line_start = false;
+        } else {
+            match select(uart_rx.read(&mut uart_buf), socket.read(&mut net_buf)).await {
+                Either::First(Ok(uart_n)) => {
+                    if uart_n == 0 {
+                        yield_now().await;
+                        continue;
+                    }
+                    forward_uart_bytes(Some(socket), &uart_buf[..uart_n]).await?;
+                }
+                Either::First(Err(_)) => return Err(()),
+                Either::Second(Ok(net_n)) => {
+                    if net_n == 0 {
+                        return Ok(());
+                    }
+                    egress_ring.push_overwrite_slice(&net_buf[..net_n]);
+                }
+                Either::Second(Err(_)) => return Err(()),
+            }
         }
     }
-    Ok(())
-}
-
-async fn flush_command_bytes(
-    command_state: &mut LocalCommandState,
-    socket: Option<&mut TcpSocket<'_>>,
-) -> Result<(), ()> {
-    if !command_state.buf.is_empty() {
-        forward_uart_bytes(socket, command_state.buf.as_bytes()).await?;
-        command_state.buf.clear();
-    }
-    command_state.active = false;
-    Ok(())
 }
 
 async fn forward_uart_bytes(
@@ -253,6 +191,7 @@ async fn forward_uart_bytes(
 ) -> Result<(), ()> {
     if let Some(socket) = socket {
         if !bytes.is_empty() {
+            signal_led_activity();
             write_socket(socket, bytes).await?;
         }
     }
