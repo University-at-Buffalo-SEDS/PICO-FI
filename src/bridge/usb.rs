@@ -215,6 +215,7 @@ pub async fn run_client(
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
+        socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             true,
@@ -256,6 +257,7 @@ pub async fn run_server(
         if socket.accept(port).await.is_err() {
             return Err(());
         }
+        socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             false,

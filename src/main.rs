@@ -10,7 +10,7 @@ mod protocol;
 mod shell;
 mod storage;
 
-use bridge::i2c_task::{i2c_poll_task, I2cFrame};
+use bridge::i2c_task::{i2c_poll_task, I2cPacket};
 use bridge::overwrite_queue::OverwriteQueue;
 use bridge::spi_task::{spi_poll_task, SpiFrame};
 use bridge::runtime::BridgeRuntime;
@@ -60,8 +60,8 @@ static USB_CDC_STATE: StaticCell<UsbCdcState<'static>> = StaticCell::new();
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 /// Channel for I2C frames from polling task to bridge session.
-static I2C_FRAME_QUEUE: OverwriteQueue<I2cFrame, 8> = OverwriteQueue::new();
-static I2C_RESPONSE_QUEUE: OverwriteQueue<I2cFrame, 8> = OverwriteQueue::new();
+static I2C_FRAME_QUEUE: OverwriteQueue<I2cPacket, 8> = OverwriteQueue::new();
+static I2C_RESPONSE_QUEUE: OverwriteQueue<I2cPacket, 8> = OverwriteQueue::new();
 static SPI_FRAME_QUEUE: OverwriteQueue<SpiFrame, 8> = OverwriteQueue::new();
 static SPI_RESPONSE_QUEUE: OverwriteQueue<SpiFrame, 8> = OverwriteQueue::new();
 
@@ -79,6 +79,9 @@ const LINK_CONNECT_TIMEOUT_MS: u64 = 1_500;
 
 /// Timeout applied to the bridge handshake exchange after TCP connects.
 const LINK_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
+
+/// Timeout applied to socket I/O once a bridge session is active.
+const LINK_SOCKET_TIMEOUT_MS: u64 = 2_000;
 
 /// Fixed magic exchanged by both peers to confirm protocol compatibility.
 const LINK_HANDSHAKE_MAGIC: &[u8] = b"PICOFI1";
@@ -387,8 +390,8 @@ async fn run_bridge_mode(
     usb_sender: Option<&mut UsbCdcSender>,
     usb_receiver: Option<&mut UsbCdcReceiver>,
     status_led: Option<&mut Output<'static>>,
-    i2c_rx: &'static OverwriteQueue<I2cFrame, 8>,
-    i2c_tx: &'static OverwriteQueue<I2cFrame, 8>,
+    i2c_rx: &'static OverwriteQueue<I2cPacket, 8>,
+    i2c_tx: &'static OverwriteQueue<I2cPacket, 8>,
     spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
     spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Result<(), ()> {
@@ -398,6 +401,7 @@ async fn run_bridge_mode(
         reconnect_delay_ms: CLIENT_RECONNECT_DELAY_MS,
         connect_timeout_ms: LINK_CONNECT_TIMEOUT_MS,
         handshake_timeout_ms: LINK_HANDSHAKE_TIMEOUT_MS,
+        socket_timeout_ms: LINK_SOCKET_TIMEOUT_MS,
         handshake_magic: LINK_HANDSHAKE_MAGIC,
     };
 
@@ -509,8 +513,8 @@ async fn i2c_controller_task(
     mut i2c: I2cSlave<'static, I2C0>,
     bridge_config: BridgeConfig,
     link_active: &'static AtomicBool,
-    tx: &'static OverwriteQueue<I2cFrame, 8>,
-    rx_resp: &'static OverwriteQueue<I2cFrame, 8>,
+    tx: &'static OverwriteQueue<I2cPacket, 8>,
+    rx_resp: &'static OverwriteQueue<I2cPacket, 8>,
 ) {
     i2c_poll_task(&mut i2c, bridge_config, link_active, tx, rx_resp).await
 }

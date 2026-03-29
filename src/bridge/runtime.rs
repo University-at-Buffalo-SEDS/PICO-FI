@@ -15,6 +15,8 @@ pub struct BridgeRuntime<'a> {
     pub connect_timeout_ms: u64,
     /// Timeout applied to the bridge handshake exchange after TCP connects.
     pub handshake_timeout_ms: u64,
+    /// Timeout applied to socket reads/writes during an active bridge session.
+    pub socket_timeout_ms: u64,
     /// Fixed magic exchanged by both peers to confirm protocol compatibility.
     pub handshake_magic: &'a [u8],
 }

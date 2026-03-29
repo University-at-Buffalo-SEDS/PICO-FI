@@ -17,47 +17,18 @@ import tty
 from dataclasses import dataclass, field
 
 try:
-    from .raw import CHUNK_SIZE, open_bus
+    from .protocol import KIND_COMMAND, KIND_DATA, KIND_ERROR, read_packet, write_packet
+    from .raw import open_bus
 except ImportError:
     import os
 
     sys.path.append(os.path.dirname(__file__))
-    from raw import CHUNK_SIZE, open_bus
+    from protocol import KIND_COMMAND, KIND_DATA, KIND_ERROR, read_packet, write_packet
+    from raw import open_bus
 
-FRAME_SIZE = 258
-PAYLOAD_MAX = FRAME_SIZE - 2
 I2C_ADDR = 0x55
 CHUNK_DELAY_S = 0.001
 INITIAL_RESPONSE_WAIT_S = 0.01
-
-REQ_MAGIC = 0xA5
-REQ_COMMAND_MAGIC = 0xA6
-RESP_DATA_MAGIC = 0x5A
-RESP_COMMAND_MAGIC = 0x5B
-
-
-def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
-    payload = payload[:PAYLOAD_MAX]
-    frame = bytearray(2 + len(payload))
-    frame[0] = magic
-    frame[1] = len(payload)
-    frame[2:2 + len(payload)] = payload
-    return bytes(frame)
-
-
-def is_garbage_frame(frame: bytes) -> bool:
-    ff_count = sum(1 for b in frame if b == 0xFF)
-    return ff_count > len(frame) * 0.8
-
-
-def parse_frame(frame: bytes) -> tuple[int, bytes]:
-    if len(frame) != FRAME_SIZE or is_garbage_frame(frame):
-        return 0, b""
-    magic = frame[0]
-    length = frame[1]
-    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
-        return 0, b""
-    return magic, bytes(frame[2:2 + length])
 
 
 def print_payload(prompt: "PromptState", payload: bytes) -> None:
@@ -67,27 +38,8 @@ def print_payload(prompt: "PromptState", payload: bytes) -> None:
             prompt.print_line(line)
 
 
-def print_raw_frame(prompt: "PromptState", magic: int, payload: bytes) -> None:
-    prompt.print_line(f"[raw] magic=0x{magic:02x} len={len(payload)} data={payload.hex(' ')}")
-
-
-def read_frame(bus) -> bytes:
-    rx = bytearray()
-    for _ in range(0, FRAME_SIZE, CHUNK_SIZE):
-        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(rx))
-        chunk = bus.read(I2C_ADDR, chunk_size)
-        rx.extend(chunk)
-        if len(rx) < FRAME_SIZE:
-            time.sleep(CHUNK_DELAY_S)
-    return bytes(rx[:FRAME_SIZE])
-
-
-def write_frame(bus, frame: bytes) -> None:
-    for i in range(0, len(frame), CHUNK_SIZE):
-        chunk = frame[i:i + CHUNK_SIZE]
-        bus.write(I2C_ADDR, chunk)
-        if i + CHUNK_SIZE < len(frame):
-            time.sleep(CHUNK_DELAY_S)
+def print_raw_packet(prompt: "PromptState", kind: int, payload: bytes) -> None:
+    prompt.print_line(f"[raw] kind=0x{kind:02x} len={len(payload)} data={payload.hex(' ')}")
 
 
 def print_help() -> list[str]:
@@ -183,29 +135,28 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def exchange_frame(bus, prompt: PromptState, magic: int, payload: bytes, poll_delay_s: float, raw_mode: bool) -> None:
+def exchange_packet(
+    bus,
+    prompt: PromptState,
+    kind: int,
+    payload: bytes,
+    poll_delay_s: float,
+    raw_mode: bool,
+    transfer_id: int,
+) -> None:
     try:
-        write_frame(bus, build_frame(payload, magic))
+        write_packet(bus, I2C_ADDR, payload, kind=kind, transfer_id=transfer_id, chunk_delay_s=CHUNK_DELAY_S)
         time.sleep(INITIAL_RESPONSE_WAIT_S)
-        rx_magic, rx_payload = parse_frame(read_frame(bus))
-        if raw_mode and rx_magic:
-            print_raw_frame(prompt, rx_magic, rx_payload)
-        if magic != REQ_COMMAND_MAGIC:
-            if rx_payload:
-                print_payload(prompt, rx_payload)
+        response = read_packet(bus, I2C_ADDR, chunk_delay_s=CHUNK_DELAY_S, timeout_s=max(0.05, poll_delay_s))
+        if response is None:
             return
-        if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
+        rx_kind, rx_payload = response
+        if raw_mode:
+            print_raw_packet(prompt, rx_kind, rx_payload)
+        if rx_payload:
             print_payload(prompt, rx_payload)
-            return
-        for _ in range(50):
-            time.sleep(poll_delay_s)
-            rx_magic, rx_payload = parse_frame(read_frame(bus))
-            if raw_mode and rx_magic:
-                print_raw_frame(prompt, rx_magic, rx_payload)
-            if rx_magic == RESP_COMMAND_MAGIC and rx_payload:
-                print_payload(prompt, rx_payload)
-                return
-        prompt.print_line("[pico] command timed out waiting for I2C reply")
+        if rx_kind == KIND_ERROR:
+            prompt.print_line("[pico] remote reported an i2c transport error")
     except Exception as exc:
         prompt.print_line(f"[error] I2C error: {exc}")
 
@@ -237,6 +188,7 @@ def main() -> int:
     )
     try:
         pending: collections.deque[tuple[int, bytes]] = collections.deque()
+        transfer_id = 1
         while True:
             try:
                 while True:
@@ -253,22 +205,26 @@ def main() -> int:
                         continue
                     prompt.print_line(f"[{sender}] {line}")
                     if stripped.startswith("/") and not stripped.startswith("//"):
-                        pending.append((REQ_COMMAND_MAGIC, (stripped + "\n").encode("utf-8")))
+                        pending.append((KIND_COMMAND, (stripped + "\n").encode("utf-8")))
                     else:
-                        pending.append((REQ_MAGIC, f"[{sender}] {line}\n".encode("utf-8")))
+                        pending.append((KIND_DATA, f"[{sender}] {line}\n".encode("utf-8")))
             except queue.Empty:
                 pass
+
             poll_delay_s = args.poll_ms / 1000.0
             if pending:
-                magic, payload = pending.popleft()
-                exchange_frame(bus, prompt, magic, payload, poll_delay_s, args.raw)
+                kind, payload = pending.popleft()
+                exchange_packet(bus, prompt, kind, payload, poll_delay_s, args.raw, transfer_id)
+                transfer_id = (transfer_id + 1) & 0xFFFF or 1
             else:
                 try:
-                    rx_magic, payload = parse_frame(read_frame(bus))
-                    if args.raw and rx_magic:
-                        print_raw_frame(prompt, rx_magic, payload)
-                    if rx_magic == RESP_DATA_MAGIC and payload:
-                        print_payload(prompt, payload)
+                    response = read_packet(bus, I2C_ADDR, chunk_delay_s=CHUNK_DELAY_S, timeout_s=poll_delay_s)
+                    if response is not None:
+                        rx_kind, payload = response
+                        if args.raw:
+                            print_raw_packet(prompt, rx_kind, payload)
+                        if payload:
+                            print_payload(prompt, payload)
                 except Exception:
                     pass
                 time.sleep(poll_delay_s)
