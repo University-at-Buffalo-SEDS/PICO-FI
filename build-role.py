@@ -71,14 +71,18 @@ def build_role(role: str, *, release: bool, flash: bool, probe: str | None) -> i
     cargo = find_tool("cargo")
     if cargo is None:
         fail("`cargo` not found. Install Rust/Cargo first.")
+    elf2uf2 = find_tool("elf2uf2-rs")
+    if elf2uf2 is None:
+        fail("`elf2uf2-rs` not found.\nInstall it with: cargo install elf2uf2-rs")
 
     role_config = ROLE_CONFIG[role]
     target_dir = ROOT / "target" / role
     profile = "release" if release else "debug"
     elf = target_dir / TARGET / profile / BIN_NAME
+    uf2 = elf.with_suffix(".uf2")
 
     env = os.environ.copy()
-    env["PICO_FI_CONFIG"] = role_config
+    env["PICO_FI_CONFIG"] = str((ROOT / role_config).resolve())
     env["CARGO_TARGET_DIR"] = str(target_dir)
 
     cmd = [cargo, "build", "--package", BIN_NAME, "--bin", BIN_NAME]
@@ -89,7 +93,11 @@ def build_role(role: str, *, release: bool, flash: bool, probe: str | None) -> i
     if not elf.is_file():
         fail(f"expected ELF was not created: {elf}")
 
-    print(f"built {role} firmware: {elf}")
+    run([elf2uf2, str(elf), str(uf2)], cwd=ROOT)
+
+    print(f"built {role} firmware:")
+    print(f"ELF: {elf}")
+    print(f"UF2: {uf2}")
 
     if flash:
         flash_with_probe(elf, probe)
