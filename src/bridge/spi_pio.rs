@@ -1,46 +1,10 @@
-//! Starter pieces for a future PIO-backed SPI slave transport.
-//!
-//! This module is intentionally not wired into the active firmware path yet.
-//! It collects the transaction/state handling that a PIO-driven SPI slave will
-//! need, so the eventual state-machine service loop can focus on GPIO/PIO
-//! mechanics instead of frame bookkeeping.
-#![allow(dead_code)]
+//! Framing helpers for the upstream PIO-backed SPI slave transport.
 
 use crate::protocol::i2c::{FRAME_SIZE, RESP_DATA_MAGIC, make_response_frame};
-use embedded_hal::spi::MODE_0;
-
-/// Wire format required by the current host and firmware framing.
-pub const SPI_PIO_FRAME_FORMAT: embedded_hal::spi::Mode = MODE_0;
-
-/// Default pinout for the SPI upstream on RP2040 `SPI1`-compatible GPIOs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PioSpiPins {
-    pub sck: u8,
-    pub mosi: u8,
-    pub miso: u8,
-    pub cs: u8,
-}
-
-impl Default for PioSpiPins {
-    fn default() -> Self {
-        Self {
-            sck: 10,
-            mosi: 12,
-            miso: 11,
-            cs: 13,
-        }
-    }
-}
-
 /// Result of one CS-bounded SPI transaction as seen by the future PIO backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionResult {
-    IdlePoll {
-        received: usize,
-        preview: [u8; 8],
-        raw_words: [u32; 4],
-        raw_word_count: usize,
-    },
+    IdlePoll { received: usize, preview: [u8; 8] },
     Partial { received: usize, expected: usize },
     Complete([u8; FRAME_SIZE]),
 }
@@ -49,12 +13,6 @@ pub enum TransactionResult {
 #[derive(Clone, Copy)]
 pub struct PioSpiTransportState {
     staged_tx: [u8; FRAME_SIZE],
-    rx_frame: [u8; FRAME_SIZE],
-    rx_raw_words: [u32; 4],
-    rx_raw_word_count: usize,
-    rx_pos: usize,
-    rx_expected: usize,
-    tx_pos: usize,
 }
 
 impl PioSpiTransportState {
@@ -62,117 +20,45 @@ impl PioSpiTransportState {
     pub fn new() -> Self {
         Self {
             staged_tx: make_response_frame(RESP_DATA_MAGIC, b""),
-            rx_frame: [0; FRAME_SIZE],
-            rx_raw_words: [0; 4],
-            rx_raw_word_count: 0,
-            rx_pos: 0,
-            rx_expected: FRAME_SIZE,
-            tx_pos: 0,
         }
     }
 
     /// Stages the next response frame for clock-out on the next transaction.
     pub fn stage_response(&mut self, frame: [u8; FRAME_SIZE]) {
         self.staged_tx = frame;
-        self.tx_pos = 0;
     }
 
-    /// Starts a new CS-bounded transaction.
-    pub fn begin_transaction(&mut self) {
-        self.rx_frame = [0; FRAME_SIZE];
-        self.rx_raw_words = [0; 4];
-        self.rx_raw_word_count = 0;
-        self.rx_pos = 0;
-        self.rx_expected = FRAME_SIZE;
-        self.tx_pos = 0;
+    /// Returns the currently staged response frame.
+    pub fn staged_response(&self) -> [u8; FRAME_SIZE] {
+        self.staged_tx
     }
 
-    /// Returns the next byte that should be presented on MISO.
-    pub fn next_tx_byte(&mut self) -> u8 {
-        let byte = if self.tx_pos < FRAME_SIZE {
-            self.staged_tx[self.tx_pos]
-        } else {
-            0
-        };
-        if self.tx_pos < FRAME_SIZE {
-            self.tx_pos += 1;
-        }
-        byte
-    }
-
-    /// Returns the next byte with a one-bit lead applied across the staged bitstream.
-    ///
-    /// This compensates for a slave TX path that presents each bit one clock late on MISO.
-    pub fn next_tx_byte_shifted_left_1(&mut self) -> u8 {
-        let byte = if self.tx_pos < FRAME_SIZE {
-            let current = self.staged_tx[self.tx_pos];
-            let next = if self.tx_pos + 1 < FRAME_SIZE {
-                self.staged_tx[self.tx_pos + 1]
-            } else {
-                0
-            };
-            (current << 1) | (next >> 7)
-        } else {
-            0
-        };
-        if self.tx_pos < FRAME_SIZE {
-            self.tx_pos += 1;
-        }
-        byte
-    }
-
-    /// Captures one received MOSI byte.
-    pub fn capture_rx_byte(&mut self, byte: u8) {
-        if self.rx_pos < FRAME_SIZE {
-            self.rx_frame[self.rx_pos] = byte;
-            self.rx_pos += 1;
-            if self.rx_pos >= 2 {
-                self.rx_expected = (self.rx_frame[1] as usize + 2).min(FRAME_SIZE);
-            }
-        }
-    }
-
-    /// Records one raw RX FIFO word for diagnostics and captures the selected byte lane.
-    pub fn capture_rx_word(&mut self, word: u32) {
-        if self.rx_raw_word_count < self.rx_raw_words.len() {
-            self.rx_raw_words[self.rx_raw_word_count] = word;
-            self.rx_raw_word_count += 1;
-        }
-        self.capture_rx_byte(word as u8);
-    }
-
-    /// Finalizes the current transaction and returns the captured result.
-    pub fn finish_transaction(&mut self) -> TransactionResult {
-        let tx_complete = self.tx_pos >= FRAME_SIZE;
-        let received_any_nonzero = self.rx_frame[..self.rx_pos].iter().any(|&byte| byte != 0);
+    /// Finalizes a CS-bounded transaction from the DMA receive buffer.
+    pub fn finish_transaction(
+        &mut self,
+        rx_frame: &[u8; FRAME_SIZE],
+        received: usize,
+    ) -> TransactionResult {
+        let received = received.min(FRAME_SIZE);
+        let received_any_nonzero = rx_frame[..received].iter().any(|&byte| byte != 0);
         let mut preview = [0u8; 8];
-        let preview_len = self.rx_pos.min(preview.len());
-        preview[..preview_len].copy_from_slice(&self.rx_frame[..preview_len]);
-        let result = if self.rx_pos == 0 || !received_any_nonzero {
-            TransactionResult::IdlePoll {
-                received: self.rx_pos,
-                preview,
-                raw_words: self.rx_raw_words,
-                raw_word_count: self.rx_raw_word_count,
-            }
-        } else if self.rx_complete() {
-            TransactionResult::Complete(self.rx_frame)
+        let preview_len = received.min(preview.len());
+        preview[..preview_len].copy_from_slice(&rx_frame[..preview_len]);
+        let expected = if received >= 2 {
+            (rx_frame[1] as usize + 2).min(FRAME_SIZE)
         } else {
-            TransactionResult::Partial {
-                received: self.rx_pos,
-                expected: self.rx_expected,
-            }
+            FRAME_SIZE
+        };
+        let result = if received == 0 || !received_any_nonzero {
+            TransactionResult::IdlePoll { received, preview }
+        } else if received >= 2 && received >= expected {
+            TransactionResult::Complete(*rx_frame)
+        } else {
+            TransactionResult::Partial { received, expected }
         };
 
-        if tx_complete {
-            self.staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
-        }
-
+        self.staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
         result
-    }
-
-    fn rx_complete(&self) -> bool {
-        self.rx_pos >= 2 && self.rx_pos >= self.rx_expected
     }
 }
 
@@ -184,14 +70,11 @@ mod tests {
     #[test]
     fn default_state_returns_idle_poll() {
         let mut state = PioSpiTransportState::new();
-        state.begin_transaction();
         assert_eq!(
-            state.finish_transaction(),
+            state.finish_transaction(&[0; FRAME_SIZE], 0),
             TransactionResult::IdlePoll {
                 received: 0,
-                preview: [0; 8],
-                raw_words: [0; 4],
-                raw_word_count: 0,
+                preview: [0; 8]
             }
         );
     }
@@ -199,14 +82,9 @@ mod tests {
     #[test]
     fn captures_complete_frame() {
         let mut state = PioSpiTransportState::new();
-        state.begin_transaction();
-        state.capture_rx_byte(0xa6);
-        state.capture_rx_byte(0x04);
-        state.capture_rx_byte(b'p');
-        state.capture_rx_byte(b'i');
-        state.capture_rx_byte(b'n');
-        state.capture_rx_byte(b'g');
-        match state.finish_transaction() {
+        let mut frame = [0u8; FRAME_SIZE];
+        frame[..6].copy_from_slice(&[0xa6, 0x04, b'p', b'i', b'n', b'g']);
+        match state.finish_transaction(&frame, 6) {
             TransactionResult::Complete(frame) => {
                 assert_eq!(frame[0], 0xa6);
                 assert_eq!(frame[1], 0x04);
@@ -218,12 +96,10 @@ mod tests {
     #[test]
     fn captures_partial_frame() {
         let mut state = PioSpiTransportState::new();
-        state.begin_transaction();
-        state.capture_rx_byte(0xa6);
-        state.capture_rx_byte(0x04);
-        state.capture_rx_byte(b'p');
+        let mut frame = [0u8; FRAME_SIZE];
+        frame[..3].copy_from_slice(&[0xa6, 0x04, b'p']);
         assert_eq!(
-            state.finish_transaction(),
+            state.finish_transaction(&frame, 3),
             TransactionResult::Partial {
                 received: 3,
                 expected: 6
@@ -235,8 +111,13 @@ mod tests {
     fn drains_staged_response_once() {
         let mut state = PioSpiTransportState::new();
         state.stage_response(make_response_frame(RESP_COMMAND_MAGIC, b"ok"));
-        state.begin_transaction();
-        assert_eq!(state.next_tx_byte(), RESP_COMMAND_MAGIC);
-        assert_eq!(state.next_tx_byte(), 2);
+        let frame = state.staged_response();
+        assert_eq!(frame[0], RESP_COMMAND_MAGIC);
+        assert_eq!(frame[1], 2);
+        let _ = state.finish_transaction(&[0; FRAME_SIZE], FRAME_SIZE);
+        assert_eq!(
+            state.staged_response(),
+            make_response_frame(RESP_DATA_MAGIC, b"")
+        );
     }
 }

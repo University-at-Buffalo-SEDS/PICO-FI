@@ -14,7 +14,7 @@ FRAME_SIZE = 258
 
 
 class RawSpiBus:
-    def __init__(self, bus: int, device: int, speed_hz: int, mode: int = 0):
+    def __init__(self, bus: int, device: int, speed_hz: int, mode: int = 1):
         self.spi = spidev.SpiDev()
         self.spi.open(bus, device)
         self.spi.mode = mode

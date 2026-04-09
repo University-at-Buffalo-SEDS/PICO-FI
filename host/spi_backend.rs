@@ -18,6 +18,7 @@ const REQ_DATA_MAGIC: u8 = 0xA5;
 const REQ_COMMAND_MAGIC: u8 = 0xA6;
 const RESP_DATA_MAGIC: u8 = 0x5A;
 const RESP_COMMAND_MAGIC: u8 = 0x5B;
+const SPI_MODE: u8 = 1;
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -166,7 +167,7 @@ impl SpiBackend {
     }
 
     fn configure(&mut self) -> Result<()> {
-        let mut mode = 0u8;
+        let mut mode = SPI_MODE;
         let mut bits = 8u8;
         let mut speed = self.speed_hz;
         ioctl_write(self.file.as_raw_fd(), SPI_IOC_WR_MODE, &mut mode)?;
@@ -231,13 +232,20 @@ fn ioctl_write<T>(fd: c_int, request: c_ulong, value: &mut T) -> Result<()> {
 }
 
 fn parse_response(raw: &[u8; FRAME_SIZE]) -> Result<Frame> {
-    let magic = raw[0];
-    let len = raw[1] as usize;
+    let (magic, len, payload_start) = if raw[0] == 0 && matches!(raw[1], RESP_DATA_MAGIC | RESP_COMMAND_MAGIC) {
+        (raw[1], raw[2] as usize, 3usize)
+    } else {
+        (raw[0], raw[1] as usize, 2usize)
+    };
     if len > PAYLOAD_MAX {
         return Err(Error::InvalidFrame { magic, len });
     }
 
-    let payload = raw[2..2 + len].to_vec();
+    let payload_end = payload_start + len;
+    if payload_end > FRAME_SIZE {
+        return Err(Error::InvalidFrame { magic, len });
+    }
+    let payload = raw[payload_start..payload_end].to_vec();
     match magic {
         RESP_DATA_MAGIC => Ok(Frame::Data(payload)),
         RESP_COMMAND_MAGIC => Ok(Frame::Command(payload)),
@@ -264,6 +272,15 @@ mod tests {
         raw[0] = RESP_COMMAND_MAGIC;
         raw[1] = 4;
         raw[2..6].copy_from_slice(b"pong");
+        assert_eq!(parse_response(&raw).unwrap(), Frame::Command(b"pong".to_vec()));
+    }
+
+    #[test]
+    fn parses_one_byte_shifted_command_frame() {
+        let mut raw = [0u8; FRAME_SIZE];
+        raw[1] = RESP_COMMAND_MAGIC;
+        raw[2] = 4;
+        raw[3..7].copy_from_slice(b"pong");
         assert_eq!(parse_response(&raw).unwrap(), Frame::Command(b"pong".to_vec()));
     }
 

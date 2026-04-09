@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import queue
 import select
@@ -45,11 +46,20 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
 def parse_frame(frame: bytes) -> tuple[int, bytes]:
     if len(frame) != FRAME_SIZE:
         return 0, b""
-    magic = frame[0]
-    length = frame[1]
+    if frame[0] == 0 and frame[1] in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC):
+        magic = frame[1]
+        length = frame[2]
+        payload_start = 3
+    else:
+        magic = frame[0]
+        length = frame[1]
+        payload_start = 2
     if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
         return 0, b""
-    return magic, bytes(frame[2:2 + length])
+    payload_end = payload_start + length
+    if payload_end > FRAME_SIZE:
+        return 0, b""
+    return magic, bytes(frame[payload_start:payload_end])
 
 
 def print_help() -> list[str]:
@@ -152,11 +162,36 @@ class StreamPrinter:
             self.pending = ""
 
 
+class TerminalModeGuard:
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._old: list | None = None
+        self._active = False
+
+    def enable(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        self._fd = fd
+        self._old = old
+        self._active = True
+
+    def restore(self) -> None:
+        if not self._active or self._fd is None or self._old is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        finally:
+            self._active = False
+            self._fd = None
+            self._old = None
+
+
 def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
     try:
-        tty.setcbreak(fd)
         prompt.redraw()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.1)
@@ -174,8 +209,8 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
             line = prompt.handle_key(ch)
             if line is not None:
                 outbound.put(line)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except (EOFError, OSError):
+        return
 
 
 def is_plausible_command_payload(payload: bytes) -> bool:
@@ -250,6 +285,9 @@ def main() -> int:
     prompt = PromptState(sender=sender)
     stream_printer = StreamPrinter(prompt=prompt)
     outbound: "queue.Queue[str]" = queue.Queue()
+    terminal = TerminalModeGuard()
+    terminal.enable()
+    atexit.register(terminal.restore)
     threading.Thread(target=input_loop, args=(outbound, prompt), daemon=True).start()
     print(
         f"connected to SPI bus {args.bus}.{args.device} @ {args.speed} Hz. "
@@ -293,9 +331,10 @@ def main() -> int:
                     pass
                 time.sleep(poll_delay_s)
     except KeyboardInterrupt:
-        bus.close()
+        terminal.restore()
         return 0
     finally:
+        terminal.restore()
         try:
             bus.close()
         except Exception:

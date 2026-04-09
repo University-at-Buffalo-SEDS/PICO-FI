@@ -49,6 +49,8 @@ pub enum UpstreamMode {
     SpiEcho,
     /// Uses the SPI transport to serve a fixed diagnostic response frame.
     SpiStatic,
+    /// Drives the SPI MISO line high as a plain GPIO for electrical diagnostics.
+    SpiLineHigh,
     /// Uses the simple TCP test mode instead of the normal bridge protocol.
     Test,
 }
@@ -144,6 +146,9 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
         ["set", "upstream", "spi_static"] | ["set", "upstream", "spistatic"] => {
             Ok(Command::SetUpstream(UpstreamMode::SpiStatic))
         }
+        ["set", "upstream", "spi_line_high"]
+        | ["set", "upstream", "spilinehigh"]
+        | ["set", "upstream", "spi_line"] => Ok(Command::SetUpstream(UpstreamMode::SpiLineHigh)),
         ["set", "upstream", "test"] => Ok(Command::SetUpstream(UpstreamMode::Test)),
         ["reset"] => Ok(Command::Reset),
         _ => Err("unknown command"),
@@ -234,6 +239,9 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
         UpstreamMode::SpiStatic => {
             let _ = out.push_str(" upstream=spi_static");
+        }
+        UpstreamMode::SpiLineHigh => {
+            let _ = out.push_str(" upstream=spi_line_high");
         }
         UpstreamMode::Test => {
             let _ = out.push_str(" upstream=test");

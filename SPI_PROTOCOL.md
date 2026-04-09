@@ -2,6 +2,9 @@
 
 This project uses a framed SPI protocol between a Linux SPI master and the Pico acting as an `SPI1` slave.
 
+The Linux master should use SPI mode `1` (`CPOL=0`, `CPHA=1`). The firmware's
+PIO slave is timed for that mode.
+
 ## Electrical setup
 
 The Pico upstream SPI slave uses:

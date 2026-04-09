@@ -14,13 +14,6 @@
     "remote_port": 5000
   },
   "upstream": {
-    "transport": "spi",
-    "usb": {
-      "manufacturer": "UBSEDS",
-      "product": "CHUD-USB-PICO-FI",
-      "serial_number": "CHUD-FI",
-      "comm_interface": "Bridge Control",
-      "data_interface": "Bridge Data"
-    }
+    "transport": "spi_line_high"
   }
 }

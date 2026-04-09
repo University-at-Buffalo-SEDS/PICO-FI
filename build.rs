@@ -149,6 +149,7 @@ fn render_upstream_mode(upstream: &JsonUpstreamConfig) -> String {
         "usb" => "UpstreamMode::Usb".to_owned(),
         "spi_echo" | "spiecho" => "UpstreamMode::SpiEcho".to_owned(),
         "spi_static" | "spistatic" => "UpstreamMode::SpiStatic".to_owned(),
+        "spi_line_high" | "spilinehigh" | "spi_line" => "UpstreamMode::SpiLineHigh".to_owned(),
         "test" => "UpstreamMode::Test".to_owned(),
         other => panic!("unsupported upstream.transport: {other}"),
     }
