@@ -1,10 +1,14 @@
-//! UART upstream bridge implementation.
+//! UART upstream bridge implementation using framed request/response packets.
 
-use crate::bridge::commands::signal_led_activity;
+use crate::bridge::commands::{render_local_bridge_command, signal_led_activity, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteByteRing;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
+use crate::protocol::i2c::{
+    FRAME_SIZE, RequestFrame, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, make_response_frame,
+    parse_request_frame,
+};
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
@@ -14,10 +18,10 @@ use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read, Write};
 use portable_atomic::{AtomicBool, Ordering};
-const UART_EGRESS_RING_BYTES: usize = 2048;
+
+const UART_EGRESS_RING_BYTES: usize = 4096;
 const UART_EGRESS_CHUNK_BYTES: usize = 256;
 
-/// Runs the UART bridge in TCP client mode with reconnect behavior.
 pub async fn run_client(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
@@ -50,8 +54,8 @@ pub async fn run_client(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-            .await
-            .is_err()
+        .await
+        .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -68,7 +72,6 @@ pub async fn run_client(
     }
 }
 
-/// Runs the UART bridge in TCP server mode.
 pub async fn run_server(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
@@ -92,8 +95,8 @@ pub async fn run_server(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-            .await
-            .is_err()
+        .await
+        .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -109,14 +112,13 @@ pub async fn run_server(
     }
 }
 
-/// Relays bytes between UART and the bridged TCP socket.
 async fn session(
     uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
-    _bridge_config: BridgeConfig,
-    _link_active: &AtomicBool,
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
 ) -> Result<(), ()> {
-    let mut uart_buf = [0u8; 1024];
+    let mut uart_frame = [0u8; FRAME_SIZE];
     let mut net_buf = [0u8; 256];
     let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
     let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
@@ -132,25 +134,30 @@ async fn session(
 
         if tx_chunk_pos < tx_chunk_len {
             match select3(
-                uart_rx.read(&mut uart_buf),
+                uart_rx.read_exact(&mut uart_frame),
                 socket.read(&mut net_buf),
                 uart_tx.write(&tx_chunk[tx_chunk_pos..tx_chunk_len]),
             )
             .await
             {
-                Either3::First(Ok(uart_n)) => {
-                    if uart_n == 0 {
-                        yield_now().await;
-                        continue;
-                    }
-                    forward_uart_bytes(Some(socket), &uart_buf[..uart_n]).await?;
+                Either3::First(Ok(())) => {
+                    handle_uart_request(
+                        &uart_frame,
+                        Some(socket),
+                        bridge_config,
+                        link_active,
+                        &mut egress_ring,
+                    )
+                    .await?;
                 }
                 Either3::First(Err(_)) => return Err(()),
                 Either3::Second(Ok(net_n)) => {
                     if net_n == 0 {
                         return Ok(());
                     }
-                    egress_ring.push_overwrite_slice(&net_buf[..net_n]);
+                    egress_ring.push_overwrite_slice(
+                        &make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
+                    );
                 }
                 Either3::Second(Err(_)) => return Err(()),
                 Either3::Third(Ok(written)) => {
@@ -166,36 +173,69 @@ async fn session(
                 Either3::Third(Err(_)) => return Err(()),
             }
         } else {
-            match select(uart_rx.read(&mut uart_buf), socket.read(&mut net_buf)).await {
-                Either::First(Ok(uart_n)) => {
-                    if uart_n == 0 {
-                        yield_now().await;
-                        continue;
-                    }
-                    forward_uart_bytes(Some(socket), &uart_buf[..uart_n]).await?;
+            match select(uart_rx.read_exact(&mut uart_frame), socket.read(&mut net_buf)).await {
+                Either::First(Ok(())) => {
+                    handle_uart_request(
+                        &uart_frame,
+                        Some(socket),
+                        bridge_config,
+                        link_active,
+                        &mut egress_ring,
+                    )
+                    .await?;
                 }
                 Either::First(Err(_)) => return Err(()),
                 Either::Second(Ok(net_n)) => {
                     if net_n == 0 {
                         return Ok(());
                     }
-                    egress_ring.push_overwrite_slice(&net_buf[..net_n]);
+                    egress_ring.push_overwrite_slice(
+                        &make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
+                    );
                 }
                 Either::Second(Err(_)) => return Err(()),
             }
         }
+
+        if tx_chunk_pos >= tx_chunk_len && egress_ring.is_empty() {
+            yield_now().await;
+        }
     }
 }
 
-async fn forward_uart_bytes(
+async fn handle_uart_request(
+    frame: &[u8; FRAME_SIZE],
     socket: Option<&mut TcpSocket<'_>>,
-    bytes: &[u8],
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
 ) -> Result<(), ()> {
-    if let Some(socket) = socket {
-        if !bytes.is_empty() {
-            signal_led_activity();
-            write_socket(socket, bytes).await?;
+    match parse_request_frame(frame) {
+        Some(RequestFrame::Data(payload)) => {
+            if let Some(socket) = socket {
+                if !payload.is_empty() {
+                    signal_led_activity();
+                    write_socket(socket, payload).await?;
+                }
+            }
+            egress_ring.push_overwrite_slice(&make_response_frame(RESP_DATA_MAGIC, b""));
+            Ok(())
+        }
+        Some(RequestFrame::Command(payload)) => {
+            let line = trim_ascii_line(payload);
+            let response = render_local_bridge_command(bridge_config, link_active, line);
+            egress_ring.push_overwrite_slice(&make_response_frame(
+                RESP_COMMAND_MAGIC,
+                response.as_bytes(),
+            ));
+            Ok(())
+        }
+        None => {
+            egress_ring.push_overwrite_slice(&make_response_frame(
+                RESP_COMMAND_MAGIC,
+                b"error invalid uart frame",
+            ));
+            Ok(())
         }
     }
-    Ok(())
 }

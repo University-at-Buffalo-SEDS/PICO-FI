@@ -310,10 +310,11 @@ def main() -> int:
                         return 0
                     if not line:
                         continue
-                    prompt.print_line(f"[{sender}] {line}")
                     if stripped.startswith("/") and not stripped.startswith("//"):
+                        prompt.print_line(f"[pico] {stripped}")
                         pending.append((REQ_COMMAND_MAGIC, (stripped + "\n").encode("utf-8")))
                     else:
+                        prompt.print_line(f"[{sender}] {line}")
                         pending.append((REQ_MAGIC, f"[{sender}] {line}\n".encode("utf-8")))
             except queue.Empty:
                 pass
