@@ -215,7 +215,7 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
 
 def is_plausible_command_payload(payload: bytes) -> bool:
     if not payload:
-        return True
+        return False
     return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
 
 

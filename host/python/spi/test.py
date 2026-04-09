@@ -58,7 +58,7 @@ def format_bytes(data: bytes) -> str:
 
 def is_plausible_command_payload(payload: bytes) -> bool:
     if not payload:
-        return True
+        return False
     return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
 
 

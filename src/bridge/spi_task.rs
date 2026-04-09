@@ -14,13 +14,17 @@ use embassy_rp::dma::Channel;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIO1};
 use embassy_rp::pio::{
-    Common, Config as PioConfig, Direction as PioDirection, Pio, ShiftDirection,
+    Common, Config as PioConfig, Direction as PioDirection, Pio, PioBatch, ShiftDirection,
 };
 use embassy_time::Timer;
+use pio::{InstructionOperands, WaitSource};
 use portable_atomic::AtomicBool;
 
+const SPI_PIO_INITIAL_SM: usize = 0;
 const SPI_PIO_CS_SM: usize = 1;
 const SPI_PIO_IO_SM: usize = 2;
+const SPI_TX_FIFO_PRELOAD_BYTES: usize = 16;
+const SPI_IRQ_ARM: usize = 7;
 const SPI_IRQ_CS_FALLING: usize = 1;
 const SPI_IRQ_CS_RISING: usize = 2;
 
@@ -71,17 +75,22 @@ pub async fn spi_poll_task(
     let irq_flags = pio.irq_flags.clone();
     let mut cs_irq = pio.irq1;
     let mut cs_release_irq = pio.irq2;
+    let mut initial_sm = pio.sm0;
     let mut cs_sm = pio.sm1;
     let mut io_sm = pio.sm2;
 
     let cs_program = PioSpiCsProgram::new(&mut common);
-    let io_program = PioSpiMode1Program::new(&mut common);
+    let io_program = PioSpiMode3Program::new(&mut common);
     configure_cs_sm(&mut common, &mut cs_sm, cs, &cs_program);
+    configure_initial_sm(&mut common, &mut initial_sm, &io_program);
     configure_io_sm(&mut common, &mut io_sm, sclk, miso, mosi, &io_program);
 
     irq_flags.clear_all(0xff);
     cs_sm.set_enable(true);
+    initial_sm.set_enable(false);
     io_sm.set_enable(false);
+    initial_sm.clear_fifos();
+    initial_sm.restart();
     io_sm.clear_fifos();
     io_sm.restart();
 
@@ -108,27 +117,47 @@ pub async fn spi_poll_task(
 
         let staged_tx = transport.staged_response();
         rx_frame.fill(0);
+        irq_flags.clear(SPI_IRQ_ARM);
         irq_flags.clear(SPI_IRQ_CS_FALLING);
         irq_flags.clear(SPI_IRQ_CS_RISING);
+        initial_sm.clear_fifos();
+        initial_sm.restart();
         io_sm.clear_fifos();
         io_sm.restart();
+
+        arm_transaction_state_machines(&mut initial_sm, &mut io_sm, &io_program);
+        preload_tx_fifo(&mut io_sm, &staged_tx);
 
         let tx_fifo_ptr = io_sm.tx_fifo_ptr() as *mut u8;
         let rx_fifo_ptr = io_sm.rx_fifo_ptr() as *const u8;
         let tx_treq = io_sm.tx_treq();
         let rx_treq = io_sm.rx_treq();
         {
-            let tx_transfer =
-                unsafe { tx_dma.write(staged_tx.as_slice(), tx_fifo_ptr, tx_treq, false) };
+            let tx_transfer = unsafe {
+                tx_dma.write(
+                    &staged_tx[SPI_TX_FIFO_PRELOAD_BYTES..],
+                    tx_fifo_ptr,
+                    tx_treq,
+                    false,
+                )
+            };
             let rx_transfer = unsafe { rx_dma.read(rx_fifo_ptr, &mut rx_frame, rx_treq, false) };
-            io_sm.set_enable(true);
+            let mut batch = PioBatch::new();
+            batch.restart(&mut initial_sm);
+            batch.restart(&mut io_sm);
+            batch.set_enable(&mut initial_sm, true);
+            batch.set_enable(&mut io_sm, true);
+            batch.execute();
             cs_irq.wait().await;
             irq_flags.clear(SPI_IRQ_CS_FALLING);
             cs_release_irq.wait().await;
             let _keep_alive = (&tx_transfer, &rx_transfer);
-        };
+        }
         let received = rx_bytes_received(&rx_dma, &rx_frame);
+        initial_sm.set_enable(false);
         io_sm.set_enable(false);
+        initial_sm.clear_fifos();
+        initial_sm.restart();
         io_sm.clear_fifos();
         io_sm.restart();
         irq_flags.clear(SPI_IRQ_CS_RISING);
@@ -170,6 +199,7 @@ impl<'d> PioSpiCsProgram<'d> {
                 .side_set 1 pindirs
                 .wrap_target
                 wait 0 gpio 13 side 0
+                irq set 7 side 1
                 irq set 1 side 1
                 wait 1 gpio 13 side 1
                 irq set 2 side 0
@@ -182,11 +212,12 @@ impl<'d> PioSpiCsProgram<'d> {
     }
 }
 
-struct PioSpiMode1Program<'d> {
+struct PioSpiMode3Program<'d> {
     loaded: embassy_rp::pio::LoadedProgram<'d, PIO1>,
+    initial_check_addr: u8,
 }
 
-impl<'d> PioSpiMode1Program<'d> {
+impl<'d> PioSpiMode3Program<'d> {
     fn new(common: &mut Common<'d, PIO1>) -> Self {
         let prg = pio::pio_asm!(
             r#"
@@ -201,10 +232,16 @@ impl<'d> PioSpiMode1Program<'d> {
                 in pins, 1
                 push iffull noblock
                 .wrap
+                public initial_check:
+                jmp y-- wait_falling
+                irq set 0
+                jmp wait_falling
             "#
         );
+        let loaded = common.load_program(&prg.program);
         Self {
-            loaded: common.load_program(&prg.program),
+            initial_check_addr: loaded.origin + prg.public_defines.initial_check as u8,
+            loaded,
         }
     }
 }
@@ -224,13 +261,33 @@ fn configure_cs_sm<'d>(
     cs_sm.set_pin_dirs(PioDirection::In, &[&miso_pin]);
 }
 
+fn configure_initial_sm<'d>(
+    common: &mut Common<'d, PIO1>,
+    initial_sm: &mut embassy_rp::pio::StateMachine<'d, PIO1, SPI_PIO_INITIAL_SM>,
+    program: &PioSpiMode3Program<'d>,
+) {
+    let mosi_pin = common.make_pio_pin(unsafe { PIN_12::steal() });
+
+    let mut cfg = PioConfig::default();
+    cfg.use_program(&program.loaded, &[]);
+    cfg.set_in_pins(&[&mosi_pin]);
+    cfg.shift_in.auto_fill = false;
+    cfg.shift_in.direction = ShiftDirection::Left;
+    cfg.shift_in.threshold = 8;
+    let mut exec = cfg.get_exec();
+    exec.wrap_bottom = program.initial_check_addr;
+    unsafe { cfg.set_exec(exec) };
+    initial_sm.set_config(&cfg);
+    initial_sm.set_pin_dirs(PioDirection::In, &[&mosi_pin]);
+}
+
 fn configure_io_sm<'d>(
     common: &mut Common<'d, PIO1>,
     io_sm: &mut embassy_rp::pio::StateMachine<'d, PIO1, SPI_PIO_IO_SM>,
     sclk: Peri<'d, PIN_10>,
     miso: Peri<'d, PIN_11>,
     mosi: Peri<'d, PIN_12>,
-    program: &PioSpiMode1Program<'d>,
+    program: &PioSpiMode3Program<'d>,
 ) {
     let sclk_pin = common.make_pio_pin(sclk);
     let miso_pin = common.make_pio_pin(miso);
@@ -251,6 +308,38 @@ fn configure_io_sm<'d>(
     io_sm.set_pins(Level::Low, &[&miso_pin]);
     io_sm.set_pin_dirs(PioDirection::Out, &[&miso_pin]);
     io_sm.set_pin_dirs(PioDirection::In, &[&sclk_pin, &mosi_pin]);
+}
+
+fn arm_transaction_state_machines(
+    initial_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_INITIAL_SM>,
+    io_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_IO_SM>,
+    program: &PioSpiMode3Program<'_>,
+) {
+    const WAIT_IRQ7: u16 = InstructionOperands::WAIT {
+        polarity: 1,
+        source: WaitSource::IRQ,
+        index: SPI_IRQ_ARM as u8,
+        relative: false,
+    }
+    .encode();
+
+    unsafe {
+        initial_sm.set_y(7);
+        initial_sm.exec_jmp(program.initial_check_addr);
+        io_sm.exec_jmp(program.loaded.origin);
+        initial_sm.exec_instr(WAIT_IRQ7);
+        io_sm.exec_instr(WAIT_IRQ7);
+    }
+}
+
+fn preload_tx_fifo(
+    io_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_IO_SM>,
+    frame: &[u8; FRAME_SIZE],
+) {
+    let tx = io_sm.tx();
+    for chunk in frame[..SPI_TX_FIFO_PRELOAD_BYTES].chunks_exact(4) {
+        tx.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
 }
 
 fn rx_bytes_received(rx_dma: &Channel<'_>, rx_frame: &[u8; FRAME_SIZE]) -> usize {

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import queue
 import select
@@ -117,11 +118,36 @@ class PromptState:
             return None
 
 
+class TerminalModeGuard:
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._old: list | None = None
+        self._active = False
+
+    def enable(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        self._fd = fd
+        self._old = old
+        self._active = True
+
+    def restore(self) -> None:
+        if not self._active or self._fd is None or self._old is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        finally:
+            self._active = False
+            self._fd = None
+            self._old = None
+
+
 def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
     try:
-        tty.setcbreak(fd)
         prompt.redraw()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.1)
@@ -131,8 +157,8 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
             line = prompt.handle_key(ch)
             if line is not None:
                 outbound.put(line)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except (EOFError, OSError):
+        return
 
 
 def exchange_packet(
@@ -180,6 +206,9 @@ def main() -> int:
     sender = args.sender or default_sender_label()
     prompt = PromptState(sender=sender)
     outbound: "queue.Queue[str]" = queue.Queue()
+    terminal = TerminalModeGuard()
+    terminal.enable()
+    atexit.register(terminal.restore)
     threading.Thread(target=input_loop, args=(outbound, prompt), daemon=True).start()
     print(
         f"connected to I2C bus {args.bus} @ addr 0x{args.addr:02x}. "
@@ -229,9 +258,10 @@ def main() -> int:
                     pass
                 time.sleep(poll_delay_s)
     except KeyboardInterrupt:
-        bus.close()
+        terminal.restore()
         return 0
     finally:
+        terminal.restore()
         try:
             bus.close()
         except Exception:

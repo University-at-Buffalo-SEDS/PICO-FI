@@ -18,7 +18,7 @@ const REQ_DATA_MAGIC: u8 = 0xA5;
 const REQ_COMMAND_MAGIC: u8 = 0xA6;
 const RESP_DATA_MAGIC: u8 = 0x5A;
 const RESP_COMMAND_MAGIC: u8 = 0x5B;
-const SPI_MODE: u8 = 1;
+const SPI_MODE: u8 = 3;
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -134,7 +134,10 @@ impl SpiBackend {
 
         for _ in 0..50 {
             match self.read_frame()? {
-                Frame::Command(bytes) => return Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                Frame::Command(bytes) if !bytes.is_empty() => {
+                    return Ok(String::from_utf8_lossy(&bytes).into_owned())
+                }
+                Frame::Command(_) => thread::sleep(self.poll_delay),
                 Frame::Data(_) => thread::sleep(self.poll_delay),
             }
         }

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import select
 import shutil
 import socket
@@ -92,6 +93,33 @@ class PromptState:
             return None
 
 
+class TerminalModeGuard:
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._old: list | None = None
+        self._active = False
+
+    def enable(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        self._fd = fd
+        self._old = old
+        self._active = True
+
+    def restore(self) -> None:
+        if not self._active or self._fd is None or self._old is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        finally:
+            self._active = False
+            self._fd = None
+            self._old = None
+
+
 def read_loop(ser: serial.Serial, prompt: PromptState) -> None:
     partial = ""
     while True:
@@ -120,9 +148,7 @@ def send_line(ser: serial.Serial, sender: str, line: str) -> None:
 
 def write_loop(ser: serial.Serial, prompt: PromptState) -> int:
     fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
     try:
-        tty.setcbreak(fd)
         prompt.redraw()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.1)
@@ -149,8 +175,6 @@ def write_loop(ser: serial.Serial, prompt: PromptState) -> int:
     except serial.SerialException as exc:
         prompt.print_line(f"[serial write error] {exc}")
         return 1
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def main() -> int:
@@ -167,6 +191,9 @@ def main() -> int:
         return 1
     sender = args.sender or default_sender_label()
     prompt = PromptState(sender=sender)
+    terminal = TerminalModeGuard()
+    terminal.enable()
+    atexit.register(terminal.restore)
     with ser:
         if args.label:
             print(f"[{args.label}] connected to {args.port} @ {args.baud}")
@@ -175,9 +202,12 @@ def main() -> int:
         print("plain text chats with the remote peer. / commands talk to the local Pico. //help for app help.")
         reader = threading.Thread(target=read_loop, args=(ser, prompt), daemon=True)
         reader.start()
-        status = write_loop(ser, prompt)
-        time.sleep(0.1)
-        return status
+        try:
+            status = write_loop(ser, prompt)
+            time.sleep(0.1)
+            return status
+        finally:
+            terminal.restore()
 
 
 if __name__ == "__main__":
