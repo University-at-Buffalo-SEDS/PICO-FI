@@ -1,6 +1,8 @@
 //! Framing helpers for the upstream PIO-backed SPI slave transport.
 
-use crate::protocol::i2c::{FRAME_SIZE, RESP_DATA_MAGIC, make_response_frame};
+use crate::protocol::i2c::{
+    FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_DATA_MAGIC, make_response_frame,
+};
 /// Result of one CS-bounded SPI transaction as seen by the future PIO backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionResult {
@@ -39,7 +41,7 @@ impl PioSpiTransportState {
         rx_frame: &[u8; FRAME_SIZE],
         received: usize,
     ) -> TransactionResult {
-        let received = received.min(FRAME_SIZE);
+        let (rx_frame, received) = normalize_request_frame(rx_frame, received);
         let received_any_nonzero = rx_frame.iter().take(received.max(8)).any(|&byte| byte != 0);
         let mut preview = [0u8; 8];
         let preview_len = received.max(preview.len()).min(FRAME_SIZE).min(preview.len());
@@ -52,7 +54,7 @@ impl PioSpiTransportState {
         let result = if !received_any_nonzero {
             TransactionResult::IdlePoll { received, preview }
         } else if expected <= FRAME_SIZE && received.max(8) >= expected {
-            TransactionResult::Complete(*rx_frame)
+            TransactionResult::Complete(rx_frame)
         } else {
             TransactionResult::Partial { received, expected }
         };
@@ -60,6 +62,35 @@ impl PioSpiTransportState {
         self.staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
         result
     }
+}
+
+fn normalize_request_frame(
+    rx_frame: &[u8; FRAME_SIZE],
+    received: usize,
+) -> ([u8; FRAME_SIZE], usize) {
+    let received = received.min(FRAME_SIZE);
+    if matches!(rx_frame[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+        return (*rx_frame, received);
+    }
+
+    let scan_len = received.max(8).min(FRAME_SIZE);
+    for offset in 1..scan_len {
+        if !matches!(rx_frame[offset], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+            continue;
+        }
+
+        let mut normalized = [0u8; FRAME_SIZE];
+        let copied = FRAME_SIZE - offset;
+        normalized[..copied].copy_from_slice(&rx_frame[offset..]);
+
+        let adjusted_received = received
+            .saturating_sub(offset)
+            .max(scan_len.saturating_sub(offset))
+            .min(FRAME_SIZE);
+        return (normalized, adjusted_received);
+    }
+
+    (*rx_frame, received)
 }
 
 #[cfg(test)]
@@ -119,5 +150,20 @@ mod tests {
             state.staged_response(),
             make_response_frame(RESP_DATA_MAGIC, b"")
         );
+    }
+
+    #[test]
+    fn normalizes_shifted_command_frame() {
+        let mut state = PioSpiTransportState::new();
+        let mut frame = [0u8; FRAME_SIZE];
+        frame[1..7].copy_from_slice(&[0xa6, 0x04, b'p', b'i', b'n', b'g']);
+        match state.finish_transaction(&frame, 7) {
+            TransactionResult::Complete(frame) => {
+                assert_eq!(frame[0], 0xa6);
+                assert_eq!(frame[1], 0x04);
+                assert_eq!(&frame[2..6], b"ping");
+            }
+            other => panic!("expected normalized complete frame, got {other:?}"),
+        }
     }
 }

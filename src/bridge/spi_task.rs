@@ -34,6 +34,7 @@ const SPI_RX_DMA_CHANNEL: usize = 3;
 const SPI_LOCAL_RESPONSE_WAIT_MS: u64 = 5;
 const SPI_COMMAND_RESPONSE_WAIT_MS: u64 = 100;
 const SPI_DMA_SETTLE_SPINS: usize = 4096;
+const SPI_TX_FIFO_PRELOAD_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Default)]
 struct TransactionStats {
@@ -139,12 +140,15 @@ pub async fn spi_poll_task(
             &io_program,
         );
 
+        let tx_preload = preload_tx_fifo(&mut io_sm, &staged_tx);
         let tx_fifo_ptr = io_sm.tx_fifo_ptr() as *mut u8;
         let rx_fifo_ptr = io_sm.rx_fifo_ptr() as *const u8;
         let tx_treq = io_sm.tx_treq();
         let rx_treq = io_sm.rx_treq();
         {
-            let tx_transfer = unsafe { tx_dma.write(&staged_tx, tx_fifo_ptr, tx_treq, false) };
+            let tx_transfer = unsafe {
+                tx_dma.write(&staged_tx[tx_preload..], tx_fifo_ptr, tx_treq, false)
+            };
             let rx_transfer = unsafe { rx_dma.read(rx_fifo_ptr, &mut rx_frame, rx_treq, false) };
             let mut batch = PioBatch::new();
             batch.restart(&mut initial_sm);
@@ -185,6 +189,20 @@ pub async fn spi_poll_task(
             transport.stage_response(next);
         }
     }
+}
+
+fn preload_tx_fifo(
+    io_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_IO_SM>,
+    frame: &[u8; FRAME_SIZE],
+) -> usize {
+    let tx = io_sm.tx();
+    let preload = SPI_TX_FIFO_PRELOAD_BYTES.min(FRAME_SIZE);
+    let mut count = 0usize;
+    while count < preload && !tx.full() {
+        tx.push(frame[count] as u32);
+        count += 1;
+    }
+    count
 }
 
 struct PioSpiCsProgram<'d> {
