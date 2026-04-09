@@ -38,14 +38,24 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        let _ = writeln_line(uart, "spi client: connecting").await;
-        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
+        loop {
+            let _ = writeln_line(uart, "spi client: connecting").await;
+            match select(
+                spi_rx.pop(),
+                connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
+            )
             .await
-            .is_err()
-        {
-            let _ = writeln_line(uart, "spi client: connect failed").await;
-            Timer::after_millis(runtime.reconnect_delay_ms).await;
-            continue;
+            {
+                Either::First(frame) => {
+                    handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx)
+                        .await?;
+                }
+                Either::Second(Ok(())) => break,
+                Either::Second(Err(_)) => {
+                    let _ = writeln_line(uart, "spi client: connect failed").await;
+                    Timer::after_millis(runtime.reconnect_delay_ms).await;
+                }
+            }
         }
         socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
         let _ = writeln_line(uart, "spi client: connected").await;
@@ -98,9 +108,17 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        let _ = writeln_line(uart, "spi server: listening").await;
-        if socket.accept(port).await.is_err() {
-            return Err(());
+        runtime.link_active.store(false, Ordering::Relaxed);
+        loop {
+            let _ = writeln_line(uart, "spi server: listening").await;
+            match select(spi_rx.pop(), socket.accept(port)).await {
+                Either::First(frame) => {
+                    handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx)
+                        .await?;
+                }
+                Either::Second(Ok(())) => break,
+                Either::Second(Err(_)) => return Err(()),
+            }
         }
         socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
         let _ = writeln_line(uart, "spi server: accepted").await;

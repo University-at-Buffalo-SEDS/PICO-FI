@@ -40,12 +40,36 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
-        if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
-            .await
-            .is_err()
         {
-            Timer::after_millis(runtime.reconnect_delay_ms).await;
-            continue;
+            let (uart_tx, uart_rx) = uart.split_ref();
+            let mut uart_frame = [0u8; FRAME_SIZE];
+            let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
+
+            loop {
+                match select(
+                    uart_rx.read_exact(&mut uart_frame),
+                    connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
+                )
+                .await
+                {
+                    Either::First(Ok(())) => {
+                        handle_uart_request(
+                            &uart_frame,
+                            None,
+                            bridge_config,
+                            runtime.link_active,
+                            &mut egress_ring,
+                        )
+                        .await?;
+                        flush_uart_egress(uart_tx, &mut egress_ring).await?;
+                    }
+                    Either::First(Err(_)) => return Err(()),
+                    Either::Second(Ok(())) => break,
+                    Either::Second(Err(_)) => {
+                        Timer::after_millis(runtime.reconnect_delay_ms).await;
+                    }
+                }
+            }
         }
         socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
         if exchange_link_handshake(
@@ -85,8 +109,30 @@ pub async fn run_server(
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_keep_alive(Some(Duration::from_secs(5)));
 
-        if socket.accept(port).await.is_err() {
-            return Err(());
+        runtime.link_active.store(false, Ordering::Relaxed);
+        {
+            let (uart_tx, uart_rx) = uart.split_ref();
+            let mut uart_frame = [0u8; FRAME_SIZE];
+            let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
+
+            loop {
+                match select(uart_rx.read_exact(&mut uart_frame), socket.accept(port)).await {
+                    Either::First(Ok(())) => {
+                        handle_uart_request(
+                            &uart_frame,
+                            None,
+                            bridge_config,
+                            runtime.link_active,
+                            &mut egress_ring,
+                        )
+                        .await?;
+                        flush_uart_egress(uart_tx, &mut egress_ring).await?;
+                    }
+                    Either::First(Err(_)) => return Err(()),
+                    Either::Second(Ok(())) => break,
+                    Either::Second(Err(_)) => return Err(()),
+                }
+            }
         }
         socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
         if exchange_link_handshake(
@@ -238,4 +284,20 @@ async fn handle_uart_request(
             Ok(())
         }
     }
+}
+
+async fn flush_uart_egress(
+    uart_tx: &mut impl Write,
+    egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
+) -> Result<(), ()> {
+    let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
+    while !egress_ring.is_empty() {
+        let chunk_len = egress_ring.pop_into(&mut tx_chunk);
+        if chunk_len == 0 {
+            break;
+        }
+        uart_tx.write_all(&tx_chunk[..chunk_len]).await.map_err(|_| ())?;
+        uart_tx.flush().await.map_err(|_| ())?;
+    }
+    Ok(())
 }

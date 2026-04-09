@@ -40,18 +40,18 @@ impl PioSpiTransportState {
         received: usize,
     ) -> TransactionResult {
         let received = received.min(FRAME_SIZE);
-        let received_any_nonzero = rx_frame[..received].iter().any(|&byte| byte != 0);
+        let received_any_nonzero = rx_frame.iter().take(received.max(8)).any(|&byte| byte != 0);
         let mut preview = [0u8; 8];
-        let preview_len = received.min(preview.len());
+        let preview_len = received.max(preview.len()).min(FRAME_SIZE).min(preview.len());
         preview[..preview_len].copy_from_slice(&rx_frame[..preview_len]);
-        let expected = if received >= 2 {
+        let expected = if received >= 2 || (rx_frame[0] != 0 || rx_frame[1] != 0) {
             (rx_frame[1] as usize + 2).min(FRAME_SIZE)
         } else {
             FRAME_SIZE
         };
-        let result = if received == 0 || !received_any_nonzero {
+        let result = if !received_any_nonzero {
             TransactionResult::IdlePoll { received, preview }
-        } else if received >= 2 && received >= expected {
+        } else if expected <= FRAME_SIZE && received.max(8) >= expected {
             TransactionResult::Complete(*rx_frame)
         } else {
             TransactionResult::Partial { received, expected }
