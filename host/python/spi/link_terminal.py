@@ -219,15 +219,6 @@ def is_plausible_command_payload(payload: bytes) -> bool:
     return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
 
 
-def flush_stale_command_frames(bus) -> None:
-    for _ in range(4):
-        rx_magic, rx_payload = parse_frame(bus.read_frame())
-        if rx_magic == RESP_DATA_MAGIC and not rx_payload:
-            return
-        if rx_magic == 0:
-            return
-
-
 def exchange_frame(
     bus,
     prompt: PromptState,
@@ -247,7 +238,6 @@ def exchange_frame(
             return
 
         for _ in range(COMMAND_RETRY_LIMIT):
-            flush_stale_command_frames(bus)
             first_rx = bus.write_frame(build_frame(payload, magic))
             rx_magic, rx_payload = parse_frame(first_rx)
             if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
@@ -330,7 +320,7 @@ def main() -> int:
                         stream_printer.feed(payload)
                 except Exception:
                     pass
-                time.sleep(poll_delay_s)
+                time.sleep(max(poll_delay_s, 0.1))
     except KeyboardInterrupt:
         terminal.restore()
         return 0
