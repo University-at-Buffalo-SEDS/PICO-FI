@@ -109,7 +109,6 @@ def recv_loop(
             continue
         payload = bytes(packet.payload).decode("utf-8", errors="replace")
         printer.line(f"[rx] {packet.sender}: {payload}")
-        printer.prompt()
 
 
 def main() -> int:
@@ -122,7 +121,7 @@ def main() -> int:
         default=["GROUND_STATION"],
         help="Packet endpoint name or integer value; may be repeated",
     )
-    parser.add_argument("--poll-ms", type=int, default=50)
+    parser.add_argument("--poll-ms", type=int, default=5)
     backends = parser.add_subparsers(dest="backend", required=True)
 
     uart = backends.add_parser("uart")

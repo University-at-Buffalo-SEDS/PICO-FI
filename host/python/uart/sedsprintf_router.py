@@ -37,8 +37,8 @@ except ImportError:
 
 class UartRouterAdapter:
     payload_limit = FRAME_SIZE - 2
-    minimum_poll_s = 0.01
-    send_reply_wait_s = 0.02
+    minimum_poll_s = 0.002
+    send_reply_wait_s = 0.005
 
     def __init__(self, port: str, speed: int) -> None:
         self.ser = open_serial(port, speed)
