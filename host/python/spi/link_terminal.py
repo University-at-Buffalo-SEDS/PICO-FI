@@ -214,7 +214,9 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
         return
 
 def exchange_frame(
-    bus,
+    bus_num: int,
+    device: int,
+    speed: int,
     prompt: PromptState,
     stream_printer: StreamPrinter,
     magic: int,
@@ -223,37 +225,25 @@ def exchange_frame(
     expect_command_reply: bool,
 ) -> None:
     try:
-        if magic != REQ_COMMAND_MAGIC or not expect_command_reply:
-            first_rx = bus.write_frame(build_frame(payload, magic))
-            rx_magic, rx_payload = parse_frame(first_rx)
-            if rx_magic == 0:
-                rx_magic, rx_payload = parse_frame(bus.read_frame())
-            if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
-                stream_printer.feed(rx_payload)
-                stream_printer.flush_partial()
-            return
-
-        last_magic = 0
-        last_payload = b""
-        deadline = time.monotonic() + COMMAND_TIMEOUT_S
-        for _ in range(COMMAND_RETRY_LIMIT):
-            if time.monotonic() >= deadline:
-                break
-            first_rx = bus.write_frame(build_frame(payload, magic))
-            rx_magic, rx_payload = parse_frame(first_rx)
-            last_magic, last_payload = rx_magic, rx_payload
-            if rx_magic == RESP_DATA_MAGIC and rx_payload:
-                stream_printer.feed(rx_payload)
-                stream_printer.flush_partial()
-            if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-                stream_printer.feed(rx_payload)
-                stream_printer.flush_partial()
+        with open_bus(bus_num, device, speed) as bus:
+            if magic != REQ_COMMAND_MAGIC or not expect_command_reply:
+                first_rx = bus.write_frame(build_frame(payload, magic))
+                rx_magic, rx_payload = parse_frame(first_rx)
+                if rx_magic == 0:
+                    rx_magic, rx_payload = parse_frame(bus.read_frame())
+                if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
                 return
-            time.sleep(poll_delay_s)
-            for _ in range(COMMAND_POLL_LIMIT):
+
+            last_magic = 0
+            last_payload = b""
+            deadline = time.monotonic() + COMMAND_TIMEOUT_S
+            for _ in range(COMMAND_RETRY_LIMIT):
                 if time.monotonic() >= deadline:
                     break
-                rx_magic, rx_payload = parse_frame(bus.read_frame())
+                first_rx = bus.write_frame(build_frame(payload, magic))
+                rx_magic, rx_payload = parse_frame(first_rx)
                 last_magic, last_payload = rx_magic, rx_payload
                 if rx_magic == RESP_DATA_MAGIC and rx_payload:
                     stream_printer.feed(rx_payload)
@@ -263,11 +253,24 @@ def exchange_frame(
                     stream_printer.flush_partial()
                     return
                 time.sleep(poll_delay_s)
-        if last_magic == RESP_COMMAND_MAGIC and last_payload:
-            stream_printer.feed(last_payload)
-            stream_printer.flush_partial()
-            return
-        prompt.print_line("[pico] command timed out waiting for SPI reply")
+                for _ in range(COMMAND_POLL_LIMIT):
+                    if time.monotonic() >= deadline:
+                        break
+                    rx_magic, rx_payload = parse_frame(bus.read_frame())
+                    last_magic, last_payload = rx_magic, rx_payload
+                    if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                        stream_printer.feed(rx_payload)
+                        stream_printer.flush_partial()
+                    if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+                        stream_printer.feed(rx_payload)
+                        stream_printer.flush_partial()
+                        return
+                    time.sleep(poll_delay_s)
+            if last_magic == RESP_COMMAND_MAGIC and last_payload:
+                stream_printer.feed(last_payload)
+                stream_printer.flush_partial()
+                return
+            prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")
 
@@ -281,7 +284,8 @@ def main() -> int:
     parser.add_argument("--sender", default="")
     args = parser.parse_args()
     try:
-        bus = open_bus(args.bus, args.device, args.speed)
+        with open_bus(args.bus, args.device, args.speed):
+            pass
     except Exception as exc:
         print(f"ERROR: Cannot open SPI bus {args.bus}.{args.device}: {exc}")
         print("Make sure SPI is enabled and wired to GPIO10/11/12/13")
@@ -311,7 +315,6 @@ def main() -> int:
                             prompt.print_line(help_line)
                         continue
                     if stripped == "//quit":
-                        bus.close()
                         return 0
                     if not line:
                         continue
@@ -329,7 +332,9 @@ def main() -> int:
             if pending:
                 magic, payload, expect_command_reply = pending.popleft()
                 exchange_frame(
-                    bus,
+                    args.bus,
+                    args.device,
+                    args.speed,
                     prompt,
                     stream_printer,
                     magic,
@@ -339,7 +344,8 @@ def main() -> int:
                 )
             else:
                 try:
-                    rx_magic, payload = parse_frame(bus.read_frame())
+                    with open_bus(args.bus, args.device, args.speed) as bus:
+                        rx_magic, payload = parse_frame(bus.read_frame())
                     if rx_magic == RESP_DATA_MAGIC and payload:
                         stream_printer.feed(payload)
                 except Exception:
@@ -350,10 +356,6 @@ def main() -> int:
         return 0
     finally:
         terminal.restore()
-        try:
-            bus.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

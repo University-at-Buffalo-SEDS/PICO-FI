@@ -28,6 +28,12 @@ class RawSpiBus:
         self.spi.bits_per_word = 8
         self.spi.max_speed_hz = speed_hz
 
+    def __enter__(self) -> "RawSpiBus":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def close(self) -> None:
         self.spi.close()
 
