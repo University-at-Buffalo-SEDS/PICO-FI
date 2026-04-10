@@ -111,6 +111,30 @@ def run_remote_spi_data(target: str, remote_root: str, text: str, speed: int, ex
     return run_checked(build_ssh_command(target, remote))
 
 
+def run_remote_spi_send(target: str, remote_root: str, text: str, speed: int) -> int:
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
+    remote = (
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        f"python3 test.py --verbose-raw --speed {speed} send {shlex.quote(text)}"
+    )
+    return run_checked(build_ssh_command(target, remote))
+
+
+def run_remote_spi_recv(target: str, remote_root: str, speed: int, expect: str | None) -> int:
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
+    remote = (
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        f"python3 test.py --verbose-raw --speed {speed} recv"
+    )
+    if expect:
+        remote += f" --expect {shlex.quote(expect)}"
+    return run_checked(build_ssh_command(target, remote))
+
+
 def run_local_uart_probe(python_bin: str, port: str, speed: int, count: int) -> int:
     return run_checked(
         [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "probe", "--count", str(count)]
@@ -125,6 +149,19 @@ def run_local_uart_command(python_bin: str, port: str, speed: int, text: str) ->
 
 def run_local_uart_data(python_bin: str, port: str, speed: int, text: str, expect: str) -> int:
     cmd = [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "data", text]
+    if expect:
+        cmd.extend(["--expect", expect])
+    return run_checked(cmd)
+
+
+def run_local_uart_send(python_bin: str, port: str, speed: int, text: str) -> int:
+    return run_checked(
+        [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "send", text]
+    )
+
+
+def run_local_uart_recv(python_bin: str, port: str, speed: int, expect: str | None) -> int:
+    cmd = [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "recv"]
     if expect:
         cmd.extend(["--expect", expect])
     return run_checked(cmd)
@@ -297,6 +334,10 @@ def main() -> int:
 
     spi_data = subparsers.add_parser("spi-data-echo", help="Run an end-to-end SPI data echo test through the Ethernet bridge")
     spi_data.add_argument("--text", default=None)
+    uart_to_spi = subparsers.add_parser("uart-to-spi", help="Send framed data into the local UART client Pico and receive it from the remote SPI server Pico")
+    uart_to_spi.add_argument("--text", default=None)
+    spi_to_uart = subparsers.add_parser("spi-to-uart", help="Send framed data into the remote SPI server Pico and receive it from the local UART client Pico")
+    spi_to_uart.add_argument("--text", default=None)
 
     subparsers.add_parser("uart-probe", help="Run the local UART probe")
 
@@ -338,6 +379,41 @@ def main() -> int:
             )
         finally:
             stop_process(echo_proc)
+    if args.command == "uart-to-spi":
+        payload = args.text or args.payload
+        rc = stage_remote_spi_tools(args.ssh_target)
+        if rc != 0:
+            return rc
+        recv_proc = subprocess.Popen(
+            build_ssh_command(
+                args.ssh_target,
+                (
+                    f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+                    f"python3 test.py --verbose-raw --speed {args.spi_speed} recv --expect {shlex.quote(payload)}"
+                ),
+            )
+        )
+        time.sleep(0.2)
+        try:
+            rc = run_local_uart_send(args.local_python, args.uart_port, args.uart_speed, payload)
+            if rc != 0:
+                return rc
+            return recv_proc.wait(timeout=10.0)
+        finally:
+            stop_process(recv_proc)
+    if args.command == "spi-to-uart":
+        payload = args.text or args.payload
+        recv_proc = subprocess.Popen(
+            [args.local_python, str(UART_TEST), "--port", args.uart_port, "--speed", str(args.uart_speed), "recv", "--expect", payload]
+        )
+        time.sleep(0.2)
+        try:
+            rc = run_remote_spi_send(args.ssh_target, args.remote_root, payload, args.spi_speed)
+            if rc != 0:
+                return rc
+            return recv_proc.wait(timeout=10.0)
+        finally:
+            stop_process(recv_proc)
     if args.command == "uart-probe":
         return run_local_uart_probe(args.local_python, args.uart_port, args.uart_speed, args.probe_count)
     if args.command == "uart-command":

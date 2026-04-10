@@ -121,18 +121,14 @@ pub async fn spi_poll_task(
     let static_frame = make_response_frame(RESP_COMMAND_MAGIC, b"pong");
     let mut transport = PioSpiTransportState::new();
     let mut rx_frame = [0u8; FRAME_SIZE];
-    let mut local_response_staged = false;
-
     loop {
         if static_mode {
             transport.stage_response(static_frame);
         } else if !echo_mode {
-            if !local_response_staged {
+            if is_default_empty_data_response(&transport.staged_response()) {
                 if let Some(resp) = rx_resp.try_pop() {
                     transport.stage_response(resp.data);
                 }
-            } else {
-                local_response_staged = false;
             }
         }
 
@@ -176,7 +172,6 @@ pub async fn spi_poll_task(
             if let Some(line) = extract_ascii_command(&rx_frame) {
                 let response = render_local_bridge_command(bridge_config, _link_active, line);
                 transport.stage_response(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
-                local_response_staged = true;
                 continue;
             }
         }
@@ -214,9 +209,12 @@ pub async fn spi_poll_task(
 
         if let Some(next) = finalize_transaction(result, bridge_config, _link_active, tx) {
             transport.stage_response(next);
-            local_response_staged = true;
         }
     }
+}
+
+fn is_default_empty_data_response(frame: &[u8; FRAME_SIZE]) -> bool {
+    frame[0] == RESP_DATA_MAGIC && frame[1] == 0
 }
 
 fn preload_tx_fifo(
@@ -540,7 +538,7 @@ fn finalize_transaction(
     result: TransactionResult,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    _tx: &'static OverwriteQueue<SpiFrame, 8>,
+    tx: &'static OverwriteQueue<SpiFrame, 8>,
 ) -> Option<[u8; FRAME_SIZE]> {
     match result {
         TransactionResult::IdlePoll { .. } => {
@@ -572,10 +570,9 @@ fn finalize_transaction(
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
                     }
-                    Some(make_response_frame(
-                        RESP_COMMAND_MAGIC,
-                        render_spi_diag("data", payload.len() + 2, payload.len() + 2, &frame[..8]).as_bytes(),
-                    ))
+                    let _ = payload;
+                    tx.push_overwrite(SpiFrame { data: frame });
+                    None
                 }
                 None => {
                     if let Some(line) = extract_ascii_command(&frame) {

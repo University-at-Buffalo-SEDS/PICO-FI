@@ -179,25 +179,13 @@ async fn session(
         }
 
         if tx_chunk_pos < tx_chunk_len {
-            match select3(
-                uart_rx.read_exact(&mut uart_frame),
+            match select(
                 socket.read(&mut net_buf),
                 uart_tx.write(&tx_chunk[tx_chunk_pos..tx_chunk_len]),
             )
             .await
             {
-                Either3::First(Ok(())) => {
-                    handle_uart_request(
-                        &uart_frame,
-                        Some(socket),
-                        bridge_config,
-                        link_active,
-                        &mut egress_ring,
-                    )
-                    .await?;
-                }
-                Either3::First(Err(_)) => return Err(()),
-                Either3::Second(Ok(net_n)) => {
+                Either::First(Ok(net_n)) => {
                     if net_n == 0 {
                         return Ok(());
                     }
@@ -205,8 +193,8 @@ async fn session(
                         &make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
                     );
                 }
-                Either3::Second(Err(_)) => return Err(()),
-                Either3::Third(Ok(written)) => {
+                Either::First(Err(_)) => return Err(()),
+                Either::Second(Ok(written)) => {
                     if written == 0 {
                         return Err(());
                     }
@@ -216,11 +204,20 @@ async fn session(
                         tx_chunk_len = 0;
                     }
                 }
-                Either3::Third(Err(_)) => return Err(()),
+                Either::Second(Err(_)) => return Err(()),
             }
         } else {
-            match select(uart_rx.read_exact(&mut uart_frame), socket.read(&mut net_buf)).await {
-                Either::First(Ok(())) => {
+            match select(socket.read(&mut net_buf), uart_rx.read_exact(&mut uart_frame)).await {
+                Either::First(Ok(net_n)) => {
+                    if net_n == 0 {
+                        return Ok(());
+                    }
+                    egress_ring.push_overwrite_slice(
+                        &make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
+                    );
+                }
+                Either::First(Err(_)) => return Err(()),
+                Either::Second(Ok(())) => {
                     handle_uart_request(
                         &uart_frame,
                         Some(socket),
@@ -229,15 +226,6 @@ async fn session(
                         &mut egress_ring,
                     )
                     .await?;
-                }
-                Either::First(Err(_)) => return Err(()),
-                Either::Second(Ok(net_n)) => {
-                    if net_n == 0 {
-                        return Ok(());
-                    }
-                    egress_ring.push_overwrite_slice(
-                        &make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
-                    );
                 }
                 Either::Second(Err(_)) => return Err(()),
             }
@@ -262,9 +250,11 @@ async fn handle_uart_request(
                 if !payload.is_empty() {
                     signal_led_activity();
                     write_socket(socket, payload).await?;
+                    egress_ring.push_overwrite_slice(&make_response_frame(RESP_DATA_MAGIC, b""));
                 }
+            } else {
+                egress_ring.push_overwrite_slice(&make_response_frame(RESP_DATA_MAGIC, b""));
             }
-            egress_ring.push_overwrite_slice(&make_response_frame(RESP_DATA_MAGIC, b""));
             Ok(())
         }
         Some(RequestFrame::Command(payload)) => {

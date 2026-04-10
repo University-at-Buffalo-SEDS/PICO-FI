@@ -81,6 +81,21 @@ fn normalize_request_frame(
         return (*rx_frame, received);
     }
 
+    if received >= 3 && rx_frame[0] == rx_frame[1] && rx_frame[0] <= (FRAME_SIZE - 2) as u8 {
+        let inferred_magic = if rx_frame[2] == b'/' {
+            Some(REQ_COMMAND_MAGIC)
+        } else {
+            Some(REQ_DATA_MAGIC)
+        };
+        if let Some(magic) = inferred_magic {
+            let mut normalized = [0u8; FRAME_SIZE];
+            normalized[0] = magic;
+            normalized[1] = rx_frame[0];
+            normalized[2..].copy_from_slice(&rx_frame[2..]);
+            return (normalized, received.saturating_add(1).min(FRAME_SIZE));
+        }
+    }
+
     let scan_len = received.max(8).min(FRAME_SIZE);
     for offset in 1..scan_len {
         if !matches!(rx_frame[offset], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {

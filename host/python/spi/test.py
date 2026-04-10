@@ -205,6 +205,14 @@ def main() -> int:
         default="",
         help="Substring expected in the returned data payload.",
     )
+    send_parser = subparsers.add_parser("send", help="Send framed data and only require a valid immediate response")
+    send_parser.add_argument("text")
+    recv_parser = subparsers.add_parser("recv", help="Poll with empty framed data frames until non-empty data is returned")
+    recv_parser.add_argument(
+        "--expect",
+        default="",
+        help="Substring expected in the returned data payload.",
+    )
     echo_parser = subparsers.add_parser("echo", help="Send a frame and verify it is echoed back on the next transfer")
     echo_parser.add_argument(
         "text",
@@ -248,6 +256,26 @@ def main() -> int:
             args.device,
             args.speed,
             args.text.encode(),
+            REQ_MAGIC,
+            await_nonempty_data=True,
+            expected_text=args.expect or None,
+            verbose_raw=args.verbose_raw,
+        )
+    if args.command == "send":
+        return spi_exchange(
+            args.bus,
+            args.device,
+            args.speed,
+            args.text.encode(),
+            REQ_MAGIC,
+            verbose_raw=args.verbose_raw,
+        )
+    if args.command == "recv":
+        return spi_exchange(
+            args.bus,
+            args.device,
+            args.speed,
+            b"",
             REQ_MAGIC,
             await_nonempty_data=True,
             expected_text=args.expect or None,

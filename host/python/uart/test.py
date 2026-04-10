@@ -72,6 +72,7 @@ def uart_exchange(
     payload: bytes,
     magic: int,
     await_nonempty_data: bool = False,
+    expect_valid_response: bool = True,
     expected_text: str | None = None,
 ) -> int:
     try:
@@ -84,13 +85,25 @@ def uart_exchange(
 
             rx = read_frame(ser, 2.0)
             if len(rx) != FRAME_SIZE:
-                print("ERROR: No UART frame response")
-                return 1
+                if await_nonempty_data and magic == REQ_DATA_MAGIC and not payload:
+                    for _ in range(DATA_POLL_LIMIT):
+                        time.sleep(0.05)
+                        ser.write(tx)
+                        ser.flush()
+                        rx = read_frame(ser, 0.5)
+                        if len(rx) == FRAME_SIZE:
+                            break
+                if len(rx) != FRAME_SIZE:
+                    print("ERROR: No UART frame response")
+                    return 1
 
             magic_val, length, body = parse_frame(rx)
             if await_nonempty_data and magic_val == RESP_DATA_MAGIC and not body:
                 for _ in range(DATA_POLL_LIMIT):
-                    rx = read_frame(ser, 0.2)
+                    time.sleep(0.05)
+                    ser.write(tx)
+                    ser.flush()
+                    rx = read_frame(ser, 0.5)
                     if len(rx) != FRAME_SIZE:
                         continue
                     magic_val, length, body = parse_frame(rx)
@@ -108,7 +121,9 @@ def uart_exchange(
                         file=sys.stderr,
                     )
                     return 1
-            return 0 if magic_val in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) else 1
+            if expect_valid_response:
+                return 0 if magic_val in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) else 1
+            return 0
     except serial.SerialException as exc:
         print(f"ERROR: Serial error - {exc}")
         print(f"Make sure device is connected to {port}")
@@ -127,6 +142,14 @@ def main() -> int:
     data_parser = subparsers.add_parser("data", help="Send framed data and optionally await a non-empty data reply")
     data_parser.add_argument("text")
     data_parser.add_argument(
+        "--expect",
+        default="",
+        help="Substring expected in the returned data payload.",
+    )
+    send_parser = subparsers.add_parser("send", help="Send framed data and only require a valid immediate response")
+    send_parser.add_argument("text")
+    recv_parser = subparsers.add_parser("recv", help="Poll with empty framed data packets until non-empty data is returned")
+    recv_parser.add_argument(
         "--expect",
         default="",
         help="Substring expected in the returned data payload.",
@@ -155,6 +178,22 @@ def main() -> int:
             args.port,
             args.speed,
             args.text.encode(),
+            REQ_DATA_MAGIC,
+            await_nonempty_data=True,
+            expected_text=args.expect or None,
+        )
+    if args.command == "send":
+        return uart_exchange(
+            args.port,
+            args.speed,
+            args.text.encode(),
+            REQ_DATA_MAGIC,
+        )
+    if args.command == "recv":
+        return uart_exchange(
+            args.port,
+            args.speed,
+            b"",
             REQ_DATA_MAGIC,
             await_nonempty_data=True,
             expected_text=args.expect or None,

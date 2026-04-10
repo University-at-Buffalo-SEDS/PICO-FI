@@ -201,18 +201,26 @@ def send_frame(ser: serial.Serial, magic: int, payload: bytes) -> None:
     ser.flush()
 
 
+def drain_data_frame(prompt: PromptState, frame: bytes | None) -> tuple[int, bytes]:
+    if frame is None:
+        return 0, b""
+    magic, payload = parse_frame(frame)
+    if magic == RESP_DATA_MAGIC and payload:
+        print_payload(prompt, payload)
+    return magic, payload
+
+
 def exchange_command(ser: serial.Serial, prompt: PromptState, command: str) -> None:
     send_frame(ser, REQ_COMMAND_MAGIC, (command + "\n").encode("utf-8"))
-    frame = read_frame(ser, 2.0)
-    if frame is None:
-        prompt.print_line("[pico] command timed out waiting for UART reply")
-        return
-    magic, payload = parse_frame(frame)
-    if magic != RESP_COMMAND_MAGIC:
-        prompt.print_line("[pico] invalid UART command reply")
-        return
-    if payload:
-        print_payload(prompt, payload)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        frame = read_frame(ser, min(0.25, max(0.0, deadline - time.monotonic())))
+        magic, payload = drain_data_frame(prompt, frame)
+        if magic == RESP_COMMAND_MAGIC:
+            if payload:
+                print_payload(prompt, payload)
+            return
+    prompt.print_line("[pico] command timed out waiting for UART reply")
 
 
 def main() -> int:

@@ -233,13 +233,20 @@ def exchange_frame(
             rx_magic, rx_payload = parse_frame(first_rx)
             if rx_magic == 0:
                 rx_magic, rx_payload = parse_frame(bus.read_frame())
-            if rx_magic == RESP_DATA_MAGIC and rx_payload:
+            if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
                 stream_printer.feed(rx_payload)
+                stream_printer.flush_partial()
             return
 
+        last_magic = 0
+        last_payload = b""
         for _ in range(COMMAND_RETRY_LIMIT):
             first_rx = bus.write_frame(build_frame(payload, magic))
             rx_magic, rx_payload = parse_frame(first_rx)
+            last_magic, last_payload = rx_magic, rx_payload
+            if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                stream_printer.feed(rx_payload)
+                stream_printer.flush_partial()
             if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
                 stream_printer.feed(rx_payload)
                 stream_printer.flush_partial()
@@ -247,11 +254,19 @@ def exchange_frame(
             time.sleep(poll_delay_s)
             for _ in range(COMMAND_POLL_LIMIT):
                 rx_magic, rx_payload = parse_frame(bus.read_frame())
+                last_magic, last_payload = rx_magic, rx_payload
+                if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
                 if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
                     stream_printer.feed(rx_payload)
                     stream_printer.flush_partial()
                     return
                 time.sleep(poll_delay_s)
+        if last_magic == RESP_COMMAND_MAGIC and last_payload:
+            stream_printer.feed(last_payload)
+            stream_printer.flush_partial()
+            return
         prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")
