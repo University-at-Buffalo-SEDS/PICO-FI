@@ -549,6 +549,9 @@ fn finalize_transaction(
             expected,
             frame,
         } => {
+            if let Some(recovered) = recover_duplicate_length_frame(&frame) {
+                return dispatch_recovered_frame(recovered, bridge_config, link_active, tx);
+            }
             if let Some(line) = extract_ascii_command(&frame) {
                 let response = render_local_bridge_command(bridge_config, link_active, line);
                 return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
@@ -559,27 +562,31 @@ fn finalize_transaction(
             ))
         }
         TransactionResult::Complete(frame) => {
-            match parse_request_frame(&frame) {
+            let parsed_frame = recover_duplicate_length_frame(&frame).unwrap_or(frame);
+            match parse_request_frame(&parsed_frame) {
                 Some(RequestFrame::Command(payload)) => {
                     let line = trim_ascii_line(payload);
                     if line.starts_with('/') {
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
                     } else {
-                        tx.push_overwrite(SpiFrame { data: frame });
+                        tx.push_overwrite(SpiFrame { data: parsed_frame });
                         None
                     }
                 }
                 Some(RequestFrame::Data(payload)) => {
-                    if let Some(line) = extract_ascii_command(&frame) {
+                    if let Some(line) = extract_ascii_command(&parsed_frame) {
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
                     }
                     let _ = payload;
-                    tx.push_overwrite(SpiFrame { data: frame });
+                    tx.push_overwrite(SpiFrame { data: parsed_frame });
                     None
                 }
                 None => {
+                    if let Some(recovered) = recover_duplicate_length_frame(&frame) {
+                        return dispatch_recovered_frame(recovered, bridge_config, link_active, tx);
+                    }
                     if let Some(line) = extract_ascii_command(&frame) {
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
@@ -592,6 +599,70 @@ fn finalize_transaction(
             }
         }
     }
+}
+
+fn dispatch_recovered_frame(
+    frame: [u8; FRAME_SIZE],
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    tx: &'static OverwriteQueue<SpiFrame, 8>,
+) -> Option<[u8; FRAME_SIZE]> {
+    match parse_request_frame(&frame) {
+        Some(RequestFrame::Command(payload)) => {
+            let line = trim_ascii_line(payload);
+            if line.starts_with('/') {
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
+            } else {
+                tx.push_overwrite(SpiFrame { data: frame });
+                None
+            }
+        }
+        Some(RequestFrame::Data(payload)) => {
+            let _ = payload;
+            tx.push_overwrite(SpiFrame { data: frame });
+            None
+        }
+        None => Some(make_response_frame(
+            RESP_COMMAND_MAGIC,
+            render_spi_diag("inv", 0, 0, &frame[..8]).as_bytes(),
+        )),
+    }
+}
+
+fn recover_duplicate_length_frame(frame: &[u8; FRAME_SIZE]) -> Option<[u8; FRAME_SIZE]> {
+    let len = frame[0] as usize;
+    if len == 0 || len > 96 || len > FRAME_SIZE - 2 || frame[0] != frame[1] {
+        return None;
+    }
+    let payload_start = frame[2];
+    if payload_start == 0 {
+        return None;
+    }
+    let preview_len = len.min(12);
+    if preview_len == 0 {
+        return None;
+    }
+    if !frame[2..2 + preview_len]
+        .iter()
+        .all(|&byte| byte == b'\n' || byte == b'\r' || byte == b'\t' || looks_like_text_byte(byte))
+    {
+        return None;
+    }
+    let mut recovered = [0u8; FRAME_SIZE];
+    recovered[0] = if payload_start == b'/' || looks_like_text_byte(payload_start) {
+        REQ_COMMAND_MAGIC
+    } else {
+        REQ_DATA_MAGIC
+    };
+    recovered[1] = frame[0];
+    recovered[2..].copy_from_slice(&frame[2..]);
+    Some(recovered)
+}
+
+fn looks_like_text_byte(byte: u8) -> bool {
+    matches!(byte, b'[' | b'{' | b'(' | b'-' | b'_' | b'.' | b'!' | b'?')
+        || byte.is_ascii_alphanumeric()
 }
 
 fn extract_ascii_command(frame: &[u8; FRAME_SIZE]) -> Option<&str> {
