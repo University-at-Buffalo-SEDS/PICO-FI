@@ -37,6 +37,9 @@ REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
 COMMAND_TIMEOUT_S = 2.0
+COMMAND_POLL_LIMIT = 50
+COMMAND_RETRY_LIMIT = 4
+PULL_COMMAND = b"/pull\n"
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -55,6 +58,19 @@ def parse_frame(frame: bytes) -> tuple[int, bytes]:
 
 def format_bytes(data: bytes, limit: int = 16) -> str:
     return " ".join(f"{b:02x}" for b in data[:limit])
+
+
+def is_plausible_command_payload(payload: bytes) -> bool:
+    if not payload:
+        return False
+    return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
+
+
+def emit_command_reply(prompt: PromptState, payload: bytes) -> None:
+    text = payload.decode("utf-8", errors="replace").replace("\r", "")
+    for line in text.split("\n"):
+        if line:
+            prompt.print_line(line)
 
 
 def print_help() -> list[str]:
@@ -211,6 +227,23 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
     except (EOFError, OSError):
         return
 
+
+@dataclass
+class TransactionThrottle:
+    min_gap_s: float
+    last_end_s: float | None = None
+
+    def wait_turn(self) -> None:
+        if self.last_end_s is None:
+            return
+        remaining = self.min_gap_s - (time.monotonic() - self.last_end_s)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def mark_complete(self) -> None:
+        self.last_end_s = time.monotonic()
+
+
 def exchange_frame(
     bus_num: int,
     device: int,
@@ -221,13 +254,16 @@ def exchange_frame(
     payload: bytes,
     poll_delay_s: float,
     expect_command_reply: bool,
+    throttle: TransactionThrottle | None = None,
 ) -> None:
     try:
+        if throttle is not None:
+            throttle.wait_turn()
         with open_bus(bus_num, device, speed) as bus:
-            first_rx = bus.write_frame(build_frame(payload, magic))
-            rx_magic, rx_payload = parse_frame(first_rx)
-            last_raw = first_rx
             if not expect_command_reply:
+                first_rx = bus.write_frame(build_frame(payload, magic))
+                rx_magic, rx_payload = parse_frame(first_rx)
+                last_raw = first_rx
                 if rx_magic == 0:
                     follow_rx = bus.read_frame()
                     last_raw = follow_rx
@@ -242,25 +278,29 @@ def exchange_frame(
                     stream_printer.flush_partial()
                 return
 
-            deadline = time.monotonic() + COMMAND_TIMEOUT_S
-            while True:
-                if rx_magic == RESP_DATA_MAGIC and rx_payload:
-                    stream_printer.feed(rx_payload)
-                    stream_printer.flush_partial()
-                elif rx_magic == RESP_COMMAND_MAGIC:
-                    if rx_payload:
-                        text = rx_payload.decode("utf-8", errors="replace").replace("\r", "")
-                        for line in text.split("\n"):
-                            if line:
-                                prompt.print_line(line)
+            last_raw = bytes(FRAME_SIZE)
+            rx_magic, rx_payload = 0, b""
+            for attempt in range(COMMAND_RETRY_LIMIT):
+                last_raw = bus.write_frame(build_frame(payload, magic))
+                rx_magic, rx_payload = parse_frame(last_raw)
+                if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+                    emit_command_reply(prompt, rx_payload)
                     return
 
-                if time.monotonic() >= deadline:
-                    break
+                deadline = time.monotonic() + COMMAND_TIMEOUT_S
+                polls = 0
+                while polls < COMMAND_POLL_LIMIT and time.monotonic() < deadline:
+                    if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                        stream_printer.feed(rx_payload)
+                        stream_printer.flush_partial()
+                    elif rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+                        emit_command_reply(prompt, rx_payload)
+                        return
 
-                time.sleep(max(poll_delay_s, 0.01))
-                last_raw = bus.read_frame()
-                rx_magic, rx_payload = parse_frame(last_raw)
+                    time.sleep(max(poll_delay_s, 0.01))
+                    last_raw = bus.read_frame()
+                    rx_magic, rx_payload = parse_frame(last_raw)
+                    polls += 1
 
             prompt.print_line(
                 "[spi dbg] command failed "
@@ -270,6 +310,39 @@ def exchange_frame(
             prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")
+    finally:
+        if throttle is not None:
+            throttle.mark_complete()
+
+
+def poll_inbound_data(
+    bus_num: int,
+    device: int,
+    speed: int,
+    poll_delay_s: float,
+    throttle: TransactionThrottle | None = None,
+) -> bytes:
+    try:
+        if throttle is not None:
+            throttle.wait_turn()
+        with open_bus(bus_num, device, speed) as bus:
+            rx = bus.write_frame(build_frame(PULL_COMMAND, REQ_COMMAND_MAGIC))
+            rx_magic, rx_payload = parse_frame(rx)
+            if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                return rx_payload
+            deadline = time.monotonic() + COMMAND_TIMEOUT_S
+            polls = 0
+            while polls < COMMAND_POLL_LIMIT and time.monotonic() < deadline:
+                time.sleep(max(poll_delay_s, 0.01))
+                rx = bus.read_frame()
+                rx_magic, rx_payload = parse_frame(rx)
+                if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                    return rx_payload
+                polls += 1
+        return b""
+    finally:
+        if throttle is not None:
+            throttle.mark_complete()
 
 
 def main() -> int:
@@ -302,6 +375,7 @@ def main() -> int:
     )
     try:
         pending: collections.deque[tuple[int, bytes, bool]] = collections.deque()
+        throttle = TransactionThrottle(min_gap_s=max(args.poll_ms / 1000.0, 0.05))
         while True:
             try:
                 while True:
@@ -321,7 +395,7 @@ def main() -> int:
                     else:
                         rendered = format_outbound_chat(sender, line)
                         prompt.print_line(rendered)
-                        pending.append((REQ_COMMAND_MAGIC, rendered.encode("utf-8"), False))
+                        pending.append((REQ_MAGIC, rendered.encode("utf-8"), False))
             except queue.Empty:
                 pass
 
@@ -338,12 +412,18 @@ def main() -> int:
                     payload,
                     poll_delay_s,
                     expect_command_reply,
+                    throttle,
                 )
             else:
                 try:
-                    with open_bus(args.bus, args.device, args.speed) as bus:
-                        rx_magic, payload = parse_frame(bus.read_frame())
-                    if rx_magic == RESP_DATA_MAGIC and payload:
+                    payload = poll_inbound_data(
+                        args.bus,
+                        args.device,
+                        args.speed,
+                        poll_delay_s,
+                        throttle,
+                    )
+                    if payload:
                         stream_printer.feed(payload)
                 except Exception:
                     pass

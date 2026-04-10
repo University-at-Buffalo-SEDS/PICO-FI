@@ -292,13 +292,12 @@ impl<'d> PioSpiCsProgram<'d> {
     fn new(common: &mut Common<'d, PIO1>) -> Self {
         let prg = pio::pio_asm!(
             r#"
-                .side_set 1 pindirs
                 .wrap_target
-                wait 0 gpio 13 side 0
-                irq set 7 side 1
-                irq set 1 side 1
-                wait 1 gpio 13 side 1
-                irq set 2 side 0
+                wait 0 gpio 13
+                irq set 7
+                irq set 1
+                wait 1 gpio 13
+                irq set 2
                 .wrap
             "#
         );
@@ -349,13 +348,11 @@ fn configure_cs_sm<'d>(
     cs: Peri<'d, PIN_13>,
     program: &PioSpiCsProgram<'d>,
 ) {
-    let miso_pin = common.make_pio_pin(unsafe { PIN_11::steal() });
     let _cs_pin = common.make_pio_pin(cs);
 
     let mut cfg = PioConfig::default();
-    cfg.use_program(&program.loaded, &[&miso_pin]);
+    cfg.use_program(&program.loaded, &[]);
     cs_sm.set_config(&cfg);
-    cs_sm.set_pin_dirs(PioDirection::In, &[&miso_pin]);
 }
 
 fn configure_initial_sm<'d>(

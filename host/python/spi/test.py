@@ -18,10 +18,11 @@ REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
+PULL_COMMAND = b"/pull\n"
 STALE_POLL_LIMIT = 4
 COMMAND_POLL_LIMIT = 50
 COMMAND_RETRY_LIMIT = 4
-DATA_POLL_LIMIT = 50
+DATA_POLL_LIMIT = 500
 PROBE_PAUSE_S = 0.02
 
 
@@ -79,6 +80,7 @@ def spi_exchange(
     payload: bytes,
     magic: int = REQ_MAGIC,
     require_valid_response: bool = True,
+    expect_command_reply: bool = False,
     await_nonempty_data: bool = False,
     expected_text: str | None = None,
     verbose_raw: bool = False,
@@ -93,7 +95,7 @@ def spi_exchange(
         rx = bytes(FRAME_SIZE)
         magic_val, length, body = 0, 0, b""
 
-        attempts = COMMAND_RETRY_LIMIT if magic == REQ_COMMAND_MAGIC else 1
+        attempts = COMMAND_RETRY_LIMIT if expect_command_reply else 1
         for attempt in range(attempts):
             first_rx = bus.write_frame(tx)
             first_magic, first_length, first_body = parse_frame(first_rx)
@@ -102,7 +104,7 @@ def spi_exchange(
 
             rx = first_rx
             magic_val, length, body = first_magic, first_length, first_body
-            if magic == REQ_COMMAND_MAGIC:
+            if expect_command_reply:
                 if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body):
                     break
                 time.sleep(0.01)
@@ -117,14 +119,14 @@ def spi_exchange(
             elif magic_val == 0:
                 rx = bus.read_frame()
                 magic_val, length, body = parse_frame(rx)
-                break
-            if await_nonempty_data and magic_val == RESP_MAGIC and not body:
+            if await_nonempty_data and not (magic_val == RESP_MAGIC and body):
                 for _ in range(DATA_POLL_LIMIT):
                     time.sleep(0.01)
                     rx = bus.read_frame()
                     magic_val, length, body = parse_frame(rx)
                     if magic_val == RESP_MAGIC and body:
                         break
+            break
         print(f"Recv: {format_bytes(rx)}...")
         print(f"Magic: 0x{magic_val:02x}, Length: {length}")
         if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) and body:
@@ -140,6 +142,10 @@ def spi_exchange(
                 )
                 return 1
         if require_valid_response:
+            if expect_command_reply:
+                return 0 if magic_val == RESP_COMMAND_MAGIC and is_plausible_command_payload(body) else 1
+            if await_nonempty_data:
+                return 0 if magic_val == RESP_MAGIC and bool(body) else 1
             return 0 if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) else 1
         return 0
     except Exception as exc:
@@ -171,6 +177,72 @@ def spi_echo_test(bus_num: int, device: int, speed: int, payload: bytes) -> int:
                 return 0
         print("Echo mismatch.")
         return 1
+    except Exception as exc:
+        print(f"ERROR: SPI error - {exc}")
+        return 1
+    finally:
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
+
+
+def spi_recv_via_pull(
+    bus_num: int,
+    device: int,
+    speed: int,
+    expected_text: str | None = None,
+    verbose_raw: bool = False,
+) -> int:
+    bus = None
+    try:
+        bus = open_bus(bus_num, device, speed)
+        tx = build_frame(PULL_COMMAND, REQ_COMMAND_MAGIC)
+        print(f"Sending to SPI bus {bus_num}.{device} @ {speed} Hz...")
+        print(f"Sent: {format_bytes(tx)}...")
+
+        rx = bytes(FRAME_SIZE)
+        magic_val, length, body = 0, 0, b""
+        matched = False
+        for pull_attempt in range(DATA_POLL_LIMIT):
+            if pull_attempt:
+                time.sleep(0.01)
+            rx = bus.write_frame(tx)
+            if verbose_raw:
+                print(f"Write recv[{pull_attempt + 1}]: {format_bytes(rx)}...")
+            magic_val, length, body = parse_frame(rx)
+            if magic_val == RESP_MAGIC and body:
+                if expected_text is None or expected_text in body.decode("utf-8", errors="replace"):
+                    matched = True
+                    break
+            for poll_attempt in range(COMMAND_POLL_LIMIT):
+                time.sleep(0.01)
+                rx = bus.read_frame()
+                if verbose_raw:
+                    poll_index = pull_attempt * COMMAND_POLL_LIMIT + poll_attempt + 1
+                    print(f"Poll recv[{poll_index}]: {format_bytes(rx)}...")
+                magic_val, length, body = parse_frame(rx)
+                if magic_val == RESP_MAGIC and body:
+                    if expected_text is None or expected_text in body.decode("utf-8", errors="replace"):
+                        matched = True
+                        break
+                    break
+            if matched:
+                break
+
+        print(f"Recv: {format_bytes(rx)}...")
+        print(f"Magic: 0x{magic_val:02x}, Length: {length}")
+        if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) and body:
+            print(f"Response: {body.decode('utf-8', errors='replace')!r}")
+        if expected_text is not None:
+            actual = body.decode("utf-8", errors="replace")
+            if expected_text not in actual:
+                print(
+                    f"ERROR: Expected response containing {expected_text!r}, got {actual!r}"
+                )
+                return 1
+        return 0 if magic_val == RESP_MAGIC and body and (expected_text is None or matched) else 1
     except Exception as exc:
         print(f"ERROR: SPI error - {exc}")
         return 1
@@ -247,6 +319,7 @@ def main() -> int:
             args.speed,
             (args.text + "\n").encode(),
             REQ_COMMAND_MAGIC,
+            expect_command_reply=True,
             verbose_raw=args.verbose_raw,
         )
     if args.command == "data":
@@ -255,7 +328,7 @@ def main() -> int:
             args.device,
             args.speed,
             args.text.encode(),
-            REQ_COMMAND_MAGIC,
+            REQ_MAGIC,
             await_nonempty_data=True,
             expected_text=args.expect or None,
             verbose_raw=args.verbose_raw,
@@ -266,17 +339,14 @@ def main() -> int:
             args.device,
             args.speed,
             args.text.encode(),
-            REQ_COMMAND_MAGIC,
+            REQ_MAGIC,
             verbose_raw=args.verbose_raw,
         )
     if args.command == "recv":
-        return spi_exchange(
+        return spi_recv_via_pull(
             args.bus,
             args.device,
             args.speed,
-            b"",
-            REQ_MAGIC,
-            await_nonempty_data=True,
             expected_text=args.expect or None,
             verbose_raw=args.verbose_raw,
         )
@@ -295,6 +365,7 @@ def main() -> int:
             (f"/led {args.action}\n").encode(),
             REQ_COMMAND_MAGIC,
             require_valid_response=not args.fire_and_forget,
+            expect_command_reply=not args.fire_and_forget,
             verbose_raw=args.verbose_raw,
         )
     return 1

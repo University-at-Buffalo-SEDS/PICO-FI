@@ -1,5 +1,6 @@
 //! Local bridge command rendering shared by UART and I2C control paths.
 
+use crate::bridge::spi_diag;
 use crate::config::{BridgeConfig, render_config};
 use heapless::String;
 use portable_atomic::{AtomicBool, AtomicU8, Ordering};
@@ -52,7 +53,7 @@ pub fn render_local_bridge_command(
     let mut out = String::<192>::new();
     match line {
         "/help" => {
-            let _ = out.push_str("pico commands: /help /show /ping /link /led <on|off|toggle|auto|status>");
+            let _ = out.push_str("pico commands: /help /show /ping /link /spi /led <on|off|toggle|auto|status>");
         }
         "/show" => {
             let rendered = render_config(&bridge_config);
@@ -67,6 +68,10 @@ pub fn render_local_bridge_command(
             } else {
                 let _ = out.push_str("link down");
             }
+        }
+        "/spi" => {
+            let rendered = spi_diag::render_snapshot();
+            let _ = out.push_str(rendered.as_str());
         }
         "/led on" => {
             LED_COMMAND.store(LED_MODE_ON, Ordering::Release);

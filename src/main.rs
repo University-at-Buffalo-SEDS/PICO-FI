@@ -12,7 +12,8 @@ mod storage;
 
 use bridge::i2c_task::{i2c_poll_task, I2cPacket};
 use bridge::overwrite_queue::OverwriteQueue;
-use bridge::spi_task::{spi_poll_task, SpiFrame};
+use bridge::spi_hw_task::spi_poll_task;
+use bridge::spi_task::SpiFrame;
 use bridge::runtime::BridgeRuntime;
 use bridge::commands::{set_led_state, take_led_activity, take_led_command};
 use config::{BridgeConfig, BridgeMode, COMPILED_USB_DEVICE_NAMES, UpstreamMode};
@@ -22,7 +23,7 @@ use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c_slave::{Config as I2cSlaveConfig, I2cSlave};
 use embassy_rp::interrupt::InterruptExt as _;
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, UART0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, SPI1, UART0, USB};
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb;
 use embassy_time::Timer;
@@ -281,7 +282,7 @@ async fn app(spawner: Spawner) {
     ) {
         spawner.spawn(
             spi_controller_task(
-                p.PIO1,
+                p.SPI1,
                 p.PIN_10,
                 p.PIN_11,
                 p.PIN_12,
@@ -525,7 +526,7 @@ async fn i2c_controller_task(
 
 #[embassy_executor::task]
 async fn spi_controller_task(
-    pio1: embassy_rp::Peri<'static, PIO1>,
+    spi1: embassy_rp::Peri<'static, SPI1>,
     sclk: embassy_rp::Peri<'static, PIN_10>,
     miso: embassy_rp::Peri<'static, PIN_11>,
     mosi: embassy_rp::Peri<'static, PIN_12>,
@@ -539,7 +540,7 @@ async fn spi_controller_task(
     rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
 ) {
     spi_poll_task(
-        pio1,
+        spi1,
         sclk,
         miso,
         mosi,
