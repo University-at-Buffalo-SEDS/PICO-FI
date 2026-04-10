@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import atexit
 import collections
+import contextlib
+import io
 import queue
 import select
 import shutil
@@ -24,6 +26,7 @@ try:
         COMMAND_RETRY_LIMIT,
         is_plausible_command_payload,
         parse_frame as parse_frame_full,
+        spi_exchange,
     )
 except ImportError:
     import os
@@ -35,6 +38,7 @@ except ImportError:
         COMMAND_RETRY_LIMIT,
         is_plausible_command_payload,
         parse_frame as parse_frame_full,
+        spi_exchange,
     )
 
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -234,48 +238,30 @@ def exchange_frame(
                 if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
                     stream_printer.feed(rx_payload)
                     stream_printer.flush_partial()
-                # A trailing empty poll helps return the SPI transport to the stable
-                # empty-response state after non-command traffic.
-                cleanup_magic, cleanup_payload = parse_frame(bus.read_frame())
-                if cleanup_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and cleanup_payload:
-                    stream_printer.feed(cleanup_payload)
-                    stream_printer.flush_partial()
                 return
 
-            last_magic = 0
-            last_payload = b""
-            deadline = time.monotonic() + COMMAND_TIMEOUT_S
-            for _ in range(COMMAND_RETRY_LIMIT):
-                if time.monotonic() >= deadline:
-                    break
-                first_rx = bus.write_frame(build_frame(payload, magic))
-                rx_magic, rx_payload = parse_frame(first_rx)
-                last_magic, last_payload = rx_magic, rx_payload
-                if rx_magic == RESP_DATA_MAGIC and rx_payload:
-                    stream_printer.feed(rx_payload)
-                    stream_printer.flush_partial()
-                if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-                    stream_printer.feed(rx_payload)
-                    stream_printer.flush_partial()
-                    return
-                time.sleep(poll_delay_s)
-                for _ in range(COMMAND_POLL_LIMIT):
-                    if time.monotonic() >= deadline:
-                        break
-                    rx_magic, rx_payload = parse_frame(bus.read_frame())
-                    last_magic, last_payload = rx_magic, rx_payload
-                    if rx_magic == RESP_DATA_MAGIC and rx_payload:
-                        stream_printer.feed(rx_payload)
-                        stream_printer.flush_partial()
-                    if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-                        stream_printer.feed(rx_payload)
-                        stream_printer.flush_partial()
-                        return
-                    time.sleep(poll_delay_s)
-            if last_magic == RESP_COMMAND_MAGIC and last_payload:
-                stream_printer.feed(last_payload)
-                stream_printer.flush_partial()
-                return
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            rc = spi_exchange(
+                bus_num,
+                device,
+                speed,
+                payload,
+                magic,
+                require_valid_response=True,
+                await_nonempty_data=False,
+                expected_text=None,
+                verbose_raw=False,
+            )
+        output = capture.getvalue().splitlines()
+        for line in output:
+            if line.startswith("Response: "):
+                response = line.removeprefix("Response: ").strip()
+                if response.startswith("'") and response.endswith("'"):
+                    response = response[1:-1]
+                if response:
+                    prompt.print_line(response)
+        if rc != 0:
             prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")
