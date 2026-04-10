@@ -34,6 +34,14 @@ impl<T, const N: usize> OverwriteQueue<T, N> {
         unsafe { self.queue.lock_mut(|queue| queue.pop_front()) }
     }
 
+    pub fn clear(&self) {
+        unsafe {
+            self.queue.lock_mut(|queue| {
+                queue.clear();
+            });
+        }
+    }
+
     pub async fn pop(&self) -> T {
         loop {
             if let Some(item) = self.try_pop() {

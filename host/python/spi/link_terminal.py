@@ -324,7 +324,7 @@ def main() -> int:
                     else:
                         rendered = format_outbound_chat(sender, line)
                         prompt.print_line(rendered)
-                        pending.append((REQ_COMMAND_MAGIC, (rendered + "\n").encode("utf-8"), False))
+                        pending.append((REQ_COMMAND_MAGIC, rendered.encode("utf-8"), False))
             except queue.Empty:
                 pass
 

@@ -224,7 +224,14 @@ pub async fn spi_poll_task(
         if error_streak >= SPI_SELF_HEAL_THRESHOLD
             && is_default_empty_data_response(&transport.staged_response())
         {
-            soft_reset_transport(&irq_flags, &mut initial_sm, &mut io_sm, &mut transport);
+            soft_reset_transport(
+                &irq_flags,
+                &mut initial_sm,
+                &mut io_sm,
+                &mut transport,
+                tx,
+                rx_resp,
+            );
             error_streak = 0;
             Timer::after_millis(SPI_SELF_HEAL_DELAY_MS).await;
         }
@@ -569,8 +576,12 @@ fn soft_reset_transport(
     initial_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_INITIAL_SM>,
     io_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_IO_SM>,
     transport: &mut PioSpiTransportState,
+    tx: &'static OverwriteQueue<SpiFrame, 8>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
 ) {
     let _ = stop_transaction(irq_flags, initial_sm, io_sm, 0);
+    tx.clear();
+    rx_resp.clear();
     transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
 }
 
