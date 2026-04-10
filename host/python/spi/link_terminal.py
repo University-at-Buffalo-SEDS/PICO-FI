@@ -243,12 +243,20 @@ def exchange_frame(
                 stream_printer.flush_partial()
             return
 
-        last_magic = 0
-        last_payload = b""
+        first_rx = bus.write_frame(build_frame(payload, magic))
+        rx_magic, rx_payload = parse_frame(first_rx)
+        last_magic, last_payload = rx_magic, rx_payload
+        if rx_magic == RESP_DATA_MAGIC and rx_payload:
+            stream_printer.feed(rx_payload)
+            stream_printer.flush_partial()
+        if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+            stream_printer.feed(rx_payload)
+            stream_printer.flush_partial()
+            return
+
         deadline = time.monotonic() + COMMAND_TIMEOUT_S
         while time.monotonic() < deadline:
-            first_rx = bus.write_frame(build_frame(payload, magic))
-            rx_magic, rx_payload = parse_frame(first_rx)
+            rx_magic, rx_payload = parse_frame(bus.read_frame())
             last_magic, last_payload = rx_magic, rx_payload
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
                 stream_printer.feed(rx_payload)
@@ -258,17 +266,6 @@ def exchange_frame(
                 stream_printer.flush_partial()
                 return
             time.sleep(poll_delay_s)
-            for _ in range(COMMAND_POLL_LIMIT):
-                rx_magic, rx_payload = parse_frame(bus.read_frame())
-                last_magic, last_payload = rx_magic, rx_payload
-                if rx_magic == RESP_DATA_MAGIC and rx_payload:
-                    stream_printer.feed(rx_payload)
-                    stream_printer.flush_partial()
-                if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-                    stream_printer.feed(rx_payload)
-                    stream_printer.flush_partial()
-                    return
-                time.sleep(poll_delay_s)
         if last_magic == RESP_COMMAND_MAGIC and last_payload:
             stream_printer.feed(last_payload)
             stream_printer.flush_partial()

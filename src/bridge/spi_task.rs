@@ -35,6 +35,8 @@ const SPI_RX_DMA_CHANNEL: usize = 3;
 const SPI_DMA_SETTLE_SPINS: usize = 4096;
 const SPI_TX_FIFO_PRELOAD_WORDS: usize = 4;
 const SPI_TX_WORDS: usize = FRAME_SIZE.div_ceil(4);
+const SPI_SELF_HEAL_THRESHOLD: u8 = 2;
+const SPI_SELF_HEAL_DELAY_MS: u64 = 2;
 
 #[derive(Clone, Copy, Default)]
 struct TransactionStats {
@@ -121,6 +123,7 @@ pub async fn spi_poll_task(
     let static_frame = make_response_frame(RESP_COMMAND_MAGIC, b"pong");
     let mut transport = PioSpiTransportState::new();
     let mut rx_frame = [0u8; FRAME_SIZE];
+    let mut error_streak = 0u8;
     loop {
         if static_mode {
             transport.stage_response(static_frame);
@@ -177,6 +180,7 @@ pub async fn spi_poll_task(
         }
 
         let result = transport.finish_transaction(&rx_frame, received);
+        let suspicious = is_suspicious_transaction(&result);
 
         if static_mode {
             continue;
@@ -207,8 +211,20 @@ pub async fn spi_poll_task(
             continue;
         }
 
+        if suspicious {
+            error_streak = error_streak.saturating_add(1);
+        } else {
+            error_streak = 0;
+        }
+
         if let Some(next) = finalize_transaction(result, bridge_config, _link_active, tx) {
             transport.stage_response(next);
+        }
+
+        if error_streak >= SPI_SELF_HEAL_THRESHOLD {
+            soft_reset_transport(&irq_flags, &mut initial_sm, &mut io_sm, &mut transport);
+            error_streak = 0;
+            Timer::after_millis(SPI_SELF_HEAL_DELAY_MS).await;
         }
     }
 }
@@ -534,6 +550,28 @@ fn render_spi_diag(kind: &str, received: usize, expected: usize, preview: &[u8])
     out
 }
 
+fn is_suspicious_transaction(result: &TransactionResult) -> bool {
+    match result {
+        TransactionResult::IdlePoll { .. } => false,
+        TransactionResult::Partial { .. } => true,
+        TransactionResult::Complete(frame) => {
+            recover_duplicate_length_frame(frame).is_none()
+                && parse_request_frame(frame).is_none()
+                && extract_ascii_command(frame).is_none()
+        }
+    }
+}
+
+fn soft_reset_transport(
+    irq_flags: &embassy_rp::pio::IrqFlags<'_, PIO1>,
+    initial_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_INITIAL_SM>,
+    io_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_IO_SM>,
+    transport: &mut PioSpiTransportState,
+) {
+    let _ = stop_transaction(irq_flags, initial_sm, io_sm, 0);
+    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
+}
+
 fn finalize_transaction(
     result: TransactionResult,
     bridge_config: BridgeConfig,
@@ -556,10 +594,8 @@ fn finalize_transaction(
                 let response = render_local_bridge_command(bridge_config, link_active, line);
                 return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
             }
-            Some(make_response_frame(
-                RESP_COMMAND_MAGIC,
-                render_spi_diag("part", received, expected, &frame[..8]).as_bytes(),
-            ))
+            let _ = (received, expected);
+            Some(make_response_frame(RESP_DATA_MAGIC, b""))
         }
         TransactionResult::Complete(frame) => {
             let parsed_frame = recover_duplicate_length_frame(&frame).unwrap_or(frame);
@@ -591,10 +627,7 @@ fn finalize_transaction(
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
                     }
-                    Some(make_response_frame(
-                        RESP_COMMAND_MAGIC,
-                        render_spi_diag("inv", 0, 0, &frame[..8]).as_bytes(),
-                    ))
+                    Some(make_response_frame(RESP_DATA_MAGIC, b""))
                 }
             }
         }
