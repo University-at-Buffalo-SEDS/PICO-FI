@@ -37,7 +37,7 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
 def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
-    for offset in range(0, min(8, FRAME_SIZE - 1)):
+    for offset in range(0, min(2, FRAME_SIZE - 1)):
         magic_val = frame[offset]
         if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
             continue

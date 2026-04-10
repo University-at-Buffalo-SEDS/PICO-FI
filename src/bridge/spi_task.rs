@@ -404,7 +404,7 @@ fn configure_io_sm<'d>(
     cfg.clock_divider = 1u8.into();
     io_sm.set_config(&cfg);
     io_sm.set_pins(Level::Low, &[&miso_pin]);
-    io_sm.set_pin_dirs(PioDirection::In, &[&miso_pin]);
+    io_sm.set_pin_dirs(PioDirection::Out, &[&miso_pin]);
     io_sm.set_pin_dirs(PioDirection::In, &[&sclk_pin, &mosi_pin]);
     prime_default_write_value(io_sm, 0);
 }
@@ -639,7 +639,7 @@ fn finalize_transaction(
                         Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
                     } else if is_strict_forward_frame(&frame) {
                         tx.push_overwrite(SpiFrame { data: frame });
-                        None
+                        Some(make_response_frame(RESP_DATA_MAGIC, b""))
                     } else {
                         Some(make_response_frame(RESP_DATA_MAGIC, b""))
                     }
@@ -652,7 +652,7 @@ fn finalize_transaction(
                     let _ = payload;
                     if is_strict_forward_frame(&frame) {
                         tx.push_overwrite(SpiFrame { data: frame });
-                        None
+                        Some(make_response_frame(RESP_DATA_MAGIC, b""))
                     } else {
                         Some(make_response_frame(RESP_DATA_MAGIC, b""))
                     }
