@@ -1,14 +1,14 @@
 //! PIO-backed SPI slave task for framed upstream transfers.
 
+use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
-    FRAME_SIZE, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame,
-    parse_request_frame,
+    FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
+    RequestFrame, make_response_frame, parse_request_frame,
 };
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
 use embassy_rp::dma::Channel;
 use embassy_rp::gpio::{Level, Output};
@@ -17,6 +17,7 @@ use embassy_rp::pio::{
     Common, Config as PioConfig, Direction as PioDirection, Pio, PioBatch, ShiftDirection,
 };
 use embassy_time::Timer;
+use heapless::String;
 use portable_atomic::AtomicBool;
 use pio::{InstructionOperands, MovDestination, MovOperation, MovSource, WaitSource};
 use rp_pac::DMA;
@@ -31,10 +32,9 @@ const SPI_IRQ_CS_FALLING: usize = 1;
 const SPI_IRQ_CS_RISING: usize = 2;
 const SPI_TX_DMA_CHANNEL: usize = 2;
 const SPI_RX_DMA_CHANNEL: usize = 3;
-const SPI_LOCAL_RESPONSE_WAIT_MS: u64 = 5;
-const SPI_COMMAND_RESPONSE_WAIT_MS: u64 = 100;
 const SPI_DMA_SETTLE_SPINS: usize = 4096;
-const SPI_TX_FIFO_PRELOAD_BYTES: usize = 8;
+const SPI_TX_FIFO_PRELOAD_WORDS: usize = 4;
+const SPI_TX_WORDS: usize = FRAME_SIZE.div_ceil(4);
 
 #[derive(Clone, Copy, Default)]
 struct TransactionStats {
@@ -121,17 +121,23 @@ pub async fn spi_poll_task(
     let static_frame = make_response_frame(RESP_COMMAND_MAGIC, b"pong");
     let mut transport = PioSpiTransportState::new();
     let mut rx_frame = [0u8; FRAME_SIZE];
+    let mut local_response_staged = false;
 
     loop {
         if static_mode {
             transport.stage_response(static_frame);
         } else if !echo_mode {
-            if let Some(resp) = rx_resp.try_pop() {
-                transport.stage_response(resp.data);
+            if !local_response_staged {
+                if let Some(resp) = rx_resp.try_pop() {
+                    transport.stage_response(resp.data);
+                }
+            } else {
+                local_response_staged = false;
             }
         }
 
         let staged_tx = transport.staged_response();
+        let staged_tx_words = pack_tx_words(&staged_tx);
         rx_frame.fill(0);
         prepare_for_next_transaction(
             &irq_flags,
@@ -140,14 +146,14 @@ pub async fn spi_poll_task(
             &io_program,
         );
 
-        let tx_preload = preload_tx_fifo(&mut io_sm, &staged_tx);
-        let tx_fifo_ptr = io_sm.tx_fifo_ptr() as *mut u8;
+        let tx_preload = preload_tx_fifo(&mut io_sm, &staged_tx_words);
+        let tx_fifo_ptr = io_sm.tx_fifo_ptr() as *mut u32;
         let rx_fifo_ptr = io_sm.rx_fifo_ptr() as *const u8;
         let tx_treq = io_sm.tx_treq();
         let rx_treq = io_sm.rx_treq();
         {
             let tx_transfer = unsafe {
-                tx_dma.write(&staged_tx[tx_preload..], tx_fifo_ptr, tx_treq, false)
+                tx_dma.write(&staged_tx_words[tx_preload..], tx_fifo_ptr, tx_treq, false)
             };
             let rx_transfer = unsafe { rx_dma.read(rx_fifo_ptr, &mut rx_frame, rx_treq, false) };
             let mut batch = PioBatch::new();
@@ -166,6 +172,15 @@ pub async fn spi_poll_task(
         let received = stats.num_bytes_read.min(FRAME_SIZE);
         apply_initial_byte(&mut rx_frame, received, stats.first_byte);
 
+        if !static_mode && !echo_mode {
+            if let Some(line) = extract_ascii_command(&rx_frame) {
+                let response = render_local_bridge_command(bridge_config, _link_active, line);
+                transport.stage_response(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                local_response_staged = true;
+                continue;
+            }
+        }
+
         let result = transport.finish_transaction(&rx_frame, received);
 
         if static_mode {
@@ -174,35 +189,64 @@ pub async fn spi_poll_task(
 
         if echo_mode {
             match result {
-                TransactionResult::Complete(frame) => transport.stage_response(frame),
-                TransactionResult::IdlePoll { .. } => {
-                    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""))
+                TransactionResult::Complete(_) => transport.stage_response(static_frame),
+                TransactionResult::IdlePoll { received, preview } => {
+                    let response = make_response_frame(
+                        RESP_COMMAND_MAGIC,
+                        render_spi_diag("idle", received, 0, &preview).as_bytes(),
+                    );
+                    transport.stage_response(response)
                 }
-                TransactionResult::Partial { .. } => {
-                    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""))
+                TransactionResult::Partial {
+                    received,
+                    expected,
+                    ..
+                } => {
+                    let response = make_response_frame(
+                        RESP_COMMAND_MAGIC,
+                        render_spi_diag("part", received, expected, &rx_frame[..8]).as_bytes(),
+                    );
+                    transport.stage_response(response)
                 }
             }
             continue;
         }
 
-        if let Some(next) = finalize_transaction(result, tx, rx_resp).await {
+        if let Some(next) = finalize_transaction(result, bridge_config, _link_active, tx) {
             transport.stage_response(next);
+            local_response_staged = true;
         }
     }
 }
 
 fn preload_tx_fifo(
     io_sm: &mut embassy_rp::pio::StateMachine<'_, PIO1, SPI_PIO_IO_SM>,
-    frame: &[u8; FRAME_SIZE],
+    frame_words: &[u32; SPI_TX_WORDS],
 ) -> usize {
     let tx = io_sm.tx();
-    let preload = SPI_TX_FIFO_PRELOAD_BYTES.min(FRAME_SIZE);
+    let preload = SPI_TX_FIFO_PRELOAD_WORDS.min(SPI_TX_WORDS);
     let mut count = 0usize;
     while count < preload && !tx.full() {
-        tx.push(frame[count] as u32);
+        tx.push(frame_words[count]);
         count += 1;
     }
     count
+}
+
+fn pack_tx_words(frame: &[u8; FRAME_SIZE]) -> [u32; SPI_TX_WORDS] {
+    let mut words = [0u32; SPI_TX_WORDS];
+    let mut index = 0usize;
+    while index < FRAME_SIZE {
+        let word_index = index / 4;
+        words[word_index] = u32::from_be_bytes([
+            frame[index],
+            *frame.get(index + 1).unwrap_or(&0),
+            *frame.get(index + 2).unwrap_or(&0),
+            *frame.get(index + 3).unwrap_or(&0),
+        ]);
+        index += 4;
+    }
+    words
 }
 
 struct PioSpiCsProgram<'d> {
@@ -321,7 +365,7 @@ fn configure_io_sm<'d>(
     cfg.shift_in.threshold = 8;
     cfg.shift_out.auto_fill = false;
     cfg.shift_out.direction = ShiftDirection::Left;
-    cfg.shift_out.threshold = 8;
+    cfg.shift_out.threshold = 32;
     cfg.clock_divider = 1u8.into();
     io_sm.set_config(&cfg);
     io_sm.set_pins(Level::Low, &[&miso_pin]);
@@ -358,7 +402,7 @@ fn arm_transaction_state_machines(
     .encode();
     unsafe {
         initial_sm.set_y(7);
-        initial_sm.exec_jmp(program.loaded.origin);
+        initial_sm.exec_jmp(program.loaded.origin + program.initial_check);
         io_sm.exec_jmp(program.loaded.origin);
         initial_sm.exec_instr(wait_irq);
         io_sm.exec_instr(wait_irq);
@@ -443,6 +487,12 @@ fn apply_initial_byte(rx_frame: &mut [u8; FRAME_SIZE], received: usize, first_by
     if rx_frame[0] == first_byte {
         return;
     }
+    if matches!(first_byte, REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+        let shift_len = received.min(FRAME_SIZE - 1);
+        rx_frame.copy_within(0..shift_len, 1);
+        rx_frame[0] = first_byte;
+        return;
+    }
     if rx_frame[0] == 0 {
         let shift_len = received.min(FRAME_SIZE - 1);
         rx_frame.copy_within(0..shift_len, 1);
@@ -450,33 +500,6 @@ fn apply_initial_byte(rx_frame: &mut [u8; FRAME_SIZE], received: usize, first_by
         return;
     }
     rx_frame[0] = first_byte;
-}
-
-async fn finalize_transaction(
-    result: TransactionResult,
-    tx: &'static OverwriteQueue<SpiFrame, 8>,
-    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
-) -> Option<[u8; FRAME_SIZE]> {
-    match result {
-        TransactionResult::IdlePoll { .. } => {
-            Some(make_response_frame(RESP_DATA_MAGIC, b""))
-        }
-        TransactionResult::Partial { .. } => {
-            Some(make_response_frame(RESP_DATA_MAGIC, b""))
-        }
-        TransactionResult::Complete(frame) => {
-            tx.push_overwrite(SpiFrame { data: frame });
-            let wait_ms = match parse_request_frame(&frame) {
-                Some(RequestFrame::Command(_)) => SPI_COMMAND_RESPONSE_WAIT_MS,
-                _ => SPI_LOCAL_RESPONSE_WAIT_MS,
-            };
-            if let Some(response) = wait_for_local_response(rx_resp, wait_ms).await {
-                Some(response.data)
-            } else {
-                None
-            }
-        }
-    }
 }
 
 fn prime_default_write_value(
@@ -501,15 +524,93 @@ fn prime_default_write_value(
     }
 }
 
-async fn wait_for_local_response(
-    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
-    wait_ms: u64,
-) -> Option<SpiFrame> {
-    if let Some(frame) = rx_resp.try_pop() {
-        return Some(frame);
+fn render_spi_diag(kind: &str, received: usize, expected: usize, preview: &[u8]) -> String<96> {
+    let mut out = String::<96>::new();
+    let _ = core::fmt::write(
+        &mut out,
+        format_args!("{kind} r={received} e={expected}"),
+    );
+    for byte in preview.iter().take(8) {
+        let _ = core::fmt::write(&mut out, format_args!(" {:02x}", byte));
     }
-    match select(rx_resp.pop(), Timer::after_millis(wait_ms)).await {
-        Either::First(frame) => Some(frame),
-        Either::Second(_) => None,
+    out
+}
+
+fn finalize_transaction(
+    result: TransactionResult,
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    _tx: &'static OverwriteQueue<SpiFrame, 8>,
+) -> Option<[u8; FRAME_SIZE]> {
+    match result {
+        TransactionResult::IdlePoll { .. } => {
+            Some(make_response_frame(RESP_DATA_MAGIC, b""))
+        }
+        TransactionResult::Partial {
+            received,
+            expected,
+            frame,
+        } => {
+            if let Some(line) = extract_ascii_command(&frame) {
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+            }
+            Some(make_response_frame(
+                RESP_COMMAND_MAGIC,
+                render_spi_diag("part", received, expected, &frame[..8]).as_bytes(),
+            ))
+        }
+        TransactionResult::Complete(frame) => {
+            match parse_request_frame(&frame) {
+                Some(RequestFrame::Command(payload)) => {
+                    let line = trim_ascii_line(payload);
+                    let response = render_local_bridge_command(bridge_config, link_active, line);
+                    Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
+                }
+                Some(RequestFrame::Data(payload)) => {
+                    if let Some(line) = extract_ascii_command(&frame) {
+                        let response = render_local_bridge_command(bridge_config, link_active, line);
+                        return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                    }
+                    Some(make_response_frame(
+                        RESP_COMMAND_MAGIC,
+                        render_spi_diag("data", payload.len() + 2, payload.len() + 2, &frame[..8]).as_bytes(),
+                    ))
+                }
+                None => {
+                    if let Some(line) = extract_ascii_command(&frame) {
+                        let response = render_local_bridge_command(bridge_config, link_active, line);
+                        return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                    }
+                    Some(make_response_frame(
+                        RESP_COMMAND_MAGIC,
+                        render_spi_diag("inv", 0, 0, &frame[..8]).as_bytes(),
+                    ))
+                }
+            }
+        }
     }
+}
+
+fn extract_ascii_command(frame: &[u8; FRAME_SIZE]) -> Option<&str> {
+    let scan = &frame[..FRAME_SIZE.min(96)];
+    let mut start = 0usize;
+    while let Some(offset) = scan[start..].iter().position(|&byte| byte == b'/') {
+        let slash = start + offset;
+        let tail = &scan[slash..];
+        let end = tail
+            .iter()
+            .position(|&byte| byte == 0 || byte == b'\n' || byte == b'\r')
+            .unwrap_or(tail.len());
+        if let Ok(candidate) = core::str::from_utf8(&tail[..end]) {
+            if candidate
+                .bytes()
+                .all(|byte| byte == b'/' || (32..=126).contains(&byte))
+            {
+                return Some(candidate);
+            }
+        }
+        start = slash + 1;
+    }
+    None
 }

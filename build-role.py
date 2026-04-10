@@ -75,14 +75,17 @@ def build_role(role: str, *, release: bool, flash: bool, probe: str | None) -> i
     if elf2uf2 is None:
         fail("`elf2uf2-rs` not found.\nInstall it with: cargo install elf2uf2-rs")
 
-    role_config = ROLE_CONFIG[role]
+    role_config = os.environ.get("PICO_FI_CONFIG") or ROLE_CONFIG[role]
     target_dir = ROOT / "target" / role
     profile = "release" if release else "debug"
     elf = target_dir / TARGET / profile / BIN_NAME
     uf2 = elf.with_suffix(".uf2")
 
     env = os.environ.copy()
-    env["PICO_FI_CONFIG"] = str((ROOT / role_config).resolve())
+    role_config_path = Path(role_config)
+    if not role_config_path.is_absolute():
+        role_config_path = (ROOT / role_config_path).resolve()
+    env["PICO_FI_CONFIG"] = str(role_config_path)
     env["CARGO_TARGET_DIR"] = str(target_dir)
 
     cmd = [cargo, "build", "--package", BIN_NAME, "--bin", BIN_NAME]

@@ -1,0 +1,19 @@
+{
+  "network": {
+    "mac": "02:00:00:12:34:56",
+    "mode": "static",
+    "ip": "192.168.7.2",
+    "prefix_len": 24,
+    "gateway": "192.168.7.1",
+    "dns": "1.1.1.1"
+  },
+  "bridge": {
+    "role": "server",
+    "listen_port": 5000,
+    "remote_ip": "192.168.7.3",
+    "remote_port": 5000
+  },
+  "upstream": {
+    "transport": "spi_echo"
+  }
+}

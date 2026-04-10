@@ -11,6 +11,13 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
     ) from exc
 
 FRAME_SIZE = 258
+REQ_MAGIC = 0xA5
+
+
+def _empty_request_frame() -> bytes:
+    frame = bytearray(FRAME_SIZE)
+    frame[0] = REQ_MAGIC
+    return bytes(frame)
 
 
 class RawSpiBus:
@@ -31,7 +38,7 @@ class RawSpiBus:
         return self.transfer(frame)
 
     def read_frame(self) -> bytes:
-        return self.transfer(bytes(FRAME_SIZE))
+        return self.transfer(_empty_request_frame())
 
 
 def open_bus(bus: int, device: int, speed_hz: int) -> RawSpiBus:

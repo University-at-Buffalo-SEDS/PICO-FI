@@ -204,7 +204,11 @@ async fn handle_spi_request(
                 let response = make_response_frame(RESP_DATA_MAGIC, b"");
                 spi_tx.push_overwrite(SpiFrame { data: response });
             } else {
-                let response = make_response_frame(RESP_DATA_MAGIC, b"");
+                let response = if payload.is_empty() {
+                    make_response_frame(RESP_DATA_MAGIC, b"")
+                } else {
+                    make_response_frame(RESP_COMMAND_MAGIC, b"error spi data no socket")
+                };
                 spi_tx.push_overwrite(SpiFrame { data: response });
             }
             Ok(())

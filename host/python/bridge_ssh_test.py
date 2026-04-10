@@ -14,6 +14,21 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UART_TEST = REPO_ROOT / "host/python/uart/test.py"
+SPI_TEST_DIR = REPO_ROOT / "host/python/spi"
+REMOTE_SPI_STAGE = "/tmp/pico-fi-spi-test"
+LINK_HANDSHAKE_MAGIC = b"PICOFI1"
+
+
+def default_local_python() -> str:
+    candidates = [
+        REPO_ROOT / "venv/bin/python",
+        REPO_ROOT / ".venv/bin/python",
+        Path.home() / "venv/bin/python",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def run_checked(cmd: list[str], cwd: Path | None = None) -> int:
@@ -37,38 +52,79 @@ def shell_quote_remote_path(path: str) -> str:
     return shlex.quote(path)
 
 
+def stage_remote_spi_tools(target: str) -> int:
+    mkdir_cmd = build_ssh_command(target, f"mkdir -p {shlex.quote(REMOTE_SPI_STAGE)}")
+    rc = run_checked(mkdir_cmd)
+    if rc != 0:
+        return rc
+    files = [
+        SPI_TEST_DIR / "__init__.py",
+        SPI_TEST_DIR / "raw.py",
+        SPI_TEST_DIR / "test.py",
+    ]
+    return run_checked(["scp", *map(str, files), f"{target}:{REMOTE_SPI_STAGE}/"])
+
+
 def run_remote_spi_probe(target: str, remote_root: str, count: int, speed: int) -> int:
-    remote_root_expr = shell_quote_remote_path(remote_root)
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
     remote = (
-        f"cd {remote_root_expr}/host/python/spi && "
-        f"python3 test.py --verbose-raw probe --count {count} --speed {speed}"
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        f"python3 test.py --verbose-raw --speed {speed} probe --count {count}"
     )
     return run_checked(build_ssh_command(target, remote))
 
 
 def run_remote_spi_command(target: str, remote_root: str, text: str, speed: int) -> int:
-    remote_root_expr = shell_quote_remote_path(remote_root)
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
     remote = (
-        f"cd {remote_root_expr}/host/python/spi && "
-        f"python3 test.py --verbose-raw command {shlex.quote(text)} --speed {speed}"
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        f"python3 test.py --verbose-raw --speed {speed} command {shlex.quote(text)}"
     )
     return run_checked(build_ssh_command(target, remote))
 
 
-def run_local_uart_probe(port: str, speed: int, count: int) -> int:
+def run_remote_spi_echo(target: str, remote_root: str, text: str, speed: int) -> int:
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
+    remote = (
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        f"python3 test.py --verbose-raw --speed {speed} echo {shlex.quote(text)}"
+    )
+    return run_checked(build_ssh_command(target, remote))
+
+
+def run_remote_spi_data(target: str, remote_root: str, text: str, speed: int, expect: str | None) -> int:
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
+    remote = (
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        f"python3 test.py --verbose-raw --speed {speed} data {shlex.quote(text)}"
+    )
+    if expect:
+        remote += f" --expect {shlex.quote(expect)}"
+    return run_checked(build_ssh_command(target, remote))
+
+
+def run_local_uart_probe(python_bin: str, port: str, speed: int, count: int) -> int:
     return run_checked(
-        [sys.executable, str(UART_TEST), "--port", port, "--speed", str(speed), "probe", "--count", str(count)]
+        [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "probe", "--count", str(count)]
     )
 
 
-def run_local_uart_command(port: str, speed: int, text: str) -> int:
+def run_local_uart_command(python_bin: str, port: str, speed: int, text: str) -> int:
     return run_checked(
-        [sys.executable, str(UART_TEST), "--port", port, "--speed", str(speed), "command", text]
+        [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "command", text]
     )
 
 
-def run_local_uart_data(port: str, speed: int, text: str, expect: str) -> int:
-    cmd = [sys.executable, str(UART_TEST), "--port", port, "--speed", str(speed), "data", text]
+def run_local_uart_data(python_bin: str, port: str, speed: int, text: str, expect: str) -> int:
+    cmd = [python_bin, str(UART_TEST), "--port", port, "--speed", str(speed), "data", text]
     if expect:
         cmd.extend(["--expect", expect])
     return run_checked(cmd)
@@ -90,8 +146,9 @@ def start_remote_echo_server(target: str, bind_host: str, bind_port: int) -> sub
         "finally:\n"
         "    conn.close(); s.close()\n"
     )
+    remote_command = f"python3 -u -c {shlex.quote(server_code)}"
     proc = subprocess.Popen(
-        ["ssh", target, "python3", "-u", "-c", server_code],
+        ["ssh", target, remote_command],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -111,6 +168,63 @@ def start_remote_echo_server(target: str, bind_host: str, bind_port: int) -> sub
     raise RuntimeError("timed out waiting for remote echo server")
 
 
+def start_remote_bridge_echo_client(
+    target: str,
+    pico_host: str,
+    pico_port: int,
+    handshake_magic: bytes = LINK_HANDSHAKE_MAGIC,
+) -> subprocess.Popen[str]:
+    server_code = (
+        "import socket, sys, time\n"
+        f"HOST={pico_host!r}\n"
+        f"PORT={pico_port}\n"
+        f"MAGIC={handshake_magic!r}\n"
+        "deadline=time.time()+10.0\n"
+        "while True:\n"
+        "    try:\n"
+        "        s=socket.create_connection((HOST, PORT), timeout=1.0)\n"
+        "        break\n"
+        "    except OSError:\n"
+        "        if time.time() > deadline:\n"
+        "            raise\n"
+        "        time.sleep(0.2)\n"
+        "s.settimeout(10.0)\n"
+        "hello=s.recv(len(MAGIC))\n"
+        "if hello != MAGIC:\n"
+        "    raise SystemExit(f'bad handshake: {hello!r}')\n"
+        "s.sendall(MAGIC)\n"
+        "print('READY', flush=True)\n"
+        "try:\n"
+        "    while True:\n"
+        "        data=s.recv(4096)\n"
+        "        if not data:\n"
+        "            break\n"
+        "        s.sendall(data)\n"
+        "finally:\n"
+        "    s.close()\n"
+    )
+    remote_command = f"python3 -u -c {shlex.quote(server_code)}"
+    proc = subprocess.Popen(
+        ["ssh", target, remote_command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert proc.stdout is not None
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            if proc.poll() is not None:
+                raise RuntimeError("remote bridge echo client exited before becoming ready")
+            continue
+        print(f"[remote] {line.rstrip()}")
+        if line.rstrip() == "READY":
+            return proc
+    proc.terminate()
+    raise RuntimeError("timed out waiting for remote bridge echo client")
+
+
 def stop_process(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
@@ -126,15 +240,21 @@ def full_smoke(args: argparse.Namespace) -> int:
     rc = run_remote_spi_probe(args.ssh_target, args.remote_root, args.probe_count, args.spi_speed)
     if rc != 0:
         return rc
-    rc = run_local_uart_probe(args.uart_port, args.uart_speed, args.probe_count)
+    rc = run_local_uart_probe(args.local_python, args.uart_port, args.uart_speed, args.probe_count)
     if rc != 0:
         return rc
-    rc = run_local_uart_command(args.uart_port, args.uart_speed, "/ping")
+    rc = run_local_uart_command(args.local_python, args.uart_port, args.uart_speed, "/ping")
     if rc != 0:
         return rc
     echo_proc = start_remote_echo_server(args.ssh_target, args.remote_bind, args.remote_port)
     try:
-        return run_local_uart_data(args.uart_port, args.uart_speed, args.payload, args.payload)
+        return run_local_uart_data(
+            args.local_python,
+            args.uart_port,
+            args.uart_speed,
+            args.payload,
+            args.payload,
+        )
     finally:
         stop_process(echo_proc)
 
@@ -148,11 +268,19 @@ def main() -> int:
         help="Repository root on the remote Pi",
     )
     parser.add_argument("--uart-port", required=True, help="Local UART device path")
+    parser.add_argument(
+        "--local-python",
+        default=default_local_python(),
+        help="Python interpreter to use for local UART tests",
+    )
     parser.add_argument("--uart-speed", type=int, default=115200)
     parser.add_argument("--spi-speed", type=int, default=100000)
     parser.add_argument("--probe-count", type=int, default=3)
     parser.add_argument("--remote-bind", default="10.8.0.5")
     parser.add_argument("--remote-port", type=int, default=4242)
+    parser.add_argument("--bridge-peer-target", default="rylan@10.8.0.5")
+    parser.add_argument("--pico-net-host", default="192.168.7.2")
+    parser.add_argument("--pico-net-port", type=int, default=5000)
     parser.add_argument("--payload", default="bridge-echo")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -163,6 +291,12 @@ def main() -> int:
 
     spi_command = subparsers.add_parser("spi-command", help="Run the remote SPI command via SSH")
     spi_command.add_argument("text")
+
+    spi_echo = subparsers.add_parser("spi-echo", help="Run the remote SPI echo diagnostic via SSH")
+    spi_echo.add_argument("text", nargs="?", default="/ping")
+
+    spi_data = subparsers.add_parser("spi-data-echo", help="Run an end-to-end SPI data echo test through the Ethernet bridge")
+    spi_data.add_argument("--text", default=None)
 
     subparsers.add_parser("uart-probe", help="Run the local UART probe")
 
@@ -185,15 +319,34 @@ def main() -> int:
         )
     if args.command == "spi-command":
         return run_remote_spi_command(args.ssh_target, args.remote_root, args.text, args.spi_speed)
+    if args.command == "spi-echo":
+        return run_remote_spi_echo(args.ssh_target, args.remote_root, args.text, args.spi_speed)
+    if args.command == "spi-data-echo":
+        payload = args.text or args.payload
+        echo_proc = start_remote_bridge_echo_client(
+            args.bridge_peer_target,
+            args.pico_net_host,
+            args.pico_net_port,
+        )
+        try:
+            return run_remote_spi_data(
+                args.ssh_target,
+                args.remote_root,
+                payload,
+                args.spi_speed,
+                payload,
+            )
+        finally:
+            stop_process(echo_proc)
     if args.command == "uart-probe":
-        return run_local_uart_probe(args.uart_port, args.uart_speed, args.probe_count)
+        return run_local_uart_probe(args.local_python, args.uart_port, args.uart_speed, args.probe_count)
     if args.command == "uart-command":
-        return run_local_uart_command(args.uart_port, args.uart_speed, args.text)
+        return run_local_uart_command(args.local_python, args.uart_port, args.uart_speed, args.text)
     if args.command == "uart-data-echo":
         payload = args.text or args.payload
         echo_proc = start_remote_echo_server(args.ssh_target, args.remote_bind, args.remote_port)
         try:
-            return run_local_uart_data(args.uart_port, args.uart_speed, payload, payload)
+            return run_local_uart_data(args.local_python, args.uart_port, args.uart_speed, payload, payload)
         finally:
             stop_process(echo_proc)
     return 1

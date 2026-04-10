@@ -7,7 +7,11 @@ use crate::protocol::i2c::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionResult {
     IdlePoll { received: usize, preview: [u8; 8] },
-    Partial { received: usize, expected: usize },
+    Partial {
+        received: usize,
+        expected: usize,
+        frame: [u8; FRAME_SIZE],
+    },
     Complete([u8; FRAME_SIZE]),
 }
 
@@ -56,7 +60,11 @@ impl PioSpiTransportState {
         } else if expected <= FRAME_SIZE && received.max(8) >= expected {
             TransactionResult::Complete(rx_frame)
         } else {
-            TransactionResult::Partial { received, expected }
+            TransactionResult::Partial {
+                received,
+                expected,
+                frame: rx_frame,
+            }
         };
 
         self.staged_tx = make_response_frame(RESP_DATA_MAGIC, b"");
@@ -133,7 +141,8 @@ mod tests {
             state.finish_transaction(&frame, 3),
             TransactionResult::Partial {
                 received: 3,
-                expected: 6
+                expected: 6,
+                frame
             }
         );
     }

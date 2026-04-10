@@ -21,6 +21,7 @@ RESP_COMMAND_MAGIC = 0x5B
 STALE_POLL_LIMIT = 4
 COMMAND_POLL_LIMIT = 50
 COMMAND_RETRY_LIMIT = 4
+DATA_POLL_LIMIT = 50
 PROBE_PAUSE_S = 0.02
 
 
@@ -79,6 +80,8 @@ def spi_exchange(
     payload: bytes,
     magic: int = REQ_MAGIC,
     require_valid_response: bool = True,
+    await_nonempty_data: bool = False,
+    expected_text: str | None = None,
     verbose_raw: bool = False,
 ) -> int:
     bus = None
@@ -93,8 +96,6 @@ def spi_exchange(
 
         attempts = COMMAND_RETRY_LIMIT if magic == REQ_COMMAND_MAGIC else 1
         for attempt in range(attempts):
-            if magic == REQ_COMMAND_MAGIC:
-                flush_stale_command_frames(bus)
             first_rx = bus.write_frame(tx)
             first_magic, first_length, first_body = parse_frame(first_rx)
             if verbose_raw:
@@ -118,6 +119,13 @@ def spi_exchange(
                 rx = bus.read_frame()
                 magic_val, length, body = parse_frame(rx)
                 break
+            if await_nonempty_data and magic_val == RESP_MAGIC and not body:
+                for _ in range(DATA_POLL_LIMIT):
+                    time.sleep(0.01)
+                    rx = bus.read_frame()
+                    magic_val, length, body = parse_frame(rx)
+                    if magic_val == RESP_MAGIC and body:
+                        break
         print(f"Recv: {format_bytes(rx)}...")
         print(f"Magic: 0x{magic_val:02x}, Length: {length}")
         if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) and body:
@@ -125,6 +133,13 @@ def spi_exchange(
                 print(f"Response: {body.decode('utf-8', errors='replace')!r}")
             except Exception:
                 print(f"Response: {body.hex()}")
+        if expected_text is not None:
+            actual = body.decode("utf-8", errors="replace")
+            if expected_text not in actual:
+                print(
+                    f"ERROR: Expected response containing {expected_text!r}, got {actual!r}"
+                )
+                return 1
         if require_valid_response:
             return 0 if magic_val in (RESP_MAGIC, RESP_COMMAND_MAGIC) else 1
         return 0
@@ -148,11 +163,13 @@ def spi_echo_test(bus_num: int, device: int, speed: int, payload: bytes) -> int:
         print(f"Sent: {format_bytes(tx)}...")
         first = bus.write_frame(tx)
         print(f"Priming recv: {format_bytes(first)}...")
-        second = bus.read_frame()
-        print(f"Echo recv: {format_bytes(second)}...")
-        if second == tx:
-            print("Echo matched previous transaction exactly.")
-            return 0
+        for poll in range(4):
+            time.sleep(0.01)
+            second = bus.read_frame()
+            print(f"Echo recv[{poll + 1}]: {format_bytes(second)}...")
+            if second == tx:
+                print("Echo matched previous transaction exactly.")
+                return 0
         print("Echo mismatch.")
         return 1
     except Exception as exc:
@@ -181,6 +198,13 @@ def main() -> int:
     probe_parser.add_argument("--count", type=int, default=10)
     cmd_parser = subparsers.add_parser("command", help="Send command")
     cmd_parser.add_argument("text", help="Command text (e.g., /ping)")
+    data_parser = subparsers.add_parser("data", help="Send framed data and await a non-empty data reply")
+    data_parser.add_argument("text")
+    data_parser.add_argument(
+        "--expect",
+        default="",
+        help="Substring expected in the returned data payload.",
+    )
     echo_parser = subparsers.add_parser("echo", help="Send a frame and verify it is echoed back on the next transfer")
     echo_parser.add_argument(
         "text",
@@ -216,6 +240,17 @@ def main() -> int:
             args.speed,
             (args.text + "\n").encode(),
             REQ_COMMAND_MAGIC,
+            verbose_raw=args.verbose_raw,
+        )
+    if args.command == "data":
+        return spi_exchange(
+            args.bus,
+            args.device,
+            args.speed,
+            args.text.encode(),
+            REQ_MAGIC,
+            await_nonempty_data=True,
+            expected_text=args.expect or None,
             verbose_raw=args.verbose_raw,
         )
     if args.command == "echo":
