@@ -229,6 +229,17 @@ def exchange_frame(
     expect_command_reply: bool,
 ) -> None:
     try:
+        if not expect_command_reply:
+            with open_bus(bus_num, device, speed) as bus:
+                first_rx = bus.write_frame(build_frame(payload, magic))
+                rx_magic, rx_payload = parse_frame(first_rx)
+                if rx_magic == 0:
+                    rx_magic, rx_payload = parse_frame(bus.read_frame())
+                if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
+            return
+
         capture = io.StringIO()
         with contextlib.redirect_stdout(capture):
             rc = spi_exchange(

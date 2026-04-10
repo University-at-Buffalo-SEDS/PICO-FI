@@ -172,9 +172,18 @@ pub async fn spi_poll_task(
         apply_initial_byte(&mut rx_frame, received, stats.first_byte);
 
         if !static_mode && !echo_mode {
-            if let Some(line) = extract_ascii_command(&rx_frame) {
-                let response = render_local_bridge_command(bridge_config, _link_active, line);
-                transport.stage_response(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+            if let Some(line) = extract_ascii_line(&rx_frame) {
+                if line.starts_with('/') {
+                    let response = render_local_bridge_command(bridge_config, _link_active, line);
+                    transport.stage_response(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                } else if looks_like_chat_text(line) {
+                    tx.push_overwrite(SpiFrame {
+                        data: make_request_frame(REQ_COMMAND_MAGIC, line.as_bytes()),
+                    });
+                    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
+                } else {
+                    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
+                }
                 continue;
             }
         }
@@ -240,6 +249,15 @@ pub async fn spi_poll_task(
 
 fn is_default_empty_data_response(frame: &[u8; FRAME_SIZE]) -> bool {
     frame[0] == RESP_DATA_MAGIC && frame[1] == 0
+}
+
+fn make_request_frame(magic: u8, payload: &[u8]) -> [u8; FRAME_SIZE] {
+    let mut frame = [0u8; FRAME_SIZE];
+    let len = payload.len().min(FRAME_SIZE - 2);
+    frame[0] = magic;
+    frame[1] = len as u8;
+    frame[2..2 + len].copy_from_slice(&payload[..len]);
+    frame
 }
 
 fn preservable_staged_response(
@@ -695,4 +713,53 @@ fn extract_ascii_command(frame: &[u8; FRAME_SIZE]) -> Option<&str> {
         start = slash + 1;
     }
     None
+}
+
+fn extract_ascii_line(frame: &[u8; FRAME_SIZE]) -> Option<&str> {
+    let scan = &frame[..FRAME_SIZE.min(96)];
+    let mut start = 0usize;
+    while start < scan.len() {
+        while start < scan.len()
+            && !(scan[start] == b'/'
+                || scan[start] == b'['
+                || scan[start] == b'0'
+                || (b'1'..=b'9').contains(&scan[start])
+                || (b'A'..=b'Z').contains(&scan[start])
+                || (b'a'..=b'z').contains(&scan[start]))
+        {
+            start += 1;
+        }
+        if start >= scan.len() {
+            break;
+        }
+        let tail = &scan[start..];
+        let end = tail
+            .iter()
+            .position(|&byte| byte == 0 || byte == b'\n' || byte == b'\r')
+            .unwrap_or(tail.len());
+        if end == 0 {
+            start += 1;
+            continue;
+        }
+        if let Ok(candidate) = core::str::from_utf8(&tail[..end]) {
+            if candidate
+                .bytes()
+                .all(|byte| byte == b'/' || (32..=126).contains(&byte))
+            {
+                return Some(candidate);
+            }
+        }
+        start += 1;
+    }
+    None
+}
+
+fn looks_like_chat_text(line: &str) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    if line.starts_with('/') {
+        return false;
+    }
+    line.contains(':') || line.contains(' ')
 }
