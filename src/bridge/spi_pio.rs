@@ -83,19 +83,6 @@ fn normalize_request_frame(
         return (*rx_frame, received);
     }
 
-    if scan_len >= 3
-        && rx_frame[0] != 0
-        && rx_frame[0] == rx_frame[1]
-        && rx_frame[0] <= (FRAME_SIZE - 2) as u8
-    {
-        let expected = (rx_frame[0] as usize + 2).min(FRAME_SIZE);
-        let mut normalized = [0u8; FRAME_SIZE];
-        normalized[0] = REQ_COMMAND_MAGIC;
-        normalized[1] = rx_frame[0];
-        normalized[2..].copy_from_slice(&rx_frame[2..]);
-        return (normalized, expected.max(received.saturating_add(1)).min(FRAME_SIZE));
-    }
-
     for offset in 1..scan_len {
         if !matches!(rx_frame[offset], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
             continue;
@@ -198,14 +185,10 @@ mod tests {
             0x0f, 0x0f, b'[', b'1', b'0', b'.', b'8', b'.', b'0', b'.', b'6', b']', b' ',
             b'h', b'e', b'y', b'\n',
         ]);
-        match state.finish_transaction(&frame, 0) {
-            TransactionResult::Complete(frame) => {
-                assert_eq!(frame[0], REQ_COMMAND_MAGIC);
-                assert_eq!(frame[1], 0x0f);
-                assert_eq!(&frame[2..17], b"[10.8.0.6] hey\n");
-            }
-            other => panic!("expected normalized complete frame, got {other:?}"),
-        }
+        assert!(matches!(
+            state.finish_transaction(&frame, 0),
+            TransactionResult::Partial { .. }
+        ));
     }
 
     #[test]
@@ -213,13 +196,9 @@ mod tests {
         let mut state = PioSpiTransportState::new();
         let mut frame = [0u8; FRAME_SIZE];
         frame[..8].copy_from_slice(&[0x06, 0x06, b'/', b'l', b'i', b'n', b'k', b'\n']);
-        match state.finish_transaction(&frame, 1) {
-            TransactionResult::Complete(frame) => {
-                assert_eq!(frame[0], REQ_COMMAND_MAGIC);
-                assert_eq!(frame[1], 0x06);
-                assert_eq!(&frame[2..8], b"/link\n");
-            }
-            other => panic!("expected normalized complete frame, got {other:?}"),
-        }
+        assert!(matches!(
+            state.finish_transaction(&frame, 1),
+            TransactionResult::Partial { .. }
+        ));
     }
 }

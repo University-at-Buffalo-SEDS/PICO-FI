@@ -34,7 +34,7 @@ pub async fn run_client(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_keep_alive(Some(Duration::from_secs(5)));
+        socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
         if connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms)
@@ -44,7 +44,7 @@ pub async fn run_client(
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
+        socket.set_timeout(None);
         if exchange_link_handshake(
             &mut socket,
             true,
@@ -88,12 +88,12 @@ pub async fn run_server(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_keep_alive(Some(Duration::from_secs(5)));
+        socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         if socket.accept(port).await.is_err() {
             return Err(());
         }
-        socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
+        socket.set_timeout(None);
         if exchange_link_handshake(
             &mut socket,
             false,

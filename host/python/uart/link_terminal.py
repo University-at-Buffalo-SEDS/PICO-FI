@@ -186,6 +186,14 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
             if not ready:
                 continue
             ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                ready, _, _ = select.select([fd], [], [], 0.01)
+                if ready:
+                    sys.stdin.read(1)
+                    ready, _, _ = select.select([fd], [], [], 0.01)
+                    if ready:
+                        sys.stdin.read(1)
+                continue
             line = prompt.handle_key(ch)
             if line is not None:
                 outbound.put(line)

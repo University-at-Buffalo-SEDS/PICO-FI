@@ -35,7 +35,7 @@ pub async fn run_client(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_keep_alive(Some(Duration::from_secs(5)));
+        socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
         loop {
@@ -57,7 +57,7 @@ pub async fn run_client(
                 }
             }
         }
-        socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
+        socket.set_timeout(None);
         let _ = writeln_line(uart, "spi client: connected").await;
         if exchange_link_handshake(
             &mut socket,
@@ -106,7 +106,7 @@ pub async fn run_server(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_keep_alive(Some(Duration::from_secs(5)));
+        socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
         loop {
@@ -120,7 +120,7 @@ pub async fn run_server(
                 Either::Second(Err(_)) => return Err(()),
             }
         }
-        socket.set_timeout(Some(Duration::from_millis(runtime.socket_timeout_ms)));
+        socket.set_timeout(None);
         let _ = writeln_line(uart, "spi server: accepted").await;
         if exchange_link_handshake(
             &mut socket,

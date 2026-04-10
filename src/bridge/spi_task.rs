@@ -35,8 +35,8 @@ const SPI_RX_DMA_CHANNEL: usize = 3;
 const SPI_DMA_SETTLE_SPINS: usize = 4096;
 const SPI_TX_FIFO_PRELOAD_WORDS: usize = 4;
 const SPI_TX_WORDS: usize = FRAME_SIZE.div_ceil(4);
-const SPI_SELF_HEAL_THRESHOLD: u8 = 2;
-const SPI_SELF_HEAL_DELAY_MS: u64 = 2;
+const SPI_SELF_HEAL_THRESHOLD: u8 = 1;
+const SPI_SELF_HEAL_DELAY_MS: u64 = 5;
 
 #[derive(Clone, Copy, Default)]
 struct TransactionStats {
@@ -221,9 +221,8 @@ pub async fn spi_poll_task(
             transport.stage_response(next);
         }
 
-        if error_streak >= SPI_SELF_HEAL_THRESHOLD
-            && is_default_empty_data_response(&transport.staged_response())
-        {
+        if error_streak >= SPI_SELF_HEAL_THRESHOLD {
+            let preserved_response = preservable_staged_response(&transport);
             soft_reset_transport(
                 &irq_flags,
                 &mut initial_sm,
@@ -231,6 +230,7 @@ pub async fn spi_poll_task(
                 &mut transport,
                 tx,
                 rx_resp,
+                preserved_response,
             );
             error_streak = 0;
             Timer::after_millis(SPI_SELF_HEAL_DELAY_MS).await;
@@ -240,6 +240,17 @@ pub async fn spi_poll_task(
 
 fn is_default_empty_data_response(frame: &[u8; FRAME_SIZE]) -> bool {
     frame[0] == RESP_DATA_MAGIC && frame[1] == 0
+}
+
+fn preservable_staged_response(
+    transport: &PioSpiTransportState,
+) -> Option<[u8; FRAME_SIZE]> {
+    let frame = transport.staged_response();
+    if frame[0] == RESP_COMMAND_MAGIC && frame[1] > 0 {
+        Some(frame)
+    } else {
+        None
+    }
 }
 
 fn preload_tx_fifo(
@@ -564,8 +575,7 @@ fn is_suspicious_transaction(result: &TransactionResult) -> bool {
         TransactionResult::IdlePoll { .. } => false,
         TransactionResult::Partial { .. } => true,
         TransactionResult::Complete(frame) => {
-            recover_duplicate_length_frame(frame).is_none()
-                && parse_request_frame(frame).is_none()
+            parse_request_frame(frame).is_none()
                 && extract_ascii_command(frame).is_none()
         }
     }
@@ -578,11 +588,14 @@ fn soft_reset_transport(
     transport: &mut PioSpiTransportState,
     tx: &'static OverwriteQueue<SpiFrame, 8>,
     rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
+    preserved_response: Option<[u8; FRAME_SIZE]>,
 ) {
     let _ = stop_transaction(irq_flags, initial_sm, io_sm, 0);
     tx.clear();
     rx_resp.clear();
-    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
+    transport.stage_response(
+        preserved_response.unwrap_or_else(|| make_response_frame(RESP_DATA_MAGIC, b"")),
+    );
 }
 
 fn finalize_transaction(
@@ -600,45 +613,48 @@ fn finalize_transaction(
             expected,
             frame,
         } => {
-            if let Some(recovered) = recover_duplicate_length_frame(&frame) {
-                return dispatch_recovered_frame(recovered, bridge_config, link_active, tx);
-            }
             if let Some(line) = extract_ascii_command(&frame) {
-                let response = render_local_bridge_command(bridge_config, link_active, line);
-                return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                if line.starts_with('/') {
+                    let response = render_local_bridge_command(bridge_config, link_active, line);
+                    return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                }
             }
             let _ = (received, expected);
             Some(make_response_frame(RESP_DATA_MAGIC, b""))
         }
         TransactionResult::Complete(frame) => {
-            let parsed_frame = recover_duplicate_length_frame(&frame).unwrap_or(frame);
-            match parse_request_frame(&parsed_frame) {
+            match parse_request_frame(&frame) {
                 Some(RequestFrame::Command(payload)) => {
                     let line = trim_ascii_line(payload);
                     if line.starts_with('/') {
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
-                    } else {
-                        tx.push_overwrite(SpiFrame { data: parsed_frame });
+                    } else if is_strict_forward_frame(&frame) {
+                        tx.push_overwrite(SpiFrame { data: frame });
                         None
+                    } else {
+                        Some(make_response_frame(RESP_DATA_MAGIC, b""))
                     }
                 }
                 Some(RequestFrame::Data(payload)) => {
-                    if let Some(line) = extract_ascii_command(&parsed_frame) {
+                    if let Some(line) = extract_ascii_command(&frame) {
                         let response = render_local_bridge_command(bridge_config, link_active, line);
                         return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
                     }
                     let _ = payload;
-                    tx.push_overwrite(SpiFrame { data: parsed_frame });
-                    None
+                    if is_strict_forward_frame(&frame) {
+                        tx.push_overwrite(SpiFrame { data: frame });
+                        None
+                    } else {
+                        Some(make_response_frame(RESP_DATA_MAGIC, b""))
+                    }
                 }
                 None => {
-                    if let Some(recovered) = recover_duplicate_length_frame(&frame) {
-                        return dispatch_recovered_frame(recovered, bridge_config, link_active, tx);
-                    }
                     if let Some(line) = extract_ascii_command(&frame) {
-                        let response = render_local_bridge_command(bridge_config, link_active, line);
-                        return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                        if line.starts_with('/') {
+                            let response = render_local_bridge_command(bridge_config, link_active, line);
+                            return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
+                        }
                     }
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
                 }
@@ -647,48 +663,15 @@ fn finalize_transaction(
     }
 }
 
-fn dispatch_recovered_frame(
-    frame: [u8; FRAME_SIZE],
-    bridge_config: BridgeConfig,
-    link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<SpiFrame, 8>,
-) -> Option<[u8; FRAME_SIZE]> {
-    match parse_request_frame(&frame) {
-        Some(RequestFrame::Command(payload)) => {
-            let line = trim_ascii_line(payload);
-            if line.starts_with('/') {
-                let response = render_local_bridge_command(bridge_config, link_active, line);
-                Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
-            } else {
-                tx.push_overwrite(SpiFrame { data: frame });
-                None
-            }
-        }
-        Some(RequestFrame::Data(payload)) => {
-            let _ = payload;
-            tx.push_overwrite(SpiFrame { data: frame });
-            None
-        }
-        None => Some(make_response_frame(
-            RESP_COMMAND_MAGIC,
-            render_spi_diag("inv", 0, 0, &frame[..8]).as_bytes(),
-        )),
+fn is_strict_forward_frame(frame: &[u8; FRAME_SIZE]) -> bool {
+    if !matches!(frame[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+        return false;
     }
-}
-
-fn recover_duplicate_length_frame(frame: &[u8; FRAME_SIZE]) -> Option<[u8; FRAME_SIZE]> {
-    let len = frame[0] as usize;
-    if len == 0 || len > 96 || len > FRAME_SIZE - 2 || frame[0] != frame[1] {
-        return None;
+    let len = frame[1] as usize;
+    if len > FRAME_SIZE - 2 {
+        return false;
     }
-    if frame[2] == 0 {
-        return None;
-    }
-    let mut recovered = [0u8; FRAME_SIZE];
-    recovered[0] = REQ_COMMAND_MAGIC;
-    recovered[1] = frame[0];
-    recovered[2..].copy_from_slice(&frame[2..]);
-    Some(recovered)
+    frame[2 + len..].iter().all(|&byte| byte == 0)
 }
 
 fn extract_ascii_command(frame: &[u8; FRAME_SIZE]) -> Option<&str> {

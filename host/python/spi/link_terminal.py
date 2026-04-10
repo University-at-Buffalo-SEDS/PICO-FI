@@ -234,6 +234,12 @@ def exchange_frame(
                 if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
                     stream_printer.feed(rx_payload)
                     stream_printer.flush_partial()
+                # A trailing empty poll helps return the SPI transport to the stable
+                # empty-response state after non-command traffic.
+                cleanup_magic, cleanup_payload = parse_frame(bus.read_frame())
+                if cleanup_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and cleanup_payload:
+                    stream_printer.feed(cleanup_payload)
+                    stream_printer.flush_partial()
                 return
 
             last_magic = 0
