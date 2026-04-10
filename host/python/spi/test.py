@@ -37,20 +37,19 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
 def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
     if len(frame) != FRAME_SIZE:
         return 0, 0, b""
-    if frame[0] == 0 and frame[1] in (RESP_MAGIC, RESP_COMMAND_MAGIC):
-        magic_val = frame[1]
-        length = frame[2]
-        payload_start = 3
-    else:
-        magic_val = frame[0]
-        length = frame[1]
-        payload_start = 2
-    if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
-        return 0, 0, b""
-    payload_end = payload_start + length
-    if payload_end > FRAME_SIZE:
-        return 0, 0, b""
-    return magic_val, length, bytes(frame[payload_start:payload_end])
+    for offset in range(0, min(8, FRAME_SIZE - 1)):
+        magic_val = frame[offset]
+        if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+            continue
+        length = frame[offset + 1]
+        if length > PAYLOAD_MAX:
+            continue
+        payload_start = offset + 2
+        payload_end = payload_start + length
+        if payload_end > FRAME_SIZE:
+            continue
+        return magic_val, length, bytes(frame[payload_start:payload_end])
+    return 0, 0, b""
 
 
 def format_bytes(data: bytes) -> str:

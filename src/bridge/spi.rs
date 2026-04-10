@@ -204,8 +204,6 @@ async fn handle_spi_request(
             if let Some(socket) = socket {
                 if !payload.is_empty() {
                     write_socket(socket, payload).await?;
-                    let response = make_response_frame(RESP_DATA_MAGIC, b"");
-                    spi_tx.push_overwrite(SpiFrame { data: response });
                 }
             } else {
                 let response = if payload.is_empty() {
@@ -226,8 +224,6 @@ async fn handle_spi_request(
             } else if let Some(socket) = socket {
                 if !payload.is_empty() {
                     write_socket(socket, payload).await?;
-                    let response = make_response_frame(RESP_DATA_MAGIC, b"");
-                    spi_tx.push_overwrite(SpiFrame { data: response });
                 }
             } else {
                 let response = if payload.is_empty() {

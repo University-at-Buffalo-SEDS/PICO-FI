@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import collections
-import contextlib
-import io
 import queue
 import select
 import shutil
@@ -22,11 +20,7 @@ from dataclasses import dataclass, field
 try:
     from .raw import FRAME_SIZE, open_bus
     from .test import (
-        COMMAND_POLL_LIMIT,
-        COMMAND_RETRY_LIMIT,
-        is_plausible_command_payload,
         parse_frame as parse_frame_full,
-        spi_exchange,
     )
 except ImportError:
     import os
@@ -34,11 +28,7 @@ except ImportError:
     sys.path.append(os.path.dirname(__file__))
     from raw import FRAME_SIZE, open_bus
     from test import (
-        COMMAND_POLL_LIMIT,
-        COMMAND_RETRY_LIMIT,
-        is_plausible_command_payload,
         parse_frame as parse_frame_full,
-        spi_exchange,
     )
 
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -233,12 +223,14 @@ def exchange_frame(
     expect_command_reply: bool,
 ) -> None:
     try:
-        if not expect_command_reply:
-            with open_bus(bus_num, device, speed) as bus:
-                first_rx = bus.write_frame(build_frame(payload, magic))
-                rx_magic, rx_payload = parse_frame(first_rx)
+        with open_bus(bus_num, device, speed) as bus:
+            first_rx = bus.write_frame(build_frame(payload, magic))
+            rx_magic, rx_payload = parse_frame(first_rx)
+            last_raw = first_rx
+            if not expect_command_reply:
                 if rx_magic == 0:
                     follow_rx = bus.read_frame()
+                    last_raw = follow_rx
                     rx_magic, rx_payload = parse_frame(follow_rx)
                     if rx_magic == 0:
                         prompt.print_line(
@@ -248,42 +240,33 @@ def exchange_frame(
                 if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
                     stream_printer.feed(rx_payload)
                     stream_printer.flush_partial()
-            return
+                return
 
-        capture = io.StringIO()
-        with contextlib.redirect_stdout(capture):
-            rc = spi_exchange(
-                bus_num,
-                device,
-                speed,
-                payload,
-                magic,
-                require_valid_response=True,
-                await_nonempty_data=False,
-                expected_text=None,
-                verbose_raw=False,
+            deadline = time.monotonic() + COMMAND_TIMEOUT_S
+            while True:
+                if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
+                elif rx_magic == RESP_COMMAND_MAGIC:
+                    if rx_payload:
+                        text = rx_payload.decode("utf-8", errors="replace").replace("\r", "")
+                        for line in text.split("\n"):
+                            if line:
+                                prompt.print_line(line)
+                    return
+
+                if time.monotonic() >= deadline:
+                    break
+
+                time.sleep(max(poll_delay_s, 0.01))
+                last_raw = bus.read_frame()
+                rx_magic, rx_payload = parse_frame(last_raw)
+
+            prompt.print_line(
+                "[spi dbg] command failed "
+                f"0x{rx_magic:02x}, Length: {len(rx_payload)} "
+                f"Recv: {format_bytes(last_raw)}"
             )
-        output = capture.getvalue().splitlines()
-        recv_line = ""
-        magic_line = ""
-        for line in output:
-            if line.startswith("Recv: "):
-                recv_line = line.removeprefix("Recv: ").strip()
-            elif line.startswith("Magic: "):
-                magic_line = line.removeprefix("Magic: ").strip()
-            if line.startswith("Response: "):
-                response = line.removeprefix("Response: ").strip()
-                if response.startswith("'") and response.endswith("'"):
-                    response = response[1:-1]
-                if response:
-                    prompt.print_line(response)
-        if rc != 0:
-            if recv_line or magic_line:
-                prompt.print_line(
-                    "[spi dbg] command failed "
-                    f"{magic_line or 'Magic: unknown'} "
-                    f"{('Recv: ' + recv_line) if recv_line else ''}".strip()
-                )
             prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")
