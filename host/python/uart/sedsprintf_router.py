@@ -37,6 +37,8 @@ except ImportError:
 
 class UartRouterAdapter:
     payload_limit = FRAME_SIZE - 2
+    minimum_poll_s = 0.01
+    send_reply_wait_s = 0.02
 
     def __init__(self, port: str, speed: int) -> None:
         self.ser = open_serial(port, speed)
@@ -53,7 +55,7 @@ class UartRouterAdapter:
     def send_payload(self, payload: bytes) -> None:
         self.ser.write(build_frame(payload, REQ_DATA_MAGIC))
         self.ser.flush()
-        captured = self._capture(read_frame(self.ser, 0.25))
+        captured = self._capture(read_frame(self.ser, self.send_reply_wait_s))
         if captured:
             self.pending.append(captured)
 
@@ -62,7 +64,7 @@ class UartRouterAdapter:
             return self.pending.popleft()
         self.ser.write(build_frame(b"", REQ_DATA_MAGIC))
         self.ser.flush()
-        captured = self._capture(read_frame(self.ser, max(timeout_s, 0.1)))
+        captured = self._capture(read_frame(self.ser, max(timeout_s, self.minimum_poll_s)))
         if captured:
             return captured
         return None

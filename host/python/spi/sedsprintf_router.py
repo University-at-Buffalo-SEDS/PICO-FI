@@ -40,6 +40,9 @@ except ImportError:
 
 class SpiRouterAdapter:
     payload_limit = FRAME_SIZE - 2
+    send_poll_attempts = 2
+    send_poll_sleep_s = 0.002
+    poll_sleep_s = 0.002
 
     def __init__(self, bus_num: int, device: int, speed: int) -> None:
         self.bus = open_bus(bus_num, device, speed)
@@ -57,8 +60,8 @@ class SpiRouterAdapter:
         if captured:
             self.pending.append(captured)
             return
-        for _ in range(4):
-            time.sleep(0.01)
+        for _ in range(self.send_poll_attempts):
+            time.sleep(self.send_poll_sleep_s)
             captured = self._capture(self.bus.read_frame())
             if captured:
                 self.pending.append(captured)
@@ -80,7 +83,7 @@ class SpiRouterAdapter:
                     return captured
                 if time.monotonic() >= deadline:
                     return None
-                time.sleep(0.01)
+                time.sleep(self.poll_sleep_s)
         return None
 
     def close(self) -> None:
