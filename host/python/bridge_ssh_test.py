@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UART_TEST = REPO_ROOT / "host/python/uart/test.py"
+TELEMETRY_CLI = REPO_ROOT / "host/python/telemetry_cli.py"
 SPI_TEST_DIR = REPO_ROOT / "host/python/spi"
 REMOTE_SPI_STAGE = "/tmp/pico-fi-spi-test"
 LINK_HANDSHAKE_MAGIC = b"PICOFI1"
@@ -223,6 +224,7 @@ def stage_remote_spi_tools(target: str) -> int:
         return rc
     files = [
         REPO_ROOT / "host/python/sedsprintf_router_common.py",
+        TELEMETRY_CLI,
         SPI_TEST_DIR / "__init__.py",
         SPI_TEST_DIR / "link_terminal_driver.py",
         SPI_TEST_DIR / "link_terminal.py",
@@ -333,6 +335,96 @@ def run_local_uart_recv(python_bin: str, port: str, speed: int, expect: str | No
     if expect:
         cmd.extend(["--expect", expect])
     return run_checked(cmd)
+
+
+def run_local_telemetry_send(
+    python_bin: str,
+    port: str,
+    speed: int,
+    text: str,
+    sender: str,
+) -> int:
+    return run_checked(
+        [
+            python_bin,
+            str(TELEMETRY_CLI),
+            "send",
+            "--sender",
+            sender,
+            text,
+            "uart",
+            "--port",
+            port,
+            "--speed",
+            str(speed),
+        ]
+    )
+
+
+def spawn_local_telemetry_recv(
+    python_bin: str,
+    port: str,
+    speed: int,
+    expect: str,
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [
+            python_bin,
+            str(TELEMETRY_CLI),
+            "recv",
+            "--timeout",
+            "10",
+            "--expect",
+            expect,
+            "uart",
+            "--port",
+            port,
+            "--speed",
+            str(speed),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def run_remote_telemetry_send(
+    target: str,
+    text: str,
+    speed: int,
+    sender: str,
+) -> int:
+    rc = stage_remote_spi_tools(target)
+    if rc != 0:
+        return rc
+    remote = (
+        f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+        "PYTHONPATH=\"$HOME/venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}\" "
+        f"python3 telemetry_cli.py send --sender {shlex.quote(sender)} "
+        f"{shlex.quote(text)} spi --speed {speed}"
+    )
+    return run_checked(build_ssh_command(target, remote))
+
+
+def spawn_remote_telemetry_recv(
+    target: str,
+    speed: int,
+    expect: str,
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        build_ssh_command(
+            target,
+            (
+                f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+                "PYTHONPATH=\"$HOME/venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}\" "
+                f"python3 telemetry_cli.py recv --timeout 10 --expect {shlex.quote(expect)} "
+                f"spi --speed {speed}"
+            ),
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
 
 def start_remote_echo_server(target: str, bind_host: str, bind_port: int) -> subprocess.Popen[str]:
@@ -1114,6 +1206,16 @@ def main() -> int:
     telemetry_soak.add_argument("--local-router-forward-port", type=int, default=9101)
     telemetry_soak.add_argument("--remote-router-listen-port", type=int, default=9200)
     telemetry_soak.add_argument("--remote-router-forward-port", type=int, default=9201)
+    telemetry_once = subparsers.add_parser(
+        "telemetry-once",
+        help="Send one telemetry payload across the UART/SPI bridge and print what the far side receives",
+    )
+    telemetry_once.add_argument(
+        "--direction",
+        choices=["uart-to-spi", "spi-to-uart"],
+        default="uart-to-spi",
+    )
+    telemetry_once.add_argument("--text", default=None)
 
     spi_probe = subparsers.add_parser("spi-probe", help="Run the remote SPI probe via SSH")
     spi_probe.add_argument("--count", type=int, default=None)
@@ -1149,6 +1251,50 @@ def main() -> int:
         return run_spi_link_terminal_soak(args)
     if args.command == "telemetry-router-soak":
         return run_telemetry_router_soak(args)
+    if args.command == "telemetry-once":
+        payload = args.text or args.payload
+        if args.direction == "uart-to-spi":
+            rc = stage_remote_spi_tools(args.ssh_target)
+            if rc != 0:
+                return rc
+            recv_proc = spawn_remote_telemetry_recv(
+                args.ssh_target,
+                args.spi_speed,
+                payload,
+            )
+            time.sleep(0.2)
+            try:
+                rc = run_local_telemetry_send(
+                    args.local_python,
+                    args.uart_port,
+                    args.uart_speed,
+                    payload,
+                    "uart-node",
+                )
+                if rc != 0:
+                    return rc
+                return wait_checked(recv_proc, 10.0, "remote telemetry recv")[0]
+            finally:
+                stop_process(recv_proc)
+        recv_proc = spawn_local_telemetry_recv(
+            args.local_python,
+            args.uart_port,
+            args.uart_speed,
+            payload,
+        )
+        time.sleep(0.2)
+        try:
+            rc = run_remote_telemetry_send(
+                args.ssh_target,
+                payload,
+                args.spi_speed,
+                "spi-node",
+            )
+            if rc != 0:
+                return rc
+            return wait_checked(recv_proc, 10.0, "local telemetry recv")[0]
+        finally:
+            stop_process(recv_proc)
     if args.command == "spi-probe":
         return run_remote_spi_probe(
             args.ssh_target,

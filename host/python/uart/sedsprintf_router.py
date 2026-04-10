@@ -21,8 +21,8 @@ except ImportError:
     import os
     import sys
 
-    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-    sys.path.append(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.dirname(__file__))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from sedsprintf_router_common import add_router_args, run_udp_router
     from test import (
         FRAME_SIZE,
