@@ -4,17 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import atexit
-import queue
-import select
-import shutil
 import socket
 import sys
-import termios
 import threading
 import time
-import tty
-from dataclasses import dataclass, field
 
 try:
     from .telemetry_cli import build_adapter
@@ -57,100 +50,18 @@ def default_sender_label() -> str:
         return "telemetry-terminal"
 
 
-@dataclass
-class PromptState:
-    prompt: str = "> "
-    buffer: str = ""
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def _rows_for(self, text: str) -> int:
-        cols = max(shutil.get_terminal_size(fallback=(80, 24)).columns, 1)
-        width = max(len(text), 1)
-        return (width - 1) // cols + 1
-
-    def _clear_prompt(self) -> None:
-        rows = self._rows_for(self.prompt + self.buffer)
-        for idx in range(rows):
-            if idx:
-                sys.stdout.write("\x1b[1A")
-            sys.stdout.write("\r\033[2K")
-
-    def redraw(self) -> None:
-        self._clear_prompt()
-        sys.stdout.write(self.prompt + self.buffer)
-        sys.stdout.flush()
-
-    def print_line(self, line: str) -> None:
-        with self.lock:
-            self._clear_prompt()
-            sys.stdout.write(line + "\n")
-            self.redraw()
-
-    def handle_key(self, ch: str) -> str | None:
-        with self.lock:
-            if ch in ("\r", "\n"):
-                line = self.buffer
-                self.buffer = ""
-                self._clear_prompt()
-                sys.stdout.flush()
-                return line
-            if ch in ("\x7f", "\b"):
-                self.buffer = self.buffer[:-1]
-            elif ch.isprintable():
-                self.buffer += ch
-            self.redraw()
-            return None
-
-
-class TerminalModeGuard:
+class Printer:
     def __init__(self) -> None:
-        self._fd: int | None = None
-        self._old: list | None = None
-        self._active = False
+        self.lock = threading.Lock()
 
-    def enable(self) -> None:
-        if not sys.stdin.isatty():
-            return
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        tty.setcbreak(fd)
-        self._fd = fd
-        self._old = old
-        self._active = True
+    def line(self, text: str) -> None:
+        with self.lock:
+            print(text, flush=True)
 
-    def restore(self) -> None:
-        if not self._active or self._fd is None or self._old is None:
-            return
-        try:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
-        finally:
-            self._active = False
-            self._fd = None
-            self._old = None
-
-
-def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
-    fd = sys.stdin.fileno()
-    try:
-        prompt.redraw()
-        while True:
-            ready, _, _ = select.select([fd], [], [], 0.1)
-            if not ready:
-                continue
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":
-                ready, _, _ = select.select([fd], [], [], 0.01)
-                if ready:
-                    sys.stdin.read(1)
-                    ready, _, _ = select.select([fd], [], [], 0.01)
-                    if ready:
-                        sys.stdin.read(1)
-                continue
-            line = prompt.handle_key(ch)
-            if line is not None:
-                outbound.put(line)
-    except (EOFError, OSError):
-        return
+    def prompt(self) -> None:
+        with self.lock:
+            sys.stdout.write("> ")
+            sys.stdout.flush()
 
 
 def build_packet(args: argparse.Namespace, payload_text: str) -> bytes:
@@ -167,11 +78,38 @@ def build_packet(args: argparse.Namespace, payload_text: str) -> bytes:
     return armor_packet(packet)
 
 
-def print_help(prompt: PromptState) -> None:
-    prompt.print_line("telemetry mode:")
-    prompt.print_line("  plain text  send one telemetry payload")
-    prompt.print_line("  //help      show this help")
-    prompt.print_line("  //quit      exit")
+def print_help(printer: Printer) -> None:
+    printer.line("telemetry mode:")
+    printer.line("  plain text  send one telemetry payload")
+    printer.line("  //help      show this help")
+    printer.line("  //quit      exit")
+
+
+def recv_loop(
+    adapter,
+    adapter_lock: threading.Lock,
+    printer: Printer,
+    stop_event: threading.Event,
+    poll_s: float,
+) -> None:
+    sedsprintf = load_sedsprintf()
+    while not stop_event.is_set():
+        try:
+            with adapter_lock:
+                incoming = adapter.recv_payload(poll_s)
+        except Exception as exc:
+            printer.line(f"[error] receive failed: {exc}")
+            stop_event.set()
+            return
+        if not incoming:
+            continue
+        packet = decode_armored_packet(sedsprintf, incoming)
+        if packet is None:
+            printer.line(f"[skip] non-sedsprintf payload: {render_payload(incoming)!r}")
+            continue
+        payload = bytes(packet.payload).decode("utf-8", errors="replace")
+        printer.line(f"[rx] {packet.sender}: {payload}")
+        printer.prompt()
 
 
 def main() -> int:
@@ -198,57 +136,57 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    sedsprintf = load_sedsprintf()
     adapter = build_adapter(args)
-    prompt = PromptState()
-    term_guard = TerminalModeGuard()
-    atexit.register(term_guard.restore)
-    term_guard.enable()
+    adapter_lock = threading.Lock()
+    printer = Printer()
+    stop_event = threading.Event()
+    poll_s = max(args.poll_ms / 1000.0, 0.05)
 
-    prompt.print_line(f"telemetry terminal on {args.backend}; sender={args.sender}")
-    print_help(prompt)
+    printer.line(f"telemetry terminal on {args.backend}; sender={args.sender}")
+    print_help(printer)
 
-    outbound: queue.Queue[str] = queue.Queue()
-    reader = threading.Thread(target=input_loop, args=(outbound, prompt), daemon=True)
-    reader.start()
+    receiver = threading.Thread(
+        target=recv_loop,
+        args=(adapter, adapter_lock, printer, stop_event, poll_s),
+        daemon=True,
+    )
+    receiver.start()
 
     try:
-        while True:
+        while not stop_event.is_set():
+            printer.prompt()
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            if line == "//quit":
+                break
+            if line == "//help":
+                print_help(printer)
+                continue
+
+            payload = build_packet(args, line)
+            if len(payload) > adapter.payload_limit:
+                printer.line(
+                    f"[error] telemetry packet too large: {len(payload)} > {adapter.payload_limit}"
+                )
+                continue
             try:
-                line = outbound.get(timeout=max(args.poll_ms / 1000.0, 0.05))
-            except queue.Empty:
-                line = None
-
-            if line is not None:
-                if line == "//quit":
-                    return 0
-                if line == "//help":
-                    print_help(prompt)
-                elif line:
-                    payload = build_packet(args, line)
-                    if len(payload) > adapter.payload_limit:
-                        prompt.print_line(
-                            f"[error] telemetry packet too large: {len(payload)} > {adapter.payload_limit}"
-                        )
-                    else:
-                        adapter.send_payload(payload)
-                        prompt.print_line(f"[tx] {args.sender}: {line}")
-
-            incoming = adapter.recv_payload(max(args.poll_ms / 1000.0, 0.05))
-            if not incoming:
-                continue
-            packet = decode_armored_packet(sedsprintf, incoming)
-            if packet is None:
-                prompt.print_line(f"[skip] non-sedsprintf payload: {render_payload(incoming)!r}")
-                continue
-            payload = bytes(packet.payload)
-            text = payload.decode("utf-8", errors="replace")
-            prompt.print_line(f"[rx] {packet.sender}: {text}")
+                with adapter_lock:
+                    adapter.send_payload(payload)
+            except Exception as exc:
+                printer.line(f"[error] send failed: {exc}")
+                return 1
+            printer.line(f"[tx] {args.sender}: {line}")
     except KeyboardInterrupt:
-        return 0
+        pass
     finally:
-        term_guard.restore()
+        stop_event.set()
+        receiver.join(timeout=1.0)
         adapter.close()
+    return 0
 
 
 if __name__ == "__main__":
