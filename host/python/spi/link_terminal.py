@@ -31,7 +31,7 @@ REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
 COMMAND_POLL_LIMIT = 50
-COMMAND_RETRY_LIMIT = 4
+COMMAND_TIMEOUT_S = 2.0
 
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
@@ -245,7 +245,8 @@ def exchange_frame(
 
         last_magic = 0
         last_payload = b""
-        for _ in range(COMMAND_RETRY_LIMIT):
+        deadline = time.monotonic() + COMMAND_TIMEOUT_S
+        while time.monotonic() < deadline:
             first_rx = bus.write_frame(build_frame(payload, magic))
             rx_magic, rx_payload = parse_frame(first_rx)
             last_magic, last_payload = rx_magic, rx_payload
