@@ -221,7 +221,9 @@ pub async fn spi_poll_task(
             transport.stage_response(next);
         }
 
-        if error_streak >= SPI_SELF_HEAL_THRESHOLD {
+        if error_streak >= SPI_SELF_HEAL_THRESHOLD
+            && is_default_empty_data_response(&transport.staged_response())
+        {
             soft_reset_transport(&irq_flags, &mut initial_sm, &mut io_sm, &mut transport);
             error_streak = 0;
             Timer::after_millis(SPI_SELF_HEAL_DELAY_MS).await;

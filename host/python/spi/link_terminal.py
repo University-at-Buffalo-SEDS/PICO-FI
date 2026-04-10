@@ -19,11 +19,13 @@ from dataclasses import dataclass, field
 
 try:
     from .raw import FRAME_SIZE, open_bus
+    from .test import parse_frame as parse_frame_full
 except ImportError:
     import os
 
     sys.path.append(os.path.dirname(__file__))
     from raw import FRAME_SIZE, open_bus
+    from test import parse_frame as parse_frame_full
 
 PAYLOAD_MAX = FRAME_SIZE - 2
 REQ_MAGIC = 0xA5
@@ -44,22 +46,8 @@ def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
 
 
 def parse_frame(frame: bytes) -> tuple[int, bytes]:
-    if len(frame) != FRAME_SIZE:
-        return 0, b""
-    if frame[0] == 0 and frame[1] in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC):
-        magic = frame[1]
-        length = frame[2]
-        payload_start = 3
-    else:
-        magic = frame[0]
-        length = frame[1]
-        payload_start = 2
-    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
-        return 0, b""
-    payload_end = payload_start + length
-    if payload_end > FRAME_SIZE:
-        return 0, b""
-    return magic, bytes(frame[payload_start:payload_end])
+    magic, _, payload = parse_frame_full(frame)
+    return magic, payload
 
 
 def print_help() -> list[str]:
