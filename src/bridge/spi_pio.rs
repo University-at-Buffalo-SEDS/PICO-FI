@@ -83,6 +83,12 @@ fn normalize_request_frame(
         return (*rx_frame, received);
     }
 
+    if let Some((normalized, adjusted_received)) =
+        recover_missing_magic_command_frame(rx_frame, received, scan_len)
+    {
+        return (normalized, adjusted_received);
+    }
+
     for offset in 1..scan_len {
         if !matches!(rx_frame[offset], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
             continue;
@@ -100,6 +106,32 @@ fn normalize_request_frame(
     }
 
     (*rx_frame, received)
+}
+
+fn recover_missing_magic_command_frame(
+    rx_frame: &[u8; FRAME_SIZE],
+    received: usize,
+    scan_len: usize,
+) -> Option<([u8; FRAME_SIZE], usize)> {
+    let len = rx_frame[0] as usize;
+    if len == 0 || len > FRAME_SIZE - 2 {
+        return None;
+    }
+    if rx_frame[1] as usize != len {
+        return None;
+    }
+
+    if scan_len < 3 {
+        return None;
+    }
+
+    let mut normalized = [0u8; FRAME_SIZE];
+    normalized[0] = REQ_COMMAND_MAGIC;
+    normalized[1] = len as u8;
+    normalized[2..2 + len].copy_from_slice(&rx_frame[2..2 + len]);
+
+    let adjusted_received = (len + 2).min(FRAME_SIZE).max(received);
+    Some((normalized, adjusted_received))
 }
 
 #[cfg(test)]
@@ -185,10 +217,14 @@ mod tests {
             0x0f, 0x0f, b'[', b'1', b'0', b'.', b'8', b'.', b'0', b'.', b'6', b']', b' ',
             b'h', b'e', b'y', b'\n',
         ]);
-        assert!(matches!(
-            state.finish_transaction(&frame, 0),
-            TransactionResult::Partial { .. }
-        ));
+        match state.finish_transaction(&frame, 0) {
+            TransactionResult::Complete(frame) => {
+                assert_eq!(frame[0], REQ_COMMAND_MAGIC);
+                assert_eq!(frame[1], 0x0f);
+                assert_eq!(&frame[2..17], b"[10.8.0.6] hey\n");
+            }
+            other => panic!("expected recovered complete frame, got {other:?}"),
+        }
     }
 
     #[test]
@@ -196,9 +232,13 @@ mod tests {
         let mut state = PioSpiTransportState::new();
         let mut frame = [0u8; FRAME_SIZE];
         frame[..8].copy_from_slice(&[0x06, 0x06, b'/', b'l', b'i', b'n', b'k', b'\n']);
-        assert!(matches!(
-            state.finish_transaction(&frame, 1),
-            TransactionResult::Partial { .. }
-        ));
+        match state.finish_transaction(&frame, 1) {
+            TransactionResult::Complete(frame) => {
+                assert_eq!(frame[0], REQ_COMMAND_MAGIC);
+                assert_eq!(frame[1], 0x06);
+                assert_eq!(&frame[2..8], b"/link\n");
+            }
+            other => panic!("expected recovered complete frame, got {other:?}"),
+        }
     }
 }

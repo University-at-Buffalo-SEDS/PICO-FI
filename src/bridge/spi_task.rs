@@ -171,23 +171,6 @@ pub async fn spi_poll_task(
         let received = stats.num_bytes_read.min(FRAME_SIZE);
         apply_initial_byte(&mut rx_frame, received, stats.first_byte);
 
-        if !static_mode && !echo_mode {
-            if let Some(line) = extract_ascii_line(&rx_frame) {
-                if line.starts_with('/') {
-                    let response = render_local_bridge_command(bridge_config, _link_active, line);
-                    transport.stage_response(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
-                } else if looks_like_chat_text(line) {
-                    tx.push_overwrite(SpiFrame {
-                        data: make_request_frame(REQ_COMMAND_MAGIC, line.as_bytes()),
-                    });
-                    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
-                } else {
-                    transport.stage_response(make_response_frame(RESP_DATA_MAGIC, b""));
-                }
-                continue;
-            }
-        }
-
         let result = transport.finish_transaction(&rx_frame, received);
         let suspicious = is_suspicious_transaction(&result);
 
@@ -591,7 +574,14 @@ fn render_spi_diag(kind: &str, received: usize, expected: usize, preview: &[u8])
 fn is_suspicious_transaction(result: &TransactionResult) -> bool {
     match result {
         TransactionResult::IdlePoll { .. } => false,
-        TransactionResult::Partial { .. } => true,
+        TransactionResult::Partial { frame, .. } => {
+            if let Some(line) = extract_ascii_command(frame) {
+                if line.starts_with('/') {
+                    return false;
+                }
+            }
+            true
+        }
         TransactionResult::Complete(frame) => {
             parse_request_frame(frame).is_none()
                 && extract_ascii_command(frame).is_none()
@@ -752,14 +742,4 @@ fn extract_ascii_line(frame: &[u8; FRAME_SIZE]) -> Option<&str> {
         start += 1;
     }
     None
-}
-
-fn looks_like_chat_text(line: &str) -> bool {
-    if line.is_empty() {
-        return false;
-    }
-    if line.starts_with('/') {
-        return false;
-    }
-    line.contains(':') || line.contains(' ')
 }

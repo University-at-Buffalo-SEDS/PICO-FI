@@ -9,7 +9,7 @@ use crate::protocol::i2c::{
     FRAME_SIZE, RequestFrame, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, make_response_frame,
     parse_request_frame,
 };
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
@@ -21,7 +21,6 @@ use portable_atomic::{AtomicBool, Ordering};
 
 const UART_EGRESS_RING_BYTES: usize = 4096;
 const UART_EGRESS_CHUNK_BYTES: usize = 256;
-
 pub async fn run_client(
     uart: &mut BufferedUart,
     stack: Stack<'static>,

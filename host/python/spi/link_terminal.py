@@ -63,6 +63,10 @@ def parse_frame(frame: bytes) -> tuple[int, bytes]:
     return magic, payload
 
 
+def format_bytes(data: bytes, limit: int = 16) -> str:
+    return " ".join(f"{b:02x}" for b in data[:limit])
+
+
 def print_help() -> list[str]:
     return [
         "chat mode:",
@@ -234,7 +238,13 @@ def exchange_frame(
                 first_rx = bus.write_frame(build_frame(payload, magic))
                 rx_magic, rx_payload = parse_frame(first_rx)
                 if rx_magic == 0:
-                    rx_magic, rx_payload = parse_frame(bus.read_frame())
+                    follow_rx = bus.read_frame()
+                    rx_magic, rx_payload = parse_frame(follow_rx)
+                    if rx_magic == 0:
+                        prompt.print_line(
+                            "[spi dbg] invalid send ack "
+                            f"write={format_bytes(first_rx)} poll={format_bytes(follow_rx)}"
+                        )
                 if rx_magic in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) and rx_payload:
                     stream_printer.feed(rx_payload)
                     stream_printer.flush_partial()
@@ -254,7 +264,13 @@ def exchange_frame(
                 verbose_raw=False,
             )
         output = capture.getvalue().splitlines()
+        recv_line = ""
+        magic_line = ""
         for line in output:
+            if line.startswith("Recv: "):
+                recv_line = line.removeprefix("Recv: ").strip()
+            elif line.startswith("Magic: "):
+                magic_line = line.removeprefix("Magic: ").strip()
             if line.startswith("Response: "):
                 response = line.removeprefix("Response: ").strip()
                 if response.startswith("'") and response.endswith("'"):
@@ -262,6 +278,12 @@ def exchange_frame(
                 if response:
                     prompt.print_line(response)
         if rc != 0:
+            if recv_line or magic_line:
+                prompt.print_line(
+                    "[spi dbg] command failed "
+                    f"{magic_line or 'Magic: unknown'} "
+                    f"{('Recv: ' + recv_line) if recv_line else ''}".strip()
+                )
             prompt.print_line("[pico] command timed out waiting for SPI reply")
     except Exception as exc:
         prompt.print_line(f"[error] SPI error: {exc}")

@@ -165,18 +165,22 @@ async fn session(
     let mut net_buf = [0u8; 256];
 
     loop {
-        match select(socket.read(&mut net_buf), spi_rx.pop()).await {
-            Either::First(Ok(net_n)) => {
+        match select(spi_rx.pop(), socket.read(&mut net_buf)).await {
+            Either::First(frame) => {
+                handle_spi_request(frame, Some(socket), bridge_config, link_active, spi_tx).await?;
+                while let Some(frame) = spi_rx.try_pop() {
+                    handle_spi_request(frame, Some(socket), bridge_config, link_active, spi_tx)
+                        .await?;
+                }
+            }
+            Either::Second(Ok(net_n)) => {
                 if net_n == 0 {
                     return Ok(());
                 }
                 let response = make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]);
                 spi_tx.push_overwrite(SpiFrame { data: response });
             }
-            Either::First(Err(_)) => return Err(()),
-            Either::Second(frame) => {
-                handle_spi_request(frame, Some(socket), bridge_config, link_active, spi_tx).await?;
-            }
+            Either::Second(Err(_)) => return Err(()),
         }
     }
 }
