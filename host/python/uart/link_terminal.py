@@ -100,6 +100,10 @@ def default_sender_label() -> str:
         return "local"
 
 
+def format_outbound_chat(sender: str, line: str) -> str:
+    return f"{sender}: {line}"
+
+
 @dataclass
 class PromptState:
     sender: str
@@ -271,11 +275,12 @@ def main() -> int:
                             prompt.print_line(f"[pico] {stripped}")
                             exchange_command(ser, prompt, stripped)
                         else:
-                            prompt.print_line(f"[{sender}] {line}")
+                            rendered = format_outbound_chat(sender, line)
+                            prompt.print_line(rendered)
                             send_frame(
                                 ser,
                                 REQ_DATA_MAGIC,
-                                f"[{sender}] {line}\n".encode("utf-8"),
+                                (rendered + "\n").encode("utf-8"),
                             )
                 except queue.Empty:
                     pass
