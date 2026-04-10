@@ -256,7 +256,7 @@ def main() -> int:
             args.device,
             args.speed,
             args.text.encode(),
-            REQ_MAGIC,
+            REQ_COMMAND_MAGIC,
             await_nonempty_data=True,
             expected_text=args.expect or None,
             verbose_raw=args.verbose_raw,
@@ -267,7 +267,7 @@ def main() -> int:
             args.device,
             args.speed,
             args.text.encode(),
-            REQ_MAGIC,
+            REQ_COMMAND_MAGIC,
             verbose_raw=args.verbose_raw,
         )
     if args.command == "recv":

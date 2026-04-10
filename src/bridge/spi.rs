@@ -215,9 +215,24 @@ async fn handle_spi_request(
         }
         Some(RequestFrame::Command(payload)) => {
             let line = trim_ascii_line(payload);
-            let response = render_local_bridge_command(bridge_config, link_active, line);
-            let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
-            spi_tx.push_overwrite(SpiFrame { data: frame });
+            if line.starts_with('/') {
+                let response = render_local_bridge_command(bridge_config, link_active, line);
+                let frame = make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes());
+                spi_tx.push_overwrite(SpiFrame { data: frame });
+            } else if let Some(socket) = socket {
+                if !payload.is_empty() {
+                    write_socket(socket, payload).await?;
+                    let response = make_response_frame(RESP_DATA_MAGIC, b"");
+                    spi_tx.push_overwrite(SpiFrame { data: response });
+                }
+            } else {
+                let response = if payload.is_empty() {
+                    make_response_frame(RESP_DATA_MAGIC, b"")
+                } else {
+                    make_response_frame(RESP_COMMAND_MAGIC, b"error spi data no socket")
+                };
+                spi_tx.push_overwrite(SpiFrame { data: response });
+            }
             Ok(())
         }
         None => {

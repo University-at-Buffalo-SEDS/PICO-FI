@@ -320,7 +320,7 @@ def main() -> int:
                         pending.append((REQ_COMMAND_MAGIC, (stripped + "\n").encode("utf-8")))
                     else:
                         prompt.print_line(f"[{sender}] {line}")
-                        pending.append((REQ_MAGIC, f"[{sender}] {line}\n".encode("utf-8")))
+                        pending.append((REQ_COMMAND_MAGIC, f"[{sender}] {line}\n".encode("utf-8")))
             except queue.Empty:
                 pass
 

@@ -562,8 +562,13 @@ fn finalize_transaction(
             match parse_request_frame(&frame) {
                 Some(RequestFrame::Command(payload)) => {
                     let line = trim_ascii_line(payload);
-                    let response = render_local_bridge_command(bridge_config, link_active, line);
-                    Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
+                    if line.starts_with('/') {
+                        let response = render_local_bridge_command(bridge_config, link_active, line);
+                        Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()))
+                    } else {
+                        tx.push_overwrite(SpiFrame { data: frame });
+                        None
+                    }
                 }
                 Some(RequestFrame::Data(payload)) => {
                     if let Some(line) = extract_ascii_command(&frame) {
