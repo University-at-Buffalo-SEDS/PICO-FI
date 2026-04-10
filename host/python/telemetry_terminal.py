@@ -91,9 +91,13 @@ def recv_loop(
     printer: Printer,
     stop_event: threading.Event,
     poll_s: float,
+    tx_pause_until: list[float],
 ) -> None:
     sedsprintf = load_sedsprintf()
     while not stop_event.is_set():
+        if time.monotonic() < tx_pause_until[0]:
+            time.sleep(min(0.01, max(tx_pause_until[0] - time.monotonic(), 0.001)))
+            continue
         try:
             with adapter_lock:
                 incoming = adapter.recv_payload(poll_s)
@@ -139,6 +143,7 @@ def main() -> int:
     adapter_lock = threading.Lock()
     printer = Printer()
     stop_event = threading.Event()
+    tx_pause_until = [0.0]
     poll_s = max(args.poll_ms / 1000.0, 0.05)
 
     printer.line(f"telemetry terminal on {args.backend}; sender={args.sender}")
@@ -146,7 +151,7 @@ def main() -> int:
 
     receiver = threading.Thread(
         target=recv_loop,
-        args=(adapter, adapter_lock, printer, stop_event, poll_s),
+        args=(adapter, adapter_lock, printer, stop_event, poll_s, tx_pause_until),
         daemon=True,
     )
     receiver.start()
@@ -173,6 +178,7 @@ def main() -> int:
                 )
                 continue
             try:
+                tx_pause_until[0] = time.monotonic() + max(poll_s * 4.0, 0.05)
                 with adapter_lock:
                     adapter.send_payload(payload)
             except Exception as exc:

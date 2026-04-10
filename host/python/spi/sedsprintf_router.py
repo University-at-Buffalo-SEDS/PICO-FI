@@ -40,9 +40,9 @@ except ImportError:
 
 class SpiRouterAdapter:
     payload_limit = FRAME_SIZE - 2
-    send_poll_attempts = 1
-    send_poll_sleep_s = 0.001
-    poll_sleep_s = 0.001
+    send_poll_attempts = 2
+    send_poll_sleep_s = 0.002
+    poll_sleep_s = 0.002
 
     def __init__(self, bus_num: int, device: int, speed: int) -> None:
         self.bus = open_bus(bus_num, device, speed)
