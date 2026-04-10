@@ -230,9 +230,10 @@ def exchange_frame(
     magic: int,
     payload: bytes,
     poll_delay_s: float,
+    expect_command_reply: bool,
 ) -> None:
     try:
-        if magic != REQ_COMMAND_MAGIC:
+        if magic != REQ_COMMAND_MAGIC or not expect_command_reply:
             first_rx = bus.write_frame(build_frame(payload, magic))
             rx_magic, rx_payload = parse_frame(first_rx)
             if rx_magic == 0:
@@ -304,7 +305,7 @@ def main() -> int:
         "//help for app help."
     )
     try:
-        pending: collections.deque[tuple[int, bytes]] = collections.deque()
+        pending: collections.deque[tuple[int, bytes, bool]] = collections.deque()
         while True:
             try:
                 while True:
@@ -321,18 +322,26 @@ def main() -> int:
                         continue
                     if stripped.startswith("/") and not stripped.startswith("//"):
                         prompt.print_line(f"[pico] {stripped}")
-                        pending.append((REQ_COMMAND_MAGIC, (stripped + "\n").encode("utf-8")))
+                        pending.append((REQ_COMMAND_MAGIC, (stripped + "\n").encode("utf-8"), True))
                     else:
                         rendered = format_outbound_chat(sender, line)
                         prompt.print_line(rendered)
-                        pending.append((REQ_COMMAND_MAGIC, (rendered + "\n").encode("utf-8")))
+                        pending.append((REQ_COMMAND_MAGIC, (rendered + "\n").encode("utf-8"), False))
             except queue.Empty:
                 pass
 
             poll_delay_s = args.poll_ms / 1000.0
             if pending:
-                magic, payload = pending.popleft()
-                exchange_frame(bus, prompt, stream_printer, magic, payload, poll_delay_s)
+                magic, payload, expect_command_reply = pending.popleft()
+                exchange_frame(
+                    bus,
+                    prompt,
+                    stream_printer,
+                    magic,
+                    payload,
+                    poll_delay_s,
+                    expect_command_reply,
+                )
             else:
                 try:
                     rx_magic, payload = parse_frame(bus.read_frame())

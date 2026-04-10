@@ -635,34 +635,14 @@ fn recover_duplicate_length_frame(frame: &[u8; FRAME_SIZE]) -> Option<[u8; FRAME
     if len == 0 || len > 96 || len > FRAME_SIZE - 2 || frame[0] != frame[1] {
         return None;
     }
-    let payload_start = frame[2];
-    if payload_start == 0 {
-        return None;
-    }
-    let preview_len = len.min(12);
-    if preview_len == 0 {
-        return None;
-    }
-    if !frame[2..2 + preview_len]
-        .iter()
-        .all(|&byte| byte == b'\n' || byte == b'\r' || byte == b'\t' || looks_like_text_byte(byte))
-    {
+    if frame[2] == 0 {
         return None;
     }
     let mut recovered = [0u8; FRAME_SIZE];
-    recovered[0] = if payload_start == b'/' || looks_like_text_byte(payload_start) {
-        REQ_COMMAND_MAGIC
-    } else {
-        REQ_DATA_MAGIC
-    };
+    recovered[0] = REQ_COMMAND_MAGIC;
     recovered[1] = frame[0];
     recovered[2..].copy_from_slice(&frame[2..]);
     Some(recovered)
-}
-
-fn looks_like_text_byte(byte: u8) -> bool {
-    matches!(byte, b'[' | b'{' | b'(' | b'-' | b'_' | b'.' | b'!' | b'?')
-        || byte.is_ascii_alphanumeric()
 }
 
 fn extract_ascii_command(frame: &[u8; FRAME_SIZE]) -> Option<&str> {

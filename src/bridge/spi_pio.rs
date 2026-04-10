@@ -89,14 +89,11 @@ fn normalize_request_frame(
         && rx_frame[0] <= (FRAME_SIZE - 2) as u8
     {
         let expected = (rx_frame[0] as usize + 2).min(FRAME_SIZE);
-        let inferred_magic = infer_duplicate_length_magic(rx_frame, scan_len);
-        if let Some(magic) = inferred_magic {
-            let mut normalized = [0u8; FRAME_SIZE];
-            normalized[0] = magic;
-            normalized[1] = rx_frame[0];
-            normalized[2..].copy_from_slice(&rx_frame[2..]);
-            return (normalized, expected.max(received.saturating_add(1)).min(FRAME_SIZE));
-        }
+        let mut normalized = [0u8; FRAME_SIZE];
+        normalized[0] = REQ_COMMAND_MAGIC;
+        normalized[1] = rx_frame[0];
+        normalized[2..].copy_from_slice(&rx_frame[2..]);
+        return (normalized, expected.max(received.saturating_add(1)).min(FRAME_SIZE));
     }
 
     for offset in 1..scan_len {
@@ -116,26 +113,6 @@ fn normalize_request_frame(
     }
 
     (*rx_frame, received)
-}
-
-fn infer_duplicate_length_magic(rx_frame: &[u8; FRAME_SIZE], scan_len: usize) -> Option<u8> {
-    let payload_start = rx_frame[2];
-    if payload_start == b'/' || looks_like_text_start(payload_start) {
-        return Some(REQ_COMMAND_MAGIC);
-    }
-    if scan_len >= 4 && looks_like_text_start(rx_frame[3]) {
-        return Some(REQ_COMMAND_MAGIC);
-    }
-    if payload_start.is_ascii_graphic() {
-        Some(REQ_DATA_MAGIC)
-    } else {
-        None
-    }
-}
-
-fn looks_like_text_start(byte: u8) -> bool {
-    matches!(byte, b'[' | b'{' | b'(' | b'-' | b'_' | b'.' | b'!')
-        || byte.is_ascii_alphanumeric()
 }
 
 #[cfg(test)]
