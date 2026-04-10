@@ -10,7 +10,15 @@ import time
 try:
     from ..sedsprintf_router_common import add_router_args, run_udp_router
     from .raw import FRAME_SIZE, open_bus
-    from .test import REQ_COMMAND_MAGIC, REQ_MAGIC, RESP_MAGIC, build_frame, parse_frame
+    from .test import (
+        COMMAND_POLL_LIMIT,
+        PULL_COMMAND,
+        REQ_COMMAND_MAGIC,
+        REQ_MAGIC,
+        RESP_MAGIC,
+        build_frame,
+        parse_frame,
+    )
 except ImportError:
     import os
     import sys
@@ -19,7 +27,15 @@ except ImportError:
     sys.path.append(os.path.dirname(__file__))
     from sedsprintf_router_common import add_router_args, run_udp_router
     from raw import FRAME_SIZE, open_bus
-    from test import REQ_COMMAND_MAGIC, REQ_MAGIC, RESP_MAGIC, build_frame, parse_frame
+    from test import (
+        COMMAND_POLL_LIMIT,
+        PULL_COMMAND,
+        REQ_COMMAND_MAGIC,
+        REQ_MAGIC,
+        RESP_MAGIC,
+        build_frame,
+        parse_frame,
+    )
 
 
 class SpiRouterAdapter:
@@ -36,7 +52,7 @@ class SpiRouterAdapter:
         return None
 
     def send_payload(self, payload: bytes) -> None:
-        first = self.bus.write_frame(build_frame(payload, REQ_COMMAND_MAGIC))
+        first = self.bus.write_frame(build_frame(payload, REQ_MAGIC))
         captured = self._capture(first)
         if captured:
             self.pending.append(captured)
@@ -53,10 +69,18 @@ class SpiRouterAdapter:
             return self.pending.popleft()
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            captured = self._capture(self.bus.read_frame())
+            captured = self._capture(
+                self.bus.write_frame(build_frame(PULL_COMMAND, REQ_COMMAND_MAGIC))
+            )
             if captured:
                 return captured
-            time.sleep(0.01)
+            for _ in range(COMMAND_POLL_LIMIT):
+                captured = self._capture(self.bus.read_frame())
+                if captured:
+                    return captured
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.01)
         return None
 
     def close(self) -> None:

@@ -41,8 +41,9 @@ SPI:
 
 - Linux host must use mode `3`
 - all traffic is sent as fixed 258-byte full-duplex transactions
-- empty probe/poll uses `0xA5`
-- non-empty host traffic uses the stable `0xA6` path
+- data traffic uses request magic `0xA5`
+- local Pico commands use request magic `0xA6`
+- inbound queued SPI data is pulled with `/pull`
 - only one SPI client should access `/dev/spidev*` at a time
 
 ## Example Commands
@@ -120,5 +121,47 @@ Useful subcommands:
 - `spi-command /link`
 - `uart-to-spi --text hello`
 - `spi-to-uart --text hello`
+- `spi-link-terminal-soak --iterations 10`
+- `spi-uart-soak --iterations 10 --check-commands`
+
+The current validated SPI regression pair is:
+
+```bash
+python3 host/python/bridge_ssh_test.py \
+  --ssh-target rylan@10.8.0.6 \
+  --remote-root /home/rylan/Documents/Git/PICO-FI \
+  --uart-port /dev/cu.usbmodem21102 \
+  --local-python ./venv/bin/python \
+  --spi-speed 100000 \
+  spi-link-terminal-soak \
+  --iterations 10
+```
+
+```bash
+python3 host/python/bridge_ssh_test.py \
+  --ssh-target rylan@10.8.0.6 \
+  --remote-root /home/rylan/Documents/Git/PICO-FI \
+  --uart-port /dev/cu.usbmodem21102 \
+  --local-python ./venv/bin/python \
+  --spi-speed 100000 \
+  spi-uart-soak \
+  --iterations 10 \
+  --check-commands
+```
+
+## Telemetry Router Coverage
+
+Telemetry router coverage now exists in unit tests:
+
+- [`host/python/test_sedsprintf_router_common.py`](/Users/rylan/Documents/GitKraken/pico-fi/host/python/test_sedsprintf_router_common.py) verifies UDP payloads are wrapped into `sedsprintf_rs_2026` packets and unwrapped back to UDP payloads.
+- [`host/python/spi/test_sedsprintf_router.py`](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/test_sedsprintf_router.py) verifies the SPI router uses `0xA5` for data sends and `/pull` for inbound data.
+
+Run them with:
+
+```bash
+python3 -m unittest \
+  host.python.test_sedsprintf_router_common \
+  host.python.spi.test_sedsprintf_router
+```
 
 Do not run automated tests while an interactive terminal is holding the same SPI or UART device.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import os
 import socket
 import sys
 import time
@@ -30,9 +31,16 @@ def load_sedsprintf():
 
         return sedsprintf
     except ImportError:
-        local_pkg_root = Path(__file__).resolve().parents[3] / "sedsprintf_2026" / "python-files"
-        if local_pkg_root.exists():
-            sys.path.insert(0, str(local_pkg_root))
+        search_roots: list[Path] = []
+        env_root = os.environ.get("SEDSPRINTF_PYTHON_ROOT")
+        if env_root:
+            search_roots.append(Path(env_root))
+        here = Path(__file__).resolve()
+        search_roots.extend(parent / "sedsprintf_2026" / "python-files" for parent in here.parents)
+        for root in search_roots:
+            if not root.exists():
+                continue
+            sys.path.insert(0, str(root))
             import sedsprintf_rs_2026 as sedsprintf  # type: ignore
 
             return sedsprintf

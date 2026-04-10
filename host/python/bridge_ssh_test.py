@@ -9,6 +9,7 @@ import queue
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -213,15 +214,20 @@ def shell_quote_remote_path(path: str) -> str:
 
 
 def stage_remote_spi_tools(target: str) -> int:
-    mkdir_cmd = build_ssh_command(target, f"mkdir -p {shlex.quote(REMOTE_SPI_STAGE)}")
+    mkdir_cmd = build_ssh_command(
+        target,
+        f"rm -rf {shlex.quote(REMOTE_SPI_STAGE)} && mkdir -p {shlex.quote(REMOTE_SPI_STAGE)}",
+    )
     rc = run_checked(mkdir_cmd)
     if rc != 0:
         return rc
     files = [
+        REPO_ROOT / "host/python/sedsprintf_router_common.py",
         SPI_TEST_DIR / "__init__.py",
         SPI_TEST_DIR / "link_terminal_driver.py",
         SPI_TEST_DIR / "link_terminal.py",
         SPI_TEST_DIR / "raw.py",
+        SPI_TEST_DIR / "sedsprintf_router.py",
         SPI_TEST_DIR / "test.py",
     ]
     return run_checked(["scp", *map(str, files), f"{target}:{REMOTE_SPI_STAGE}/"])
@@ -576,6 +582,173 @@ class RemoteSpiLinkTerminalSession:
         stop_process(self.proc)
 
 
+class LineProcessSession:
+    def __init__(self, cmd: list[str], prefix: str) -> None:
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.prefix = prefix
+        self.lines: collections.deque[str] = collections.deque(maxlen=200)
+        self.queue: queue.Queue[str] = queue.Queue()
+        self.reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader.start()
+
+    def _reader_loop(self) -> None:
+        assert self.proc.stdout is not None
+        for raw_line in self.proc.stdout:
+            line = ANSI_ESCAPE_RE.sub("", raw_line.replace("\r", "")).rstrip("\n")
+            self.lines.append(line)
+            print(f"[{self.prefix}] {line}", flush=True)
+            self.queue.put(line)
+
+    def wait_for(self, expected: str, timeout_s: float) -> str:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None and self.queue.empty():
+                raise RuntimeError(
+                    f"{self.prefix} exited before emitting {expected!r}"
+                )
+            try:
+                line = self.queue.get(timeout=min(0.25, max(0.01, deadline - time.monotonic())))
+            except queue.Empty:
+                continue
+            if expected in line:
+                return line
+        raise RuntimeError(f"timed out waiting for {self.prefix} output containing {expected!r}")
+
+    def dump_output(self) -> str:
+        return "\n".join(self.lines)
+
+    def close(self) -> None:
+        stop_process(self.proc)
+
+
+def start_local_uart_router(
+    python_bin: str,
+    port: str,
+    speed: int,
+    listen_port: int,
+    forward_port: int,
+    sender: str,
+) -> LineProcessSession:
+    return LineProcessSession(
+        [
+            python_bin,
+            "-u",
+            str(REPO_ROOT / "host/python/uart/sedsprintf_router.py"),
+            "--port",
+            port,
+            "--speed",
+            str(speed),
+            "--listen-port",
+            str(listen_port),
+            "--forward-port",
+            str(forward_port),
+            "--sender",
+            sender,
+            "--debug",
+        ],
+        "uart-router",
+    )
+
+
+def start_remote_spi_router(
+    target: str,
+    speed: int,
+    listen_port: int,
+    forward_port: int,
+    sender: str,
+) -> LineProcessSession:
+    return LineProcessSession(
+        build_ssh_command(
+            target,
+            (
+                f"fuser -k {listen_port}/udp >/dev/null 2>&1 || true; "
+                f"fuser -k {forward_port}/udp >/dev/null 2>&1 || true; "
+                f"cd {shlex.quote(REMOTE_SPI_STAGE)} && "
+                "PYTHONPATH=\"$HOME/venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}\" "
+                "exec python3 -u sedsprintf_router.py "
+                f"--speed {speed} "
+                f"--listen-port {listen_port} --forward-port {forward_port} "
+                f"--sender {shlex.quote(sender)} --debug"
+            ),
+        ),
+        "spi-router",
+    )
+
+
+def send_local_udp(port: int, payload: str) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(payload.encode("utf-8"), ("127.0.0.1", port))
+    finally:
+        sock.close()
+
+
+def recv_local_udp(port: int, timeout_s: float) -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+        sock.settimeout(timeout_s)
+        data, _ = sock.recvfrom(65535)
+        return data.decode("utf-8", errors="replace")
+    finally:
+        sock.close()
+
+
+def start_remote_udp_capture(target: str, port: int, expected: str) -> subprocess.Popen[str]:
+    code = (
+        "import socket, sys\n"
+        f"EXPECT={expected!r}\n"
+        f"PORT={port}\n"
+        "sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "sock.bind(('127.0.0.1', PORT))\n"
+        "sock.settimeout(15.0)\n"
+        "print('READY', flush=True)\n"
+        "data,_=sock.recvfrom(65535)\n"
+        "text=data.decode('utf-8', errors='replace')\n"
+        "print(text, flush=True)\n"
+        "sock.close()\n"
+        "raise SystemExit(0 if EXPECT in text else 1)\n"
+    )
+    proc = subprocess.Popen(
+        build_ssh_command(target, f"python3 -u -c {shlex.quote(code)}"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert proc.stdout is not None
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            if proc.poll() is not None:
+                raise RuntimeError("remote UDP capture exited before becoming ready")
+            continue
+        print(f"[remote-udp] {line.rstrip()}")
+        if line.rstrip() == "READY":
+            return proc
+    stop_process(proc)
+    raise RuntimeError("timed out waiting for remote UDP capture")
+
+
+def run_remote_udp_send(target: str, port: int, payload: str) -> int:
+    code = (
+        "import socket\n"
+        f"PORT={port}\n"
+        f"PAYLOAD={payload!r}.encode('utf-8')\n"
+        "sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "sock.sendto(PAYLOAD, ('127.0.0.1', PORT))\n"
+        "sock.close()\n"
+    )
+    return run_checked(build_ssh_command(target, f"python3 -u -c {shlex.quote(code)}"))
+
+
 def full_smoke(args: argparse.Namespace) -> int:
     rc = run_remote_spi_probe(args.ssh_target, args.remote_root, args.probe_count, args.spi_speed)
     if rc != 0:
@@ -779,6 +952,116 @@ def run_spi_link_terminal_soak(args: argparse.Namespace) -> int:
         session.close()
 
 
+def run_telemetry_router_soak(args: argparse.Namespace) -> int:
+    rc = stage_remote_spi_tools(args.ssh_target)
+    if rc != 0:
+        return rc
+
+    preflight = LocalUartSession(args.uart_port, args.uart_speed)
+    try:
+        initial_link = wait_for_local_link_up(preflight, timeout_s=args.recv_timeout_s)
+        print(f"[telemetry-soak] initial /link -> {initial_link}")
+    finally:
+        preflight.close()
+
+    local_router = start_local_uart_router(
+        args.local_python,
+        args.uart_port,
+        args.uart_speed,
+        args.local_router_listen_port,
+        args.local_router_forward_port,
+        "uart-node",
+    )
+    remote_router = start_remote_spi_router(
+        args.ssh_target,
+        args.spi_speed,
+        args.remote_router_listen_port,
+        args.remote_router_forward_port,
+        "spi-node",
+    )
+    try:
+        local_router.wait_for("router listening", timeout_s=10.0)
+        remote_router.wait_for("router listening", timeout_s=10.0)
+
+        for iteration in range(1, args.iterations + 1):
+            uart_to_spi_payload = f"telemetry-uart-to-spi-{iteration}"
+            spi_to_uart_payload = f"telemetry-spi-to-uart-{iteration}"
+            print(f"[telemetry-soak] iteration {iteration}/{args.iterations}")
+
+            remote_recv = start_remote_udp_capture(
+                args.ssh_target,
+                args.remote_router_forward_port,
+                uart_to_spi_payload,
+            )
+            try:
+                send_local_udp(args.local_router_listen_port, uart_to_spi_payload)
+                rc, output = wait_checked(
+                    remote_recv,
+                    args.recv_timeout_s,
+                    f"remote telemetry recv iteration {iteration}",
+                )
+            finally:
+                stop_process(remote_recv)
+            if rc != 0:
+                raise RuntimeError(f"remote telemetry recv failed on iteration {iteration}")
+            ensure_substring(
+                output,
+                uart_to_spi_payload,
+                f"remote telemetry recv iteration {iteration}",
+            )
+
+            local_recv: list[str] = []
+            local_error: list[BaseException] = []
+
+            def recv_local() -> None:
+                try:
+                    local_recv.append(
+                        recv_local_udp(args.local_router_forward_port, args.recv_timeout_s)
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    local_error.append(exc)
+
+            recv_thread = threading.Thread(target=recv_local, daemon=True)
+            recv_thread.start()
+            time.sleep(0.2)
+            rc = run_remote_udp_send(
+                args.ssh_target,
+                args.remote_router_listen_port,
+                spi_to_uart_payload,
+            )
+            recv_thread.join(timeout=args.recv_timeout_s + 1.0)
+            if rc != 0:
+                raise RuntimeError(f"remote telemetry send failed on iteration {iteration}")
+            if local_error:
+                raise RuntimeError(
+                    f"local telemetry recv failed on iteration {iteration}: {local_error[0]}"
+                )
+            if not local_recv:
+                raise RuntimeError(f"local telemetry recv timed out on iteration {iteration}")
+            ensure_substring(
+                local_recv[0],
+                spi_to_uart_payload,
+                f"local telemetry recv iteration {iteration}",
+            )
+
+        print(f"[telemetry-soak] passed {args.iterations} iterations")
+        return 0
+    except Exception as exc:
+        print(f"[telemetry-soak] FAIL: {exc}", file=sys.stderr)
+        local_output = local_router.dump_output()
+        if local_output:
+            print("[telemetry-soak] recent UART router output:", file=sys.stderr)
+            print(local_output, file=sys.stderr)
+        remote_output = remote_router.dump_output()
+        if remote_output:
+            print("[telemetry-soak] recent SPI router output:", file=sys.stderr)
+            print(remote_output, file=sys.stderr)
+        return 1
+    finally:
+        remote_router.close()
+        local_router.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run remote SPI and local UART bridge tests.")
     parser.add_argument("--ssh-target", required=True, help="SSH target for the Pi connected to the Pico")
@@ -822,6 +1105,15 @@ def main() -> int:
         help="Drive the remote SPI link terminal and verify repeated send/receive plus immediate /link commands",
     )
     link_soak.add_argument("--iterations", type=int, default=10)
+    telemetry_soak = subparsers.add_parser(
+        "telemetry-router-soak",
+        help="Run local UART and remote SPI telemetry router nodes and verify UDP payloads flow across the firmware bridge",
+    )
+    telemetry_soak.add_argument("--iterations", type=int, default=10)
+    telemetry_soak.add_argument("--local-router-listen-port", type=int, default=9100)
+    telemetry_soak.add_argument("--local-router-forward-port", type=int, default=9101)
+    telemetry_soak.add_argument("--remote-router-listen-port", type=int, default=9200)
+    telemetry_soak.add_argument("--remote-router-forward-port", type=int, default=9201)
 
     spi_probe = subparsers.add_parser("spi-probe", help="Run the remote SPI probe via SSH")
     spi_probe.add_argument("--count", type=int, default=None)
@@ -855,6 +1147,8 @@ def main() -> int:
         return run_spi_uart_soak(args)
     if args.command == "spi-link-terminal-soak":
         return run_spi_link_terminal_soak(args)
+    if args.command == "telemetry-router-soak":
+        return run_telemetry_router_soak(args)
     if args.command == "spi-probe":
         return run_remote_spi_probe(
             args.ssh_target,
