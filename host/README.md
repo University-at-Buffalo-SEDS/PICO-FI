@@ -1,71 +1,124 @@
-Host-side Pico-Fi I2C backend
+Host-side Pico-Fi tooling
 
-Files:
-- `i2c_backend.rs`: std-based Linux `/dev/i2c-*` backend for the Pico-Fi framed I2C transport.
-- `spi_backend.rs`: std-based Linux `/dev/spidev*` backend for the Pico-Fi framed SPI transport.
-- `python/i2c/`: I2C Python tools (`test.py`, `link_terminal.py`, `detect.py`, `bus_check.py`).
-- `python/spi/`: SPI Python tools (`test.py`, `link_terminal.py`).
-- `python/uart/`: UART Python tools (`test.py`, `link_terminal.py`).
+## Layout
 
-Usage from another Rust crate:
+- `i2c_backend.rs`: Linux `/dev/i2c-*` backend for the Pico-Fi I2C transport
+- `spi_backend.rs`: Linux `/dev/spidev*` backend for the Pico-Fi SPI transport
+- `python/i2c/`: I2C tools and router
+- `python/spi/`: SPI tools and router
+- `python/uart/`: UART tools and router
+- `python/bridge_ssh_test.py`: end-to-end regression harness for the Pi-connected SPI server and local UART client
 
-```rust
-#[path = "/absolute/path/to/pico-fi/host/i2c_backend.rs"]
-mod i2c_backend;
+## Python Tools
 
-use i2c_backend::{Frame, I2cBackend};
-use std::time::Duration;
+Each backend has:
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut backend = I2cBackend::open(1, 0x55)?;
+- `test.py`: probe, command, send, and recv helpers
+- `link_terminal.py`: interactive terminal
+- `sedsprintf_router.py`: UDP-to-Fi router using `sedsprintf_rs_2026`
 
-    let pong = backend.send_command("/ping")?;
-    println!("pico replied: {pong}");
+Interactive terminal behavior is now consistent across UART, I2C, and SPI:
 
-    backend.send_data(b"frontend hello\n")?;
+- plain text sends bridged data
+- `/...` sends a local Pico command
+- outbound chat is rendered as `sender: message`
 
-    backend.stream(Duration::from_millis(20), |frame| match frame {
-        Frame::Data(bytes) => {
-            let text = String::from_utf8_lossy(&bytes);
-            println!("stream: {text}");
-        }
-        Frame::Command(bytes) => {
-            let text = String::from_utf8_lossy(&bytes);
-            println!("command: {text}");
-        }
-    })?;
+## Backend Notes
 
-    Ok(())
-}
+UART:
+
+- framed binary runtime, `115200 8N1`
+- boot shell is still present briefly after reset
+- use `host/python/uart/test.py` and `host/python/uart/link_terminal.py`
+
+I2C:
+
+- Linux host uses 32-byte slot framing on the wire
+- logical message semantics still map to data and command payloads
+- use `host/python/i2c/test.py` and `host/python/i2c/link_terminal.py`
+
+SPI:
+
+- Linux host must use mode `3`
+- all traffic is sent as fixed 258-byte full-duplex transactions
+- empty probe/poll uses `0xA5`
+- non-empty host traffic uses the stable `0xA6` path
+- only one SPI client should access `/dev/spidev*` at a time
+
+## Example Commands
+
+UART:
+
+```bash
+python3 host/python/uart/test.py --port /dev/ttyUSB0 probe --count 3
+python3 host/python/uart/test.py --port /dev/ttyUSB0 command /ping
+python3 host/python/uart/test.py --port /dev/ttyUSB0 send "hello"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 recv --expect "hello"
+python3 host/python/uart/link_terminal.py --port /dev/ttyUSB0
 ```
 
-Notes:
-- This module is for Linux hosts. It uses the `I2C_RDWR` ioctl directly.
-- `Frame::Data` is the streaming payload you would forward into the frontend.
-- `Frame::Command` is for local Pico command replies such as `/ping` and `/link`.
-- The I2C backend mirrors the Python terminal behavior: writes are chunked to 32 bytes and reads pull a full 258-byte response frame.
+I2C:
 
-SPI notes:
-- The SPI backend uses `SPI_IOC_MESSAGE` on `/dev/spidev*`.
-- The Pico SPI slave path uses `SPI1` on `GPIO10`=`SCK`, `GPIO11`=`MISO`/TX from Pico, `GPIO12`=`MOSI`/RX into Pico, `GPIO13`=`CSn`.
-- Linux masters must use SPI mode `3`.
-- SPI requests and polls are each sent as a single 258-byte full-duplex transaction so Linux keeps them within one chip-select window.
-- SPI reads are implemented as full-duplex transfers with zero-filled MOSI bytes while clocking data out of the Pico.
-- Empty SPI probes are currently reliable and are the recommended first sanity check.
-- Non-empty SPI command frames are still not reliable in the current firmware. Prefer I2C or framed UART if you need working local `/ping`/`/link` commands today.
+```bash
+python3 host/python/i2c/test.py --bus 1 probe --count 3
+python3 host/python/i2c/test.py --bus 1 command /ping
+python3 host/python/i2c/test.py --bus 1 command /link
+python3 host/python/i2c/link_terminal.py --bus 1 --addr 0x55
+```
 
-UART notes:
-- The UART backend now uses fixed `258` byte frames with the same `0xA5`/`0xA6` request and `0x5A`/`0x5B` response magics used by the SPI transport.
-- Runtime UART is binary/framed, not newline-delimited text.
-- UART hosts must use `115200 8N1` with flow control disabled.
-- During the first ~3 seconds after reset, the Pico still uses the UART for the boot/config shell before switching into framed runtime mode.
+SPI:
 
-Example Python entrypoints:
-- `python3 -m host.python.i2c.test command /ping`
-- `python3 -m host.python.i2c.link_terminal`
-- `python3 -m host.python.spi.test probe --bus 0 --device 0 --speed 100000 --count 10`
-- `python3 -m host.python.spi.link_terminal --bus 0 --device 0 --speed 100000`
-- `python3 -m host.python.spi.test command /ping --bus 0 --device 0 --speed 100000`
-- `python3 -m host.python.uart.test probe --port /dev/ttyUSB0 --count 10`
-- `python3 -m host.python.uart.test command /ping --port /dev/ttyUSB0`
-- `python3 -m host.python.uart.link_terminal --port /dev/ttyUSB0`
+```bash
+python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 probe --count 3
+python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 command /link
+python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 send "hello"
+python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 recv --expect "hello"
+python3 host/python/spi/link_terminal.py --bus 0 --device 0 --speed 100000
+```
+
+## sedsprintf Routers
+
+The router scripts listen on a local UDP port, wrap datagrams in `sedsprintf_rs_2026` packets, carry them over the chosen Fi backend, and forward received payloads to another local UDP port.
+
+Examples:
+
+```bash
+python3 host/python/uart/sedsprintf_router.py --port /dev/ttyUSB0 --listen-port 9000 --forward-port 9001 --sender uart-end
+python3 host/python/i2c/sedsprintf_router.py --bus 1 --addr 0x55 --listen-port 9000 --forward-port 9001 --sender i2c-end
+python3 host/python/spi/sedsprintf_router.py --bus 0 --device 0 --speed 100000 --listen-port 9000 --forward-port 9001 --sender spi-end
+```
+
+Paired router examples:
+
+```bash
+python3 host/python/uart/sedsprintf_router.py --port /dev/ttyUSB0 --listen-port 9000 --forward-port 9001 --sender uart-end
+python3 host/python/spi/sedsprintf_router.py --bus 0 --device 0 --speed 100000 --listen-port 9001 --forward-port 9000 --sender spi-end
+```
+
+```bash
+python3 host/python/i2c/sedsprintf_router.py --bus 1 --addr 0x55 --listen-port 9000 --forward-port 9001 --sender i2c-end
+python3 host/python/uart/sedsprintf_router.py --port /dev/ttyUSB0 --listen-port 9001 --forward-port 9000 --sender uart-end
+```
+
+## Automated Bridge Testing
+
+Use the SSH harness to validate the local UART client Pico against the remote SPI server Pico:
+
+```bash
+python3 host/python/bridge_ssh_test.py \
+  --ssh-target rylan@10.8.0.6 \
+  --remote-root /home/rylan/Documents/Git/PICO-FI \
+  --uart-port /dev/cu.usbmodem21102 \
+  --local-python ./venv/bin/python \
+  --spi-speed 100000 \
+  spi-probe
+```
+
+Useful subcommands:
+
+- `spi-probe`
+- `spi-command /link`
+- `uart-to-spi --text hello`
+- `spi-to-uart --text hello`
+
+Do not run automated tests while an interactive terminal is holding the same SPI or UART device.

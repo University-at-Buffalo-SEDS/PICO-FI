@@ -2,7 +2,7 @@
 
 This project uses `UART0` as a framed upstream transport after the short boot-time shell exits.
 
-The runtime UART wire format now matches the same fixed-size request/response frame layout used by the SPI transport.
+Runtime UART uses fixed-size binary frames. It is not newline-delimited text mode.
 
 ## Physical Link
 
@@ -20,11 +20,11 @@ Pins:
 
 For a USB-UART adapter:
 
-- adapter `TX` -> Pico `GPIO1` (`RX`)
-- adapter `RX` -> Pico `GPIO0` (`TX`)
+- adapter `TX` -> Pico `GPIO1`
+- adapter `RX` -> Pico `GPIO0`
 - adapter `GND` -> Pico `GND`
 
-## Frame Layout
+## Runtime Frame Format
 
 All runtime UART traffic is sent as fixed `258` byte frames:
 
@@ -42,63 +42,97 @@ Constants:
 - data response magic = `0x5A`
 - command response magic = `0x5B`
 
-## Semantics
+Semantics:
 
-- `0xA5` requests carry raw bridged data.
+- `0xA5` requests carry bridged data.
 - `0xA6` requests carry local Pico commands such as `/ping`, `/show`, and `/link`.
-- `0x5A` responses carry raw bridged data or an empty probe/idle reply.
-- `0x5B` responses carry local Pico command replies or transport errors.
+- `0x5A` responses carry bridged data or an empty poll reply.
+- `0x5B` responses carry local Pico command replies.
 
-## Boot Behavior
+## Boot Window
 
-During early boot, UART is temporarily attached to the configuration shell for about `3000 ms`.
+Immediately after reset, UART is briefly attached to the boot/config shell for about `3000 ms`.
 
-During that window the Pico can emit ASCII lines such as:
+During that window the Pico can emit plain ASCII lines. After startup finishes, UART switches to framed runtime packets.
 
-- `pico-fi uart bridge`
-- `booting with compiled config`
-- configuration help text
+Implications for host tools:
 
-After startup/config finishes, UART switches to framed binary packets.
+- if the Pico has just reset, wait a few seconds before starting framed traffic
+- or explicitly drive the shell to runtime mode first if you are using the boot window intentionally
 
-Implication for host drivers:
+## Host Tools
 
-- if the Pico has just reset, either wait at least `3` seconds before starting framed UART traffic
-- or explicitly send `start\r\n` during the shell window and wait for the bridge to enter runtime mode
+Test tool:
 
-## Current Status
+```bash
+python3 host/python/uart/test.py --port /dev/ttyUSB0 probe --count 3
+python3 host/python/uart/test.py --port /dev/ttyUSB0 command /ping
+python3 host/python/uart/test.py --port /dev/ttyUSB0 send "hello"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 recv --expect "hello"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 data "hello" --expect "hello"
+```
 
-- Empty UART probes are currently reliable.
-- Framed UART command handling is now implemented, but if you are observing failures you should verify that:
-  - the Pico is actually running `upstream=uart`
-  - you are talking to the runtime UART path, not only the boot shell
-  - you are sending full `258` byte frames, not raw text lines
+Typical bridge check:
 
-## Host Requirements
+```bash
+python3 host/python/uart/test.py --port /dev/ttyUSB0 send "uart-to-peer"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 recv --expect "peer-to-uart"
+```
 
-A correct host driver should:
+Interactive terminal:
 
-- open the serial device in raw mode
-- configure `115200 8N1`
-- disable canonical mode, echo, software flow control, and hardware flow control
-- send and receive full `258` byte frames
-- treat payload bytes as binary, not C strings
+```bash
+python3 host/python/uart/link_terminal.py --port /dev/ttyUSB0
+```
 
-The host should not:
+Terminal behavior:
 
-- append newline framing in runtime mode
-- stop reading at `0x00`
-- assume partial reads are complete frames
+- plain text lines are sent as bridged data
+- `/...` lines are sent as local Pico commands
+- outbound chat is rendered as `sender: message`
 
-## Recommended Examples
+## sedsprintf Router
 
-Use these in order:
+There is also a UART router that wraps UDP datagrams in `sedsprintf_rs_2026` packets and carries them over the UART Fi link.
 
-1. Probe baseline:
-   `python3 -m host.python.uart.test probe --port /dev/ttyUSB0 --count 10`
-2. Command test:
-   `python3 -m host.python.uart.test command /ping --port /dev/ttyUSB0`
-3. Interactive terminal:
-   `python3 -m host.python.uart.link_terminal --port /dev/ttyUSB0`
+Example:
 
-If you are using a Raspberry Pi Debug Probe or another debugger that exposes the Pico UART as a USB modem device, substitute that device path instead of `/dev/ttyUSB0`.
+```bash
+python3 host/python/uart/sedsprintf_router.py \
+  --port /dev/ttyUSB0 \
+  --speed 115200 \
+  --listen-port 9000 \
+  --forward-port 9001 \
+  --sender uart-end
+```
+
+Paired example:
+
+```bash
+python3 host/python/uart/sedsprintf_router.py \
+  --port /dev/ttyUSB0 \
+  --listen-port 9000 \
+  --forward-port 9001 \
+  --sender uart-end
+
+python3 host/python/spi/sedsprintf_router.py \
+  --bus 0 \
+  --device 0 \
+  --speed 100000 \
+  --listen-port 9001 \
+  --forward-port 9000 \
+  --sender spi-end
+```
+
+This router:
+
+- listens on local UDP `9000`
+- sends received datagrams over UART inside `sedsprintf` packets
+- forwards received `sedsprintf` payloads to local UDP `9001`
+
+## References
+
+- [host/python/uart/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/test.py)
+- [host/python/uart/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/link_terminal.py)
+- [host/python/uart/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/sedsprintf_router.py)
+- [src/bridge/uart.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/uart.rs)

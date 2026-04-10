@@ -19,20 +19,29 @@ from dataclasses import dataclass, field
 
 try:
     from .raw import FRAME_SIZE, open_bus
-    from .test import parse_frame as parse_frame_full
+    from .test import (
+        COMMAND_POLL_LIMIT,
+        COMMAND_RETRY_LIMIT,
+        is_plausible_command_payload,
+        parse_frame as parse_frame_full,
+    )
 except ImportError:
     import os
 
     sys.path.append(os.path.dirname(__file__))
     from raw import FRAME_SIZE, open_bus
-    from test import parse_frame as parse_frame_full
+    from test import (
+        COMMAND_POLL_LIMIT,
+        COMMAND_RETRY_LIMIT,
+        is_plausible_command_payload,
+        parse_frame as parse_frame_full,
+    )
 
 PAYLOAD_MAX = FRAME_SIZE - 2
 REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
 RESP_COMMAND_MAGIC = 0x5B
-COMMAND_POLL_LIMIT = 50
 COMMAND_TIMEOUT_S = 2.0
 
 
@@ -204,13 +213,6 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
     except (EOFError, OSError):
         return
 
-
-def is_plausible_command_payload(payload: bytes) -> bool:
-    if not payload:
-        return False
-    return all(byte in (9, 10, 13) or 32 <= byte <= 126 for byte in payload)
-
-
 def exchange_frame(
     bus,
     prompt: PromptState,
@@ -231,20 +233,14 @@ def exchange_frame(
                 stream_printer.flush_partial()
             return
 
-        first_rx = bus.write_frame(build_frame(payload, magic))
-        rx_magic, rx_payload = parse_frame(first_rx)
-        last_magic, last_payload = rx_magic, rx_payload
-        if rx_magic == RESP_DATA_MAGIC and rx_payload:
-            stream_printer.feed(rx_payload)
-            stream_printer.flush_partial()
-        if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
-            stream_printer.feed(rx_payload)
-            stream_printer.flush_partial()
-            return
-
+        last_magic = 0
+        last_payload = b""
         deadline = time.monotonic() + COMMAND_TIMEOUT_S
-        while time.monotonic() < deadline:
-            rx_magic, rx_payload = parse_frame(bus.read_frame())
+        for _ in range(COMMAND_RETRY_LIMIT):
+            if time.monotonic() >= deadline:
+                break
+            first_rx = bus.write_frame(build_frame(payload, magic))
+            rx_magic, rx_payload = parse_frame(first_rx)
             last_magic, last_payload = rx_magic, rx_payload
             if rx_magic == RESP_DATA_MAGIC and rx_payload:
                 stream_printer.feed(rx_payload)
@@ -254,6 +250,19 @@ def exchange_frame(
                 stream_printer.flush_partial()
                 return
             time.sleep(poll_delay_s)
+            for _ in range(COMMAND_POLL_LIMIT):
+                if time.monotonic() >= deadline:
+                    break
+                rx_magic, rx_payload = parse_frame(bus.read_frame())
+                last_magic, last_payload = rx_magic, rx_payload
+                if rx_magic == RESP_DATA_MAGIC and rx_payload:
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
+                if rx_magic == RESP_COMMAND_MAGIC and is_plausible_command_payload(rx_payload):
+                    stream_printer.feed(rx_payload)
+                    stream_printer.flush_partial()
+                    return
+                time.sleep(poll_delay_s)
         if last_magic == RESP_COMMAND_MAGIC and last_payload:
             stream_printer.feed(last_payload)
             stream_printer.flush_partial()
