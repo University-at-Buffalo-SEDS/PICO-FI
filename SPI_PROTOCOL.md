@@ -176,6 +176,11 @@ Telemetry packet validation:
 python3 host/python/telemetry_terminal.py --sender spi-node spi --bus 0 --device 0 --speed 100000
 ```
 
+Telemetry decode note:
+
+- the telemetry helpers accept both `SP6:`-armored packets and raw serialized `sedsprintf_rs_2026` packets on receive
+- the terminal renders the decoded packet using the packet library string conversion when available
+
 ## Diagnostics
 
 The SPI firmware includes diagnostic and recovery support in:
@@ -203,6 +208,11 @@ python3 host/python/spi/sedsprintf_router.py \
   --forward-port 9001 \
   --sender spi-end
 ```
+
+Current router note:
+
+- the shared router path currently sends `SP6:`-armored packets
+- the telemetry CLI and telemetry terminal can also decode raw serialized packets on receive
 
 This does not change the SPI wire format. It only changes the payload bytes placed inside `0xA5` data frames.
 

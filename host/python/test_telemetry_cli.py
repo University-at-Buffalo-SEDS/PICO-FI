@@ -108,6 +108,26 @@ class TelemetryCliTests(unittest.TestCase):
         self.assertTrue(adapter.closed)
         self.assertIn("sender=spi-node payload=rx payload", out.getvalue())
 
+    def test_run_recv_accepts_raw_packet_payload(self) -> None:
+        packet = FakePacket("spi-node", b"rx payload")
+        adapter = FakeAdapter(packet.serialize())
+        args = argparse.Namespace(
+            timeout=0.1,
+            poll_interval=0.01,
+            expect="rx payload",
+            backend="spi",
+        )
+        out = io.StringIO()
+
+        with mock.patch.object(telemetry_cli, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
+            telemetry_cli, "build_adapter", return_value=adapter
+        ), redirect_stdout(out):
+            rc = telemetry_cli.run_recv(args)
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(adapter.closed)
+        self.assertIn("sender=spi-node payload=rx payload", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

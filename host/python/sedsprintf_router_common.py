@@ -117,6 +117,16 @@ def decode_armored_packet(sedsprintf, payload: bytes):
         return None
 
 
+def decode_packet(sedsprintf, payload: bytes):
+    packet = decode_armored_packet(sedsprintf, payload)
+    if packet is not None:
+        return packet
+    try:
+        return sedsprintf.deserialize_packet_py(payload)
+    except Exception:
+        return None
+
+
 def render_payload(payload: bytes) -> str:
     try:
         return payload.decode("utf-8")

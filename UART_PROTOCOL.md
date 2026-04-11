@@ -41,6 +41,7 @@ Practical implication:
 
 - wait a few seconds after reset before sending framed traffic
 - do not mix boot-shell text with runtime binary frames on the same open session
+- the firmware now resynchronizes on valid `0xA5` and `0xA6` request starts, so a few stray shell/debug-probe bytes no longer permanently poison framing
 
 ## Frame Format
 
@@ -169,6 +170,11 @@ Telemetry packet validation:
 python3 host/python/telemetry_terminal.py --sender uart-node uart --port /dev/ttyUSB0 --speed 115200
 ```
 
+Telemetry decode note:
+
+- the telemetry helpers accept both `SP6:`-armored packets and raw serialized `sedsprintf_rs_2026` packets on receive
+- the terminal renders the decoded packet using the packet library string conversion when available
+
 ## sedsprintf Router
 
 The router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes over the UART framed data path.
@@ -188,6 +194,7 @@ That means:
 
 - the UART wire protocol still carries only normal `0xA5` framed payloads
 - the payload bytes happen to be serialized telemetry packets
+- the shared router path currently sends `SP6:`-armored packets, while the interactive telemetry tools can also decode raw serialized packets
 
 ## References
 

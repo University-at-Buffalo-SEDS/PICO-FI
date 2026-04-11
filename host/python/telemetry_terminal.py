@@ -20,7 +20,7 @@ try:
     from .telemetry_cli import build_adapter
     from .sedsprintf_router_common import (
         armor_packet,
-        decode_armored_packet,
+        decode_packet,
         load_sedsprintf,
         render_payload,
         resolve_endpoints,
@@ -33,7 +33,7 @@ except ImportError:
     from telemetry_cli import build_adapter
     from sedsprintf_router_common import (
         armor_packet,
-        decode_armored_packet,
+        decode_packet,
         load_sedsprintf,
         render_payload,
         resolve_endpoints,
@@ -176,11 +176,53 @@ def build_packet(args: argparse.Namespace, payload_text: str) -> bytes:
     return armor_packet(packet)
 
 
-def render_incoming(prompt: PromptState, packet) -> None:
-    payload = bytes(packet.payload).decode("utf-8", errors="replace").replace("\r", "")
-    for line in payload.split("\n"):
+def stringify_packet_field(value) -> str:
+    if isinstance(value, bytes):
+        return render_payload(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(stringify_packet_field(item) for item in value) + "]"
+    return str(value)
+
+
+def packet_to_strings(packet) -> list[str]:
+    to_string = getattr(packet, "to_string", None)
+    if callable(to_string):
+        rendered = str(to_string()).replace("\r", "")
+        lines = [line for line in rendered.split("\n") if line]
+        if lines:
+            return [f"[rx] {line}" for line in lines]
+    rendered_packet = str(packet).replace("\r", "")
+    if rendered_packet and rendered_packet != object.__str__(packet):
+        lines = [line for line in rendered_packet.split("\n") if line]
+        if lines:
+            return [f"[rx] {line}" for line in lines]
+
+    sender = stringify_packet_field(getattr(packet, "sender", "unknown"))
+    packet_type = stringify_packet_field(
+        getattr(packet, "packet_type", getattr(packet, "data_type", "unknown"))
+    )
+    endpoints = stringify_packet_field(getattr(packet, "endpoints", []))
+    timestamp_ms = stringify_packet_field(
+        getattr(packet, "timestamp_ms", getattr(packet, "timestamp", "unknown"))
+    )
+    payload = bytes(getattr(packet, "payload", b""))
+    rendered_payload = render_payload(payload).replace("\r", "")
+
+    lines = [
+        f"[rx] sender={sender} type={packet_type} endpoints={endpoints} ts={timestamp_ms} len={len(payload)}"
+    ]
+    payload_lines = rendered_payload.split("\n") or [""]
+    for line in payload_lines:
         if line:
-            prompt.print_line(f"[rx] {packet.sender}: {line}")
+            lines.append(f"[rx] payload={line}")
+    if len(lines) == 1:
+        lines.append("[rx] payload=")
+    return lines
+
+
+def render_incoming(prompt: PromptState, packet) -> None:
+    for line in packet_to_strings(packet):
+        prompt.print_line(line)
 
 
 def main() -> int:
@@ -249,7 +291,7 @@ def main() -> int:
             incoming = adapter.recv_payload(max(args.poll_ms / 1000.0, 0.01))
             if not incoming:
                 continue
-            packet = decode_armored_packet(load_sedsprintf(), incoming)
+            packet = decode_packet(load_sedsprintf(), incoming)
             if packet is None:
                 prompt.print_line(f"[skip] non-sedsprintf payload: {render_payload(incoming)!r}")
                 continue

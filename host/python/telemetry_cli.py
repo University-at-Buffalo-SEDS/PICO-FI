@@ -10,7 +10,7 @@ import time
 try:
     from .sedsprintf_router_common import (
         armor_packet,
-        decode_armored_packet,
+        decode_packet,
         load_sedsprintf,
         render_payload,
         resolve_endpoints,
@@ -22,7 +22,7 @@ except ImportError:
     sys.path.append(os.path.dirname(__file__))
     from sedsprintf_router_common import (
         armor_packet,
-        decode_armored_packet,
+        decode_packet,
         load_sedsprintf,
         render_payload,
         resolve_endpoints,
@@ -112,7 +112,7 @@ def run_recv(args: argparse.Namespace) -> int:
             incoming = adapter.recv_payload(min(args.poll_interval, max(deadline - time.monotonic(), 0.01)))
             if not incoming:
                 continue
-            packet = decode_armored_packet(sedsprintf, incoming)
+            packet = decode_packet(sedsprintf, incoming)
             if packet is None:
                 print(f"skip non-sedsprintf payload: {render_payload(incoming)!r}", file=sys.stderr)
                 continue
