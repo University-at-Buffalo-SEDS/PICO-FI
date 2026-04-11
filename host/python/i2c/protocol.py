@@ -150,7 +150,11 @@ def read_packet(bus, addr: int, *, chunk_delay_s: float, timeout_s: float) -> tu
             continue
         if slot.flags & FLAG_START:
             assembly = RxAssembly(slot)
-        elif assembly is None:
+            if slot.flags & FLAG_END:
+                return slot.kind, bytes(slot.data)
+            time.sleep(chunk_delay_s)
+            continue
+        if assembly is None:
             raise ValueError("slot arrived without an active transfer")
         assert assembly is not None
         payload = assembly.push(slot)

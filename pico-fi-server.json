@@ -14,7 +14,7 @@
     "remote_port": 5000
   },
   "upstream": {
-    "transport": "spi",
+    "transport": "i2c",
     "usb": {
       "manufacturer": "UBSEDS",
       "product": "CHUD-USB-PICO-FI",

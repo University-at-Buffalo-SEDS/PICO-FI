@@ -21,6 +21,8 @@ use portable_atomic::{AtomicBool, Ordering};
 
 const UART_EGRESS_RING_BYTES: usize = 4096;
 const UART_EGRESS_CHUNK_BYTES: usize = 256;
+const UART_RETRY_DELAY_MS: u64 = 10;
+
 pub async fn run_client(
     uart: &mut BufferedUart,
     stack: Stack<'static>,
@@ -60,9 +62,11 @@ pub async fn run_client(
                             &mut egress_ring,
                         )
                         .await?;
-                        flush_uart_egress(uart_tx, &mut egress_ring).await?;
+                        flush_uart_egress(uart_tx, &mut egress_ring).await;
                     }
-                    Either::First(Err(_)) => return Err(()),
+                    Either::First(Err(_)) => {
+                        Timer::after_millis(UART_RETRY_DELAY_MS).await;
+                    }
                     Either::Second(Ok(())) => break,
                     Either::Second(Err(_)) => {
                         Timer::after_millis(runtime.reconnect_delay_ms).await;
@@ -125,11 +129,15 @@ pub async fn run_server(
                             &mut egress_ring,
                         )
                         .await?;
-                        flush_uart_egress(uart_tx, &mut egress_ring).await?;
+                        flush_uart_egress(uart_tx, &mut egress_ring).await;
                     }
-                    Either::First(Err(_)) => return Err(()),
+                    Either::First(Err(_)) => {
+                        Timer::after_millis(UART_RETRY_DELAY_MS).await;
+                    }
                     Either::Second(Ok(())) => break,
-                    Either::Second(Err(_)) => return Err(()),
+                    Either::Second(Err(_)) => {
+                        Timer::after_millis(runtime.reconnect_delay_ms).await;
+                    }
                 }
             }
         }
@@ -180,7 +188,7 @@ async fn session(
         if tx_chunk_pos < tx_chunk_len {
             match select(
                 socket.read(&mut net_buf),
-                uart_tx.write(&tx_chunk[tx_chunk_pos..tx_chunk_len]),
+                write_uart_chunk_lossy(uart_tx, &tx_chunk[tx_chunk_pos..tx_chunk_len]),
             )
             .await
             {
@@ -193,20 +201,21 @@ async fn session(
                     );
                 }
                 Either::First(Err(_)) => return Err(()),
-                Either::Second(Ok(written)) => {
-                    if written == 0 {
-                        return Err(());
-                    }
+                Either::Second(written) => {
                     tx_chunk_pos = (tx_chunk_pos + written).min(tx_chunk_len);
                     if tx_chunk_pos >= tx_chunk_len {
                         tx_chunk_pos = 0;
                         tx_chunk_len = 0;
                     }
                 }
-                Either::Second(Err(_)) => return Err(()),
             }
         } else {
-            match select(socket.read(&mut net_buf), uart_rx.read_exact(&mut uart_frame)).await {
+            match select(
+                socket.read(&mut net_buf),
+                read_uart_frame_lossy(uart_rx, &mut uart_frame),
+            )
+            .await
+            {
                 Either::First(Ok(net_n)) => {
                     if net_n == 0 {
                         return Ok(());
@@ -216,7 +225,7 @@ async fn session(
                     );
                 }
                 Either::First(Err(_)) => return Err(()),
-                Either::Second(Ok(())) => {
+                Either::Second(()) => {
                     handle_uart_request(
                         &uart_frame,
                         Some(socket),
@@ -226,7 +235,6 @@ async fn session(
                     )
                     .await?;
                 }
-                Either::Second(Err(_)) => return Err(()),
             }
         }
 
@@ -278,15 +286,45 @@ async fn handle_uart_request(
 async fn flush_uart_egress(
     uart_tx: &mut impl Write,
     egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
-) -> Result<(), ()> {
+) {
     let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
     while !egress_ring.is_empty() {
         let chunk_len = egress_ring.pop_into(&mut tx_chunk);
         if chunk_len == 0 {
             break;
         }
-        uart_tx.write_all(&tx_chunk[..chunk_len]).await.map_err(|_| ())?;
-        uart_tx.flush().await.map_err(|_| ())?;
+        match uart_tx.write(&tx_chunk[..chunk_len]).await {
+            Ok(0) | Err(_) => {
+                egress_ring.clear();
+                break;
+            }
+            Ok(written) if written < chunk_len => {
+                egress_ring.push_overwrite_slice(&tx_chunk[written..chunk_len]);
+                break;
+            }
+            Ok(_) => {
+                let _ = uart_tx.flush().await;
+            }
+        }
     }
-    Ok(())
+}
+
+async fn read_uart_frame_lossy(uart_rx: &mut impl Read, frame: &mut [u8; FRAME_SIZE]) {
+    loop {
+        if uart_rx.read_exact(frame).await.is_ok() {
+            return;
+        }
+        Timer::after_millis(UART_RETRY_DELAY_MS).await;
+    }
+}
+
+async fn write_uart_chunk_lossy(uart_tx: &mut impl Write, chunk: &[u8]) -> usize {
+    loop {
+        match uart_tx.write(chunk).await {
+            Ok(written) if written != 0 => return written,
+            Ok(_) | Err(_) => {
+                Timer::after_millis(UART_RETRY_DELAY_MS).await;
+            }
+        }
+    }
 }

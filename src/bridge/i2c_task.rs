@@ -393,12 +393,12 @@ async fn await_response_packet(
         return;
     }
 
-    if let Some(resp) = rx_resp.try_pop() {
+    if let Some(resp) = rx_resp.try_pop_latest() {
         tx_packet.stage_bridge_packet(transfer_id, resp);
         return;
     }
 
-    match select(rx_resp.pop(), Timer::after_millis(RESPONSE_WAIT_MS)).await {
+    match select(rx_resp.pop_latest(), Timer::after_millis(RESPONSE_WAIT_MS)).await {
         Either::First(resp) => tx_packet.stage_bridge_packet(transfer_id, resp),
         Either::Second(_) => tx_packet.stage_idle(transfer_id),
     }

@@ -3,8 +3,8 @@
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::spi_diag;
+use crate::bridge::spi_frame::SpiFrame;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
-use crate::bridge::spi_task::SpiFrame;
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
     FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
@@ -418,7 +418,7 @@ fn pull_queued_response(
     if let Some(resp) = pending_pull_response {
         return *resp;
     }
-    if let Some(resp) = rx_resp.try_pop() {
+    if let Some(resp) = rx_resp.try_pop_latest() {
         *pending_pull_response = Some(resp.data);
         return resp.data;
     }

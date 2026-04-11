@@ -13,8 +13,8 @@ mod storage;
 use bridge::i2c_task::{i2c_poll_task, I2cPacket};
 use bridge::overwrite_queue::OverwriteQueue;
 use bridge::spi_hw_task::spi_poll_task;
-use bridge::spi_task::SpiFrame;
 use bridge::runtime::BridgeRuntime;
+use bridge::spi_frame::SpiFrame;
 use bridge::commands::{set_led_state, take_led_activity, take_led_command};
 use config::{BridgeConfig, BridgeMode, COMPILED_USB_DEVICE_NAMES, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
@@ -80,9 +80,6 @@ const LINK_CONNECT_TIMEOUT_MS: u64 = 1_500;
 
 /// Timeout applied to the bridge handshake exchange after TCP connects.
 const LINK_HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
-
-/// Timeout applied to socket I/O once a bridge session is active.
-const LINK_SOCKET_TIMEOUT_MS: u64 = 2_000;
 
 /// Fixed magic exchanged by both peers to confirm protocol compatibility.
 const LINK_HANDSHAKE_MAGIC: &[u8] = b"PICOFI1";
@@ -406,7 +403,6 @@ async fn run_bridge_mode(
         reconnect_delay_ms: CLIENT_RECONNECT_DELAY_MS,
         connect_timeout_ms: LINK_CONNECT_TIMEOUT_MS,
         handshake_timeout_ms: LINK_HANDSHAKE_TIMEOUT_MS,
-        socket_timeout_ms: LINK_SOCKET_TIMEOUT_MS,
         handshake_magic: LINK_HANDSHAKE_MAGIC,
     };
 

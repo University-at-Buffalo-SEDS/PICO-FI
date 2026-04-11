@@ -4,7 +4,7 @@ use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::bridge::spi_diag;
-use crate::bridge::spi_task::SpiFrame;
+use crate::bridge::spi_frame::SpiFrame;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
 use crate::shell::writeln_line;

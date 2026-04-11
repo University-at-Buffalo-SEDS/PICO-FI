@@ -34,17 +34,30 @@ impl<T, const N: usize> OverwriteQueue<T, N> {
         unsafe { self.queue.lock_mut(|queue| queue.pop_front()) }
     }
 
-    pub fn clear(&self) {
+    pub fn try_pop_latest(&self) -> Option<T> {
         unsafe {
             self.queue.lock_mut(|queue| {
-                queue.clear();
-            });
+                let mut latest = queue.pop_front()?;
+                while let Some(next) = queue.pop_front() {
+                    latest = next;
+                }
+                Some(latest)
+            })
         }
     }
 
     pub async fn pop(&self) -> T {
         loop {
             if let Some(item) = self.try_pop() {
+                return item;
+            }
+            self.ready.wait().await;
+        }
+    }
+
+    pub async fn pop_latest(&self) -> T {
+        loop {
+            if let Some(item) = self.try_pop_latest() {
                 return item;
             }
             self.ready.wait().await;
@@ -84,6 +97,10 @@ impl<const N: usize> OverwriteByteRing<N> {
             }
         }
         count
+    }
+
+    pub fn clear(&mut self) {
+        self.queue.clear();
     }
 
     pub fn is_empty(&self) -> bool {

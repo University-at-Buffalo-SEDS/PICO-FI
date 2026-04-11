@@ -64,13 +64,6 @@ pub fn record_transfer_status(status_before: u8, status_after: u8, ok: bool) {
     }
 }
 
-pub fn record_reset(staged_magic: u8, staged_len: u8) {
-    LAST_KIND.store(KIND_RESET, Ordering::Relaxed);
-    LAST_STAGED_MAGIC.store(staged_magic, Ordering::Relaxed);
-    LAST_STAGED_LEN.store(staged_len, Ordering::Relaxed);
-    let _ = RESET_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
 pub fn record_queued_response(magic: u8, len: u8) {
     let _ = QUEUED_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
     LAST_QUEUED_MAGIC.store(magic, Ordering::Relaxed);
