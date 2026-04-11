@@ -1,32 +1,50 @@
 # UART Protocol
 
-This project uses `UART0` as a framed upstream transport after the short boot-time shell exits.
+This document describes the current Pico-Fi UART upstream transport as implemented by:
 
-Runtime UART uses fixed-size binary frames. It is not newline-delimited text mode.
+- [src/bridge/uart.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/uart.rs)
+- [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)
+- [host/python/uart/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/test.py)
+
+The UART runtime protocol is a fixed-size binary frame protocol. It is not line-oriented text mode.
 
 ## Physical Link
 
-Default UART settings:
+Default settings:
 
 - `UART0`
 - `115200` baud
 - `8N1`
-- no software or hardware flow control
+- no RTS/CTS
+- no XON/XOFF
 
 Pins:
 
-- `GPIO0` = UART TX from Pico
-- `GPIO1` = UART RX into Pico
+- `GPIO0`: Pico TX
+- `GPIO1`: Pico RX
 
-For a USB-UART adapter:
+USB-UART wiring:
 
 - adapter `TX` -> Pico `GPIO1`
 - adapter `RX` -> Pico `GPIO0`
 - adapter `GND` -> Pico `GND`
 
-## Runtime Frame Format
+On macOS, use `/dev/cu.*` for host-initiated traffic rather than `/dev/tty.*`.
 
-All runtime UART traffic is sent as fixed `258` byte frames:
+## Boot Window
+
+Immediately after reset, UART is briefly attached to the boot/config shell. During that window the Pico emits plain ASCII text.
+
+After startup finishes, UART switches to framed runtime packets.
+
+Practical implication:
+
+- wait a few seconds after reset before sending framed traffic
+- do not mix boot-shell text with runtime binary frames on the same open session
+
+## Frame Format
+
+Every UART request and response is exactly `258` bytes:
 
 - byte `0`: magic
 - byte `1`: payload length `N`
@@ -35,65 +53,125 @@ All runtime UART traffic is sent as fixed `258` byte frames:
 
 Constants:
 
-- frame size = `258`
-- max payload = `256`
-- data request magic = `0xA5`
-- command request magic = `0xA6`
-- data response magic = `0x5A`
-- command response magic = `0x5B`
+- frame size: `258`
+- max payload: `256`
+- request data magic: `0xA5`
+- request command magic: `0xA6`
+- response data magic: `0x5A`
+- response command magic: `0x5B`
 
-Semantics:
+The firmware parser is currently shared with the SPI/I2C framed protocol code in [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs).
 
-- `0xA5` requests carry bridged data.
-- `0xA6` requests carry local Pico commands such as `/ping`, `/show`, and `/link`.
-- `0x5A` responses carry bridged data or an empty poll reply.
-- `0x5B` responses carry local Pico command replies.
+## Semantics
 
-## Boot Window
+`0xA5` request:
 
-Immediately after reset, UART is briefly attached to the boot/config shell for about `3000 ms`.
+- carries bridged data bytes
+- empty payload is a poll for pending inbound data
 
-During that window the Pico can emit plain ASCII lines. After startup finishes, UART switches to framed runtime packets.
+`0xA6` request:
 
-Implications for host tools:
+- carries a local Pico command such as `/ping\n`, `/show\n`, or `/link\n`
 
-- if the Pico has just reset, wait a few seconds before starting framed traffic
-- or explicitly drive the shell to runtime mode first if you are using the boot window intentionally
+`0x5A` response:
+
+- carries bridged data
+- or an empty acknowledgement / empty poll result
+
+`0x5B` response:
+
+- carries local Pico command output
+- or an error such as `error invalid uart frame`
+
+## Current Firmware Behavior
+
+When the Ethernet bridge session is active:
+
+- non-empty `0xA5` payloads are forwarded across the bridge
+- empty `0xA5` payloads poll for pending bridged data
+- `0xA6` payloads are handled locally as Pico commands
+
+Before the bridge session is active:
+
+- `0xA5` requests still parse and typically receive an empty `0x5A`
+- `0xA6` requests still work for local Pico commands
+
+Important constraint:
+
+- only one host process should own the UART device at a time
+
+If two host tools write to the same UART simultaneously, the Pico will see corrupted framing and can reply with `error invalid uart frame`.
+
+## Minimal Driver Algorithm
+
+To send bridged data:
+
+1. Build a `258` byte frame with magic `0xA5`.
+2. Put the payload length in byte `1`.
+3. Copy the payload into bytes `2..`.
+4. Zero-fill the rest.
+5. Write all `258` bytes.
+6. Read exactly `258` bytes back.
+
+To poll for inbound bridged data:
+
+1. Send an empty `0xA5` frame.
+2. Read exactly `258` bytes back.
+3. If the reply magic is `0x5A` and length is non-zero, bytes `2..(2+N)` are the inbound data.
+4. If the reply magic is `0x5A` and length is zero, no data is pending.
+
+To issue a local Pico command:
+
+1. Send a `0xA6` frame whose payload is ASCII and usually newline-terminated, for example `/link\n`.
+2. Read a `0x5B` response.
+
+## Example Frames
+
+Send bridged payload `hello`:
+
+```text
+a5 05 68 65 6c 6c 6f 00 00 ...
+```
+
+Poll for inbound data:
+
+```text
+a5 00 00 00 00 00 ...
+```
+
+Send local command `/ping\n`:
+
+```text
+a6 06 2f 70 69 6e 67 0a 00 ...
+```
 
 ## Host Tools
 
-Test tool:
+Raw helper:
 
 ```bash
-python3 host/python/uart/test.py --port /dev/ttyUSB0 probe --count 3
-python3 host/python/uart/test.py --port /dev/ttyUSB0 command /ping
-python3 host/python/uart/test.py --port /dev/ttyUSB0 send "hello"
-python3 host/python/uart/test.py --port /dev/ttyUSB0 recv --expect "hello"
-python3 host/python/uart/test.py --port /dev/ttyUSB0 data "hello" --expect "hello"
-```
-
-Typical bridge check:
-
-```bash
-python3 host/python/uart/test.py --port /dev/ttyUSB0 send "uart-to-peer"
-python3 host/python/uart/test.py --port /dev/ttyUSB0 recv --expect "peer-to-uart"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 --speed 115200 probe --count 3
+python3 host/python/uart/test.py --port /dev/ttyUSB0 --speed 115200 command /ping
+python3 host/python/uart/test.py --port /dev/ttyUSB0 --speed 115200 send "hello"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 --speed 115200 recv --expect "hello"
+python3 host/python/uart/test.py --port /dev/ttyUSB0 --speed 115200 data "hello" --expect "hello"
 ```
 
 Interactive terminal:
 
 ```bash
-python3 host/python/uart/link_terminal.py --port /dev/ttyUSB0
+python3 host/python/uart/link_terminal.py --port /dev/ttyUSB0 --baud 115200
 ```
 
-Terminal behavior:
+Telemetry packet validation:
 
-- plain text lines are sent as bridged data
-- `/...` lines are sent as local Pico commands
-- outbound chat is rendered as `sender: message`
+```bash
+python3 host/python/telemetry_terminal.py --sender uart-node uart --port /dev/ttyUSB0 --speed 115200
+```
 
 ## sedsprintf Router
 
-There is also a UART router that wraps UDP datagrams in `sedsprintf_rs_2026` packets and carries them over the UART Fi link.
+The router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes over the UART framed data path.
 
 Example:
 
@@ -106,33 +184,16 @@ python3 host/python/uart/sedsprintf_router.py \
   --sender uart-end
 ```
 
-Paired example:
+That means:
 
-```bash
-python3 host/python/uart/sedsprintf_router.py \
-  --port /dev/ttyUSB0 \
-  --listen-port 9000 \
-  --forward-port 9001 \
-  --sender uart-end
-
-python3 host/python/spi/sedsprintf_router.py \
-  --bus 0 \
-  --device 0 \
-  --speed 100000 \
-  --listen-port 9001 \
-  --forward-port 9000 \
-  --sender spi-end
-```
-
-This router:
-
-- listens on local UDP `9000`
-- sends received datagrams over UART inside `sedsprintf` packets
-- forwards received `sedsprintf` payloads to local UDP `9001`
+- the UART wire protocol still carries only normal `0xA5` framed payloads
+- the payload bytes happen to be serialized telemetry packets
 
 ## References
 
 - [host/python/uart/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/test.py)
 - [host/python/uart/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/link_terminal.py)
 - [host/python/uart/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/sedsprintf_router.py)
+- [host/python/telemetry_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/telemetry_terminal.py)
 - [src/bridge/uart.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/uart.rs)
+- [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)

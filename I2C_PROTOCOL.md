@@ -1,17 +1,28 @@
 # I2C Protocol
 
-This project uses a framed I2C transport between a Linux I2C master and the Pico acting as an `I2C0` slave at address `0x55`.
+This document describes the current Pico-Fi I2C upstream transport as implemented by:
 
-Unlike UART and SPI, the I2C host transport is chunked into fixed 32-byte slots on the wire.
+- [src/bridge/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c.rs)
+- [src/bridge/i2c_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c_task.rs)
+- [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
+- [host/python/i2c/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/test.py)
+
+Unlike UART and SPI, I2C does not use a single fixed `258` byte wire frame. It uses chunked `32` byte slots that are reassembled into logical packets.
 
 ## Electrical Setup
 
-The Pico uses:
+Default bus role:
 
-- `GPIO0` = `I2C0 SDA`
-- `GPIO1` = `I2C0 SCL`
+- Linux host: I2C master
+- Pico: `I2C0` slave
+- default address: `0x55`
 
-Pi wiring:
+Pico pins:
+
+- `GPIO0`: `I2C0 SDA`
+- `GPIO1`: `I2C0 SCL`
+
+Typical Pi wiring:
 
 - Pi `SDA` -> Pico `GPIO0`
 - Pi `SCL` -> Pico `GPIO1`
@@ -19,51 +30,113 @@ Pi wiring:
 
 ## Slot Format
 
-The host-side I2C transport uses `32` byte slots.
+Each on-wire transfer is one `32` byte slot.
 
 Constants from [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py):
 
-- slot size = `32`
-- header size = `18`
-- payload per slot = `14`
-- magic bytes = `0x49 0x32`
-- version = `1`
+- slot size: `32`
+- header size: `18`
+- payload bytes per slot: `14`
+- magic: `0x49 0x32`
+- version: `1`
 
-Each slot contains:
+Per-slot layout:
 
-- magic/version
-- kind
-- flags (`START`, `END`)
-- transfer id
-- transfer offset
-- total payload length
-- slot payload bytes
+- bytes `0..1`: magic
+- byte `2`: version
+- byte `3`: kind
+- byte `4`: flags
+- byte `5`: reserved
+- bytes `6..9`: payload offset, little-endian
+- bytes `10..13`: total transfer length, little-endian
+- bytes `14..15`: slot payload length, little-endian
+- bytes `16..17`: transfer id, little-endian
+- bytes `18..31`: slot payload bytes
 
-Complete logical messages are reassembled from one or more slots.
+Flags:
 
-## Message Semantics
+- `FLAG_START = 0x01`
+- `FLAG_END = 0x02`
 
-Logical payloads still use the same application-level meanings as the other backends:
+Large logical messages are split across multiple slots and reassembled by transfer id plus offset.
 
-- `KIND_DATA` carries bridged data
-- `KIND_COMMAND` carries local Pico commands such as `/ping`, `/show`, and `/link`
-- empty `KIND_DATA` polls are used to fetch pending bridged data
+## Packet Kinds
 
-## Host Tools
+Current host and firmware kinds:
 
-Test tool:
+- `KIND_IDLE = 0x00`
+- `KIND_DATA = 0x01`
+- `KIND_COMMAND = 0x02`
+- `KIND_ERROR = 0x7F`
+
+Semantics:
+
+- `KIND_DATA`: bridged data
+- `KIND_COMMAND`: local Pico commands such as `/ping`, `/show`, `/link`
+- `KIND_ERROR`: protocol or parsing error
+
+An empty `KIND_DATA` payload is the I2C-side equivalent of a poll / empty acknowledgement.
+
+## Current Firmware Behavior
+
+When the bridge session is active:
+
+- non-empty `KIND_DATA` payloads are forwarded across the bridge
+- incoming network data is queued back to the I2C host as `KIND_DATA`
+- `KIND_COMMAND` is handled locally on the Pico
+
+When the bridge session is not active:
+
+- `KIND_COMMAND` still works locally
+- non-empty `KIND_DATA` may receive only an empty acknowledgement
+
+Unknown kinds are answered with:
+
+- `KIND_ERROR`
+- payload `error invalid i2c frame`
+
+## Minimal Driver Algorithm
+
+To send a logical packet:
+
+1. Split the payload into `14` byte chunks.
+2. Emit one or more `32` byte slots with:
+3. matching transfer id
+4. offset increasing by chunk length
+5. `FLAG_START` on the first slot
+6. `FLAG_END` on the last slot
+
+To receive a logical packet:
+
+1. Read `32` byte slots from the slave.
+2. Ignore all-zero / all-`0xFF` / `KIND_IDLE` slots.
+3. Start a new assembly when `FLAG_START` is set.
+4. Append payload bytes while validating:
+5. same kind
+6. same transfer id
+7. matching offset
+8. stop when `FLAG_END` arrives and total length matches
+
+The reference implementation for this is already in:
+
+- [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
+
+If you are implementing another driver, copy that state machine behavior.
+
+## Example Host Usage
+
+Current `host/python/i2c/test.py` supports:
 
 ```bash
-python3 host/python/i2c/test.py --bus 1 probe --count 3
-python3 host/python/i2c/test.py --bus 1 command /ping
-python3 host/python/i2c/test.py --bus 1 command /link
+python3 host/python/i2c/test.py --bus 1 --addr 0x55 probe --count 3
+python3 host/python/i2c/test.py --bus 1 --addr 0x55 command /ping
+python3 host/python/i2c/test.py --bus 1 --addr 0x55 command /link
 ```
 
 Current note:
 
-- the I2C helper currently exposes `probe` and `command`
-- there is no standalone `send`/`recv` helper yet in `host/python/i2c/test.py`
-- bridged data is easiest to exercise through `link_terminal.py` or the `sedsprintf` router
+- the I2C test helper does not yet expose standalone `send` / `recv` subcommands like UART and SPI
+- the interactive terminal and telemetry router are the easiest current ways to drive bridged I2C payloads
 
 Interactive terminal:
 
@@ -71,15 +144,14 @@ Interactive terminal:
 python3 host/python/i2c/link_terminal.py --bus 1 --addr 0x55
 ```
 
-Terminal behavior:
+Telemetry note:
 
-- plain text lines are sent as bridged data
-- `/...` lines are sent as local Pico commands
-- outbound chat is rendered as `sender: message`
+- the current telemetry terminal only supports UART and SPI
+- for I2C telemetry validation today, use [host/python/i2c/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/sedsprintf_router.py) or add an I2C backend that reuses [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
 
 ## sedsprintf Router
 
-There is also an I2C router that wraps UDP datagrams in `sedsprintf_rs_2026` packets and carries them over the I2C Fi link.
+The I2C router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes inside logical `KIND_DATA` packets.
 
 Example:
 
@@ -92,22 +164,7 @@ python3 host/python/i2c/sedsprintf_router.py \
   --sender i2c-end
 ```
 
-Paired example:
-
-```bash
-python3 host/python/i2c/sedsprintf_router.py \
-  --bus 1 \
-  --addr 0x55 \
-  --listen-port 9000 \
-  --forward-port 9001 \
-  --sender i2c-end
-
-python3 host/python/uart/sedsprintf_router.py \
-  --port /dev/ttyUSB0 \
-  --listen-port 9001 \
-  --forward-port 9000 \
-  --sender uart-end
-```
+Again, this does not change the I2C slot format. It only changes the bytes carried in the logical data packet.
 
 ## References
 
@@ -116,3 +173,4 @@ python3 host/python/uart/sedsprintf_router.py \
 - [host/python/i2c/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/link_terminal.py)
 - [host/python/i2c/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/sedsprintf_router.py)
 - [src/bridge/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c.rs)
+- [src/bridge/i2c_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c_task.rs)

@@ -1,29 +1,45 @@
 # SPI Protocol
 
-This project uses a framed SPI protocol between a Linux SPI master and the Pico acting as an `SPI1` slave.
+This document describes the current Pico-Fi SPI upstream transport as implemented by:
 
-The Linux master must use SPI mode `3` (`CPOL=1`, `CPHA=1`).
+- [src/bridge/spi.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi.rs)
+- [src/bridge/spi_hw_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi_hw_task.rs)
+- [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)
+- [host/python/spi/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/test.py)
+
+The Linux side is always the SPI master. The Pico acts as an `SPI1` slave.
 
 ## Electrical Setup
 
-The Pico upstream SPI slave uses:
+SPI mode requirements:
 
-- `GPIO10` = `SPI1 SCK`
-- `GPIO11` = `SPI1 TX` output from Pico
-- `GPIO12` = `SPI1 RX` input to Pico
-- `GPIO13` = `SPI1 CSn`
+- mode `3`
+- `CPOL=1`
+- `CPHA=1`
+- 8-bit words
 
-Pi wiring:
+Pico pins:
+
+- `GPIO10`: `SPI1 SCK`
+- `GPIO11`: Pico TX / MISO from Pico
+- `GPIO12`: Pico RX / MOSI into Pico
+- `GPIO13`: `SPI1 CSn`
+
+Typical Raspberry Pi wiring:
 
 - Pi `SCLK` -> Pico `GPIO10`
 - Pi `MOSI` -> Pico `GPIO12`
 - Pi `MISO` <- Pico `GPIO11`
-- Pi `CE0`/chip-select -> Pico `GPIO13`
+- Pi `CE0` -> Pico `GPIO13`
 - Pi `GND` -> Pico `GND`
 
-## Frame Format
+Important constraint:
 
-SPI requests and responses use fixed `258` byte framed transfers:
+- only one SPI client may access `/dev/spidev*` at a time
+
+## Transfer Format
+
+Each Linux SPI transaction is exactly one `258` byte framed transfer:
 
 - byte `0`: magic
 - byte `1`: payload length `N`
@@ -32,26 +48,113 @@ SPI requests and responses use fixed `258` byte framed transfers:
 
 Constants:
 
-- frame size = `258`
-- max payload = `256`
-- data request magic = `0xA5`
-- command request magic = `0xA6`
-- data response magic = `0x5A`
-- command response magic = `0x5B`
+- frame size: `258`
+- max payload: `256`
+- request data magic: `0xA5`
+- request command magic: `0xA6`
+- response data magic: `0x5A`
+- response command magic: `0x5B`
+
+One Pico response is returned on the same full-duplex transfer, or on a later poll if the response is queued.
 
 ## Semantics
 
-- empty `0xA5` requests are probe/poll frames
-- local Pico commands use `0xA6` with payloads like `/ping\n` or `/link\n`
-- plain non-empty SPI chat/data currently also uses the stable `0xA6` path on the host tools, and firmware treats non-slash `0xA6` payloads as bridged data
-- `0x5A` responses carry bridged data or an empty acknowledgement
-- `0x5B` responses carry local Pico command replies
+`0xA5` request:
 
-Each request must fit in one CS-bounded transfer. Splitting a frame across multiple Linux SPI transactions is not supported.
+- carries bridged data
+- empty payload is just an empty data frame and is commonly used as a probe
+
+`0xA6` request:
+
+- carries a local Pico command such as `/ping\n` or `/link\n`
+- also carries the host-side `/pull\n` command used to fetch queued inbound data
+
+`0x5A` response:
+
+- carries bridged data
+- or an empty acknowledgement / empty queued-data result
+
+`0x5B` response:
+
+- carries local Pico command output
+- or an error such as `error invalid spi frame`
+
+## Current Firmware Behavior
+
+The SPI bridge currently accepts both of these bridged-data paths:
+
+- `0xA5` with arbitrary payload
+- `0xA6` with non-slash payload
+
+The host tools use:
+
+- `0xA5` for normal data sends
+- `0xA6 "/pull\n"` to fetch queued inbound data
+- `0xA6 "/... \n"` for local Pico commands
+
+The relevant logic is in [src/bridge/spi.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi.rs).
+
+## Minimal Driver Algorithm
+
+To send bridged data:
+
+1. Build a `258` byte frame with magic `0xA5`.
+2. Set byte `1` to payload length.
+3. Copy the payload into bytes `2..`.
+4. Zero-fill the rest.
+5. Perform one `258` byte SPI transfer.
+6. Parse the returned `258` byte response frame.
+
+To fetch pending inbound data:
+
+1. Send a `0xA6` frame whose payload is `/pull\n`.
+2. If the same transfer returns `0x5A` with non-zero length, consume it.
+3. Otherwise keep issuing additional `258` byte transfers until a queued `0x5A` with data arrives or your timeout expires.
+
+To issue a local Pico command:
+
+1. Send a `0xA6` frame containing `/command\n`.
+2. Poll until a `0x5B` response arrives.
+
+## Example Frames
+
+Send bridged payload `hello`:
+
+```text
+a5 05 68 65 6c 6c 6f 00 00 ...
+```
+
+Poll inbound queue:
+
+```text
+a6 06 2f 70 75 6c 6c 0a 00 ...
+```
+
+Send local command `/link\n`:
+
+```text
+a6 06 2f 6c 69 6e 6b 0a 00 ...
+```
+
+## Response Timing Model
+
+SPI is the most stateful host transport in this repo.
+
+Practical rules for driver authors:
+
+- treat every transaction as request plus possible reply
+- keep chip select asserted for the whole `258` byte transfer
+- do not split a single frame across multiple SPI transactions
+- be prepared to poll after sends to retrieve queued inbound data or delayed command replies
+
+The current Python reference implementation is in:
+
+- [host/python/spi/raw.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/raw.py)
+- [host/python/spi/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/test.py)
 
 ## Host Tools
 
-Test tool:
+Raw helper:
 
 ```bash
 python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 probe --count 3
@@ -61,39 +164,33 @@ python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 recv --expect 
 python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 data "hello" --expect "hello"
 ```
 
-Typical bridge check:
-
-```bash
-python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 send "spi-to-peer"
-python3 host/python/spi/test.py --bus 0 --device 0 --speed 100000 recv --expect "peer-to-spi"
-```
-
 Interactive terminal:
 
 ```bash
 python3 host/python/spi/link_terminal.py --bus 0 --device 0 --speed 100000
 ```
 
-Terminal behavior:
+Telemetry packet validation:
 
-- plain text lines are sent as bridged data
-- `/...` lines are sent as local Pico commands
-- outbound chat is rendered as `sender: message`
-- only one SPI client should touch `/dev/spidev*` at a time
+```bash
+python3 host/python/telemetry_terminal.py --sender spi-node spi --bus 0 --device 0 --speed 100000
+```
 
-## Self-Healing
+## Diagnostics
 
-The SPI firmware now includes a small self-heal path:
+The SPI firmware includes diagnostic and recovery support in:
 
-- malformed or partial captures fail closed to an empty `0x5A` response
-- repeated suspicious captures trigger a soft SPI transport reset
-- self-heal no longer overwrites a real staged command reply
+- [src/bridge/spi_diag.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi_diag.rs)
+- [src/bridge/spi_hw_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi_hw_task.rs)
 
-This is intended to make the transport recover from bad host traffic more safely instead of poisoning later transactions.
+Malformed captures are failed closed and can produce:
+
+- empty `0x5A`
+- `0x5B "error invalid spi frame"`
 
 ## sedsprintf Router
 
-There is also an SPI router that wraps UDP datagrams in `sedsprintf_rs_2026` packets and carries them over the SPI Fi link.
+The router wraps UDP payloads in `sedsprintf_rs_2026` serialized packets and sends those bytes over the normal SPI framed data path.
 
 Example:
 
@@ -107,29 +204,15 @@ python3 host/python/spi/sedsprintf_router.py \
   --sender spi-end
 ```
 
-Paired example:
-
-```bash
-python3 host/python/spi/sedsprintf_router.py \
-  --bus 0 \
-  --device 0 \
-  --speed 100000 \
-  --listen-port 9000 \
-  --forward-port 9001 \
-  --sender spi-end
-
-python3 host/python/uart/sedsprintf_router.py \
-  --port /dev/ttyUSB0 \
-  --listen-port 9001 \
-  --forward-port 9000 \
-  --sender uart-end
-```
+This does not change the SPI wire format. It only changes the payload bytes placed inside `0xA5` data frames.
 
 ## References
 
 - [host/python/spi/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/test.py)
 - [host/python/spi/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/link_terminal.py)
-- [host/python/spi/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/sedsprintf_router.py)
 - [host/python/spi/raw.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/raw.py)
+- [host/python/spi/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/sedsprintf_router.py)
+- [host/python/telemetry_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/telemetry_terminal.py)
 - [src/bridge/spi.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi.rs)
-- [src/bridge/spi_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi_task.rs)
+- [src/bridge/spi_hw_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi_hw_task.rs)
+- [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)
