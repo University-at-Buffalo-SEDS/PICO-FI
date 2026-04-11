@@ -54,15 +54,6 @@ impl<T, const N: usize> OverwriteQueue<T, N> {
             self.ready.wait().await;
         }
     }
-
-    pub async fn pop_latest(&self) -> T {
-        loop {
-            if let Some(item) = self.try_pop_latest() {
-                return item;
-            }
-            self.ready.wait().await;
-        }
-    }
 }
 
 pub struct OverwriteByteRing<const N: usize> {

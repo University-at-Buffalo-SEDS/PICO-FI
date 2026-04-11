@@ -7,6 +7,7 @@ use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
 use embassy_futures::select::{Either, select};
+use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
@@ -91,7 +92,8 @@ pub async fn run_server(
         socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         if socket.accept(port).await.is_err() {
-            return Err(());
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
         }
         socket.set_timeout(None);
         if exchange_link_handshake(
@@ -146,6 +148,8 @@ async fn session(
             }
             Either::Second(Err(_)) => return Err(()),
         }
+
+        yield_now().await;
     }
 }
 

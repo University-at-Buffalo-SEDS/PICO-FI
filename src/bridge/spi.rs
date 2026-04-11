@@ -12,6 +12,7 @@ use crate::protocol::i2c::{
     RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame, parse_request_frame,
 };
 use embassy_futures::select::{Either, select};
+use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
@@ -116,9 +117,12 @@ pub async fn run_server(
                 Either::First(frame) => {
                     handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx)
                         .await?;
+                    yield_now().await;
                 }
                 Either::Second(Ok(())) => break,
-                Either::Second(Err(_)) => return Err(()),
+                Either::Second(Err(_)) => {
+                    Timer::after_millis(runtime.reconnect_delay_ms).await;
+                }
             }
         }
         socket.set_timeout(None);
@@ -180,6 +184,8 @@ async fn session(
                 handle_spi_request(frame, Some(socket), bridge_config, link_active, spi_tx).await?;
             }
         }
+
+        yield_now().await;
     }
 }
 

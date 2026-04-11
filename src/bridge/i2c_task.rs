@@ -3,10 +3,10 @@
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::config::BridgeConfig;
-use embassy_futures::select::{Either, select};
+use embassy_futures::yield_now;
 use embassy_rp::i2c_slave::{Command, I2cSlave, ReadStatus};
 use embassy_rp::peripherals::I2C0;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
 use heapless::Vec;
 use portable_atomic::AtomicBool;
 
@@ -27,7 +27,6 @@ const KIND_ERROR: u8 = 0x7F;
 const FLAG_START: u8 = 0x01;
 const FLAG_END: u8 = 0x02;
 
-const RESPONSE_WAIT_MS: u64 = 20;
 const PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(50);
 pub const I2C_PACKET_MAX: usize = 1024;
 const INVALID_SLOT_MSG: &[u8] = b"error invalid i2c slot";
@@ -305,16 +304,18 @@ pub async fn i2c_poll_task(
                     link_active,
                     tx,
                 );
-                await_response_packet(&mut tx_packet, rx_resp, last_transfer_id).await;
+                stage_response_packet(&mut tx_packet, rx_resp, last_transfer_id);
                 let _ = respond_slot(i2c, &mut tx_packet).await;
             }
             Ok(Command::Read) => {
-                await_response_packet(&mut tx_packet, rx_resp, last_transfer_id).await;
+                stage_response_packet(&mut tx_packet, rx_resp, last_transfer_id);
                 let _ = respond_slot(i2c, &mut tx_packet).await;
             }
             Ok(Command::GeneralCall(_)) => {}
             Err(_) => recover_i2c_state(i2c, &mut rx_packet, &mut tx_packet, last_transfer_id),
         }
+
+        yield_now().await;
     }
 }
 
@@ -384,7 +385,7 @@ fn process_complete_packet(
     }
 }
 
-async fn await_response_packet(
+fn stage_response_packet(
     tx_packet: &mut TxPacketState,
     rx_resp: &'static OverwriteQueue<I2cPacket, 8>,
     transfer_id: u16,
@@ -398,10 +399,7 @@ async fn await_response_packet(
         return;
     }
 
-    match select(rx_resp.pop_latest(), Timer::after_millis(RESPONSE_WAIT_MS)).await {
-        Either::First(resp) => tx_packet.stage_bridge_packet(transfer_id, resp),
-        Either::Second(_) => tx_packet.stage_idle(transfer_id),
-    }
+    tx_packet.stage_idle(transfer_id);
 }
 
 async fn respond_slot(

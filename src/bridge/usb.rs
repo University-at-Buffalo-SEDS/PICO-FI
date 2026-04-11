@@ -37,10 +37,16 @@ async fn write_usb_packet(
     bytes: &[u8],
 ) -> Result<(), ()> {
     let mut offset = 0usize;
+    let mut chunk_count = 0usize;
     while offset < bytes.len() {
         let end = bytes.len().min(offset + 64);
         sender.write_packet(&bytes[offset..end]).await.map_err(|_| ())?;
         offset = end;
+        chunk_count += 1;
+        if chunk_count >= 4 {
+            chunk_count = 0;
+            yield_now().await;
+        }
     }
     Ok(())
 }
@@ -186,6 +192,7 @@ async fn session(
             }
             Either::Second(Err(_)) => return Err(()),
         }
+        yield_now().await;
     }
 }
 
@@ -255,7 +262,8 @@ pub async fn run_server(
         socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         if socket.accept(port).await.is_err() {
-            return Err(());
+            Timer::after_millis(runtime.reconnect_delay_ms).await;
+            continue;
         }
         socket.set_timeout(None);
         if exchange_link_handshake(

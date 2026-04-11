@@ -1,6 +1,6 @@
 //! UART-facing configuration shell and basic line output helpers.
 
-use crate::config::{BridgeConfig, Command, apply_command, parse_command, render_config};
+use crate::config::{BridgeConfig, Command, UpstreamMode, apply_command, parse_command, render_config};
 use crate::storage::ConfigStorage;
 use embassy_futures::select::{Either, select};
 use embassy_rp::uart::BufferedUart;
@@ -10,6 +10,13 @@ use heapless::String;
 
 /// Maximum time the boot-time configuration shell is allowed to delay startup.
 const SHELL_WINDOW_MS: u64 = 3_000;
+const UART_SHELL_WINDOW_MS: u64 = 250;
+
+enum ReadLineOutcome {
+    Ready,
+    Idle,
+    BusyTraffic,
+}
 
 /// Writes the boot banner and pre-start command summary.
 pub async fn write_banner(uart: &mut BufferedUart) -> Result<(), ()> {
@@ -34,13 +41,20 @@ pub async fn configuration_shell(
     initial_config: BridgeConfig,
 ) -> BridgeConfig {
     let mut config = initial_config;
-    let deadline = Instant::now() + Duration::from_millis(SHELL_WINDOW_MS);
+    let shell_window_ms = if matches!(initial_config.upstream_mode, UpstreamMode::Uart) {
+        UART_SHELL_WINDOW_MS
+    } else {
+        SHELL_WINDOW_MS
+    };
+    let deadline = Instant::now() + Duration::from_millis(shell_window_ms);
+    let abort_on_non_shell_byte = matches!(initial_config.upstream_mode, UpstreamMode::Uart);
 
     while Instant::now() < deadline {
         let mut line = String::<128>::new();
-        match read_line_with_timeout(uart, &mut line, 100, deadline).await {
-            Ok(true) => {}
-            Ok(false) => continue,
+        match read_line_with_timeout(uart, &mut line, 100, deadline, abort_on_non_shell_byte).await {
+            Ok(ReadLineOutcome::Ready) => {}
+            Ok(ReadLineOutcome::Idle) => continue,
+            Ok(ReadLineOutcome::BusyTraffic) => return config,
             Err(()) => {
                 let _ = writeln_line(uart, "uart read error").await;
                 continue;
@@ -85,12 +99,13 @@ pub async fn configuration_shell(
 }
 
 /// Reads one editable line from UART while allowing the caller to poll on timeout.
-pub async fn read_line_with_timeout(
+async fn read_line_with_timeout(
     uart: &mut BufferedUart,
     line: &mut String<128>,
     timeout_ms: u64,
     deadline: Instant,
-) -> Result<bool, ()> {
+    abort_on_non_shell_byte: bool,
+) -> Result<ReadLineOutcome, ()> {
     let mut byte = [0u8; 1];
 
     loop {
@@ -98,7 +113,7 @@ pub async fn read_line_with_timeout(
             Either::First(Ok(())) => match byte[0] {
                 b'\r' | b'\n' => {
                     let _ = writeln_line(uart, "").await;
-                    return Ok(true);
+                    return Ok(ReadLineOutcome::Ready);
                 }
                 0x08 | 0x7f => {
                     line.pop();
@@ -109,20 +124,39 @@ pub async fn read_line_with_timeout(
                         uart.flush().await.map_err(|_| ())?;
                     }
                 }
+                _ if abort_on_non_shell_byte => {
+                    line.clear();
+                    return Ok(ReadLineOutcome::BusyTraffic);
+                }
                 _ => {}
             },
             Either::First(Err(_)) => return Err(()),
             Either::Second(_) => {
                 if Instant::now() >= deadline {
                     line.clear();
-                    return Ok(false);
+                    return Ok(ReadLineOutcome::Idle);
                 }
                 if line.is_empty() {
-                    return Ok(false);
+                    return Ok(ReadLineOutcome::Idle);
                 }
             }
         }
     }
+}
+
+pub async fn drain_uart_rx(uart: &mut BufferedUart, quiet_ms: u64, max_ms: u64) -> Result<(), ()> {
+    let deadline = Instant::now() + Duration::from_millis(max_ms);
+    let mut byte = [0u8; 1];
+
+    while Instant::now() < deadline {
+        match select(uart.read_exact(&mut byte), Timer::after_millis(quiet_ms)).await {
+            Either::First(Ok(())) => {}
+            Either::First(Err(_)) => return Err(()),
+            Either::Second(_) => return Ok(()),
+        }
+    }
+
+    Ok(())
 }
 
 /// Writes a string to UART followed by CRLF.

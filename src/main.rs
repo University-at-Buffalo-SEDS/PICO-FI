@@ -33,7 +33,7 @@ use embassy_usb::{Config as UsbConfig, UsbDevice};
 #[allow(unused_imports)]
 use panic_halt as _;
 use portable_atomic::{AtomicBool, Ordering};
-use shell::configuration_shell;
+use shell::{configuration_shell, drain_uart_rx};
 use static_cell::StaticCell;
 use storage::ConfigStorage;
 
@@ -231,6 +231,9 @@ async fn app(spawner: Spawner) {
         initial_config,
     )
     .await;
+    if let Some(uart) = uart.as_mut() {
+        let _ = drain_uart_rx(uart, 10, 100).await;
+    }
     if !matches!(bridge_config.upstream_mode, UpstreamMode::Test) {
         spawner.spawn(
             heartbeat_task(
@@ -356,6 +359,12 @@ async fn app(spawner: Spawner) {
             Timer::after_secs(1).await;
         },
     };
+
+    if matches!(bridge_config.upstream_mode, UpstreamMode::Uart) {
+        if let Some(uart) = uart.as_mut() {
+            let _ = drain_uart_rx(uart, 10, 250).await;
+        }
+    }
 
     let result = run_bridge_mode(
         uart.as_mut(),

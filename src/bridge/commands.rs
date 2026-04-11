@@ -25,16 +25,8 @@ pub fn set_led_state(on: bool) {
     LED_STATE.store(if on { LED_MODE_ON } else { LED_MODE_OFF }, Ordering::Relaxed);
 }
 
-pub fn signal_led_activity() {
-    let _ = LED_ACTIVITY_PULSES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-        Some(count.saturating_add(1))
-    });
-}
-
 pub fn take_led_activity() -> bool {
-    LED_ACTIVITY_PULSES
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1))
-        .is_ok()
+    LED_ACTIVITY_PULSES.swap(0, Ordering::AcqRel) != 0
 }
 
 fn led_status_text() -> &'static str {
