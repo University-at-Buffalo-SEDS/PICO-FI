@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import sys
-import time
 
 import serial
+import sys
+import time
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -41,7 +41,7 @@ def build_frame(payload: bytes, magic: int) -> bytes:
     frame = bytearray(FRAME_SIZE)
     frame[0] = magic
     frame[1] = len(payload)
-    frame[2 : 2 + len(payload)] = payload
+    frame[2: 2 + len(payload)] = payload
     return bytes(frame)
 
 
@@ -52,7 +52,7 @@ def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
     length = frame[1]
     if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
         return 0, 0, b""
-    payload = bytes(frame[2 : 2 + length])
+    payload = bytes(frame[2: 2 + length])
     return magic, length, payload
 
 
@@ -67,13 +67,13 @@ def read_frame(ser: serial.Serial, timeout_s: float) -> bytes:
 
 
 def uart_exchange(
-    port: str,
-    speed: int,
-    payload: bytes,
-    magic: int,
-    await_nonempty_data: bool = False,
-    expect_valid_response: bool = True,
-    expected_text: str | None = None,
+        port: str,
+        speed: int,
+        payload: bytes,
+        magic: int,
+        await_nonempty_data: bool = False,
+        expect_valid_response: bool = True,
+        expected_text: str | None = None,
 ) -> int:
     try:
         with open_serial(port, speed) as ser:
@@ -148,7 +148,8 @@ def main() -> int:
     )
     send_parser = subparsers.add_parser("send", help="Send framed data and only require a valid immediate response")
     send_parser.add_argument("text")
-    recv_parser = subparsers.add_parser("recv", help="Poll with empty framed data packets until non-empty data is returned")
+    recv_parser = subparsers.add_parser("recv",
+                                        help="Poll with empty framed data packets until non-empty data is returned")
     recv_parser.add_argument(
         "--expect",
         default="",

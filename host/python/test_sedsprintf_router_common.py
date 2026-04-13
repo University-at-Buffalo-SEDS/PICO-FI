@@ -38,7 +38,8 @@ class FakeSedsprintf:
         GROUND_STATION = 3
 
     @staticmethod
-    def make_packet(packet_type: int, sender: str, endpoints: list[int], timestamp_ms: int, payload: bytes) -> FakePacket:
+    def make_packet(packet_type: int, sender: str, endpoints: list[int], timestamp_ms: int,
+                    payload: bytes) -> FakePacket:
         return FakePacket(packet_type, sender, endpoints, timestamp_ms, payload)
 
     @staticmethod
@@ -125,9 +126,9 @@ class RouterCommonTests(unittest.TestCase):
         )
 
         with mock.patch.object(common, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
-            common.socket,
-            "socket",
-            side_effect=[listen, forward],
+                common.socket,
+                "socket",
+                side_effect=[listen, forward],
         ):
             rc = common.run_udp_router(adapter, args, "spi")
 
@@ -137,7 +138,7 @@ class RouterCommonTests(unittest.TestCase):
         self.assertEqual(len(adapter.sent_payloads), 1)
         armored = adapter.sent_payloads[0]
         self.assertTrue(armored.startswith(common.ARMOR_PREFIX))
-        raw = base64.urlsafe_b64decode(armored[len(common.ARMOR_PREFIX) :])
+        raw = base64.urlsafe_b64decode(armored[len(common.ARMOR_PREFIX):])
         packet = FakeSedsprintf.deserialize_packet_py(raw)
         self.assertEqual(packet.sender, "uart-end")
         self.assertEqual(packet.payload, b"udp-outbound")

@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
+
+import time
 
 SLOT_SIZE = 32
 HEADER_SIZE = 18

@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import time
 
 import serial
+import time
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -78,7 +78,7 @@ class FirmwareStyleValidator:
         if payload_len > PAYLOAD_MAX:
             return ("reject", f"frame length out of range: {payload_len}")
 
-        pad = frame[2 + payload_len :]
+        pad = frame[2 + payload_len:]
         if any(byte != 0 for byte in pad):
             first_bad = next(idx for idx, value in enumerate(pad, start=2 + payload_len) if value != 0)
             return (
@@ -88,7 +88,7 @@ class FirmwareStyleValidator:
             )
 
         magic = frame[0]
-        payload = frame[2 : 2 + payload_len]
+        payload = frame[2: 2 + payload_len]
         try:
             rendered = payload.decode("utf-8")
             payload_text = f" text={rendered!r}"

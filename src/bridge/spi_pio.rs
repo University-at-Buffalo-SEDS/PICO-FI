@@ -1,12 +1,15 @@
 //! Framing helpers for the upstream PIO-backed SPI slave transport.
 
 use crate::protocol::i2c::{
-    FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_DATA_MAGIC, make_response_frame,
+    make_response_frame, FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_DATA_MAGIC,
 };
 /// Result of one CS-bounded SPI transaction as seen by the future PIO backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionResult {
-    IdlePoll { received: usize, preview: [u8; 8] },
+    IdlePoll {
+        received: usize,
+        preview: [u8; 8],
+    },
     Partial {
         received: usize,
         expected: usize,
@@ -214,8 +217,8 @@ mod tests {
         let mut state = PioSpiTransportState::new();
         let mut frame = [0u8; FRAME_SIZE];
         frame[..17].copy_from_slice(&[
-            0x0f, 0x0f, b'[', b'1', b'0', b'.', b'8', b'.', b'0', b'.', b'6', b']', b' ',
-            b'h', b'e', b'y', b'\n',
+            0x0f, 0x0f, b'[', b'1', b'0', b'.', b'8', b'.', b'0', b'.', b'6', b']', b' ', b'h',
+            b'e', b'y', b'\n',
         ]);
         match state.finish_transaction(&frame, 0) {
             TransactionResult::Complete(frame) => {

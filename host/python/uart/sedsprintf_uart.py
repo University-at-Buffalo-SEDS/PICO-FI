@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import sys
-import time
 from pathlib import Path
 
 import serial
+import sys
+import time
 
 
 def load_sedsprintf():
@@ -18,7 +18,7 @@ def load_sedsprintf():
         return sedsprintf
     except ImportError:
         local_pkg_root = (
-            Path(__file__).resolve().parents[4] / "sedsprintf_2026" / "python-files"
+                Path(__file__).resolve().parents[4] / "sedsprintf_2026" / "python-files"
         )
         if local_pkg_root.exists():
             sys.path.insert(0, str(local_pkg_root))

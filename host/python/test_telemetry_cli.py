@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import base64
 import io
-import sys
 import types
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
+
+import sys
 
 if "spidev" not in sys.modules:
     sys.modules["spidev"] = types.SimpleNamespace(SpiDev=object)
@@ -35,7 +36,8 @@ class FakeSedsprintf:
         GROUND_STATION = 3
 
     @staticmethod
-    def make_packet(packet_type: int, sender: str, endpoints: list[int], timestamp_ms: int, payload: bytes) -> FakePacket:
+    def make_packet(packet_type: int, sender: str, endpoints: list[int], timestamp_ms: int,
+                    payload: bytes) -> FakePacket:
         return FakePacket(sender, payload)
 
     @staticmethod
@@ -76,7 +78,7 @@ class TelemetryCliTests(unittest.TestCase):
         )
 
         with mock.patch.object(telemetry_cli, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
-            telemetry_cli, "build_adapter", return_value=adapter
+                telemetry_cli, "build_adapter", return_value=adapter
         ):
             rc = telemetry_cli.run_send(args)
 
@@ -100,7 +102,7 @@ class TelemetryCliTests(unittest.TestCase):
         out = io.StringIO()
 
         with mock.patch.object(telemetry_cli, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
-            telemetry_cli, "build_adapter", return_value=adapter
+                telemetry_cli, "build_adapter", return_value=adapter
         ), redirect_stdout(out):
             rc = telemetry_cli.run_recv(args)
 
@@ -120,7 +122,7 @@ class TelemetryCliTests(unittest.TestCase):
         out = io.StringIO()
 
         with mock.patch.object(telemetry_cli, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
-            telemetry_cli, "build_adapter", return_value=adapter
+                telemetry_cli, "build_adapter", return_value=adapter
         ), redirect_stdout(out):
             rc = telemetry_cli.run_recv(args)
 

@@ -7,7 +7,8 @@ This document describes the current Pico-Fi I2C upstream transport as implemente
 - [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
 - [host/python/i2c/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/test.py)
 
-Unlike UART and SPI, I2C does not use a single fixed `258` byte wire frame. It uses chunked `32` byte slots that are reassembled into logical packets.
+Unlike UART and SPI, I2C does not use a single fixed `258` byte wire frame. It uses chunked `32` byte slots that are
+reassembled into logical packets.
 
 ## Electrical Setup
 
@@ -147,11 +148,15 @@ python3 host/python/i2c/link_terminal.py --bus 1 --addr 0x55
 Telemetry note:
 
 - the current telemetry terminal only supports UART and SPI
-- for I2C telemetry validation today, use [host/python/i2c/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/sedsprintf_router.py) or add an I2C backend that reuses [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
+- for I2C telemetry validation today,
+  use [host/python/i2c/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/sedsprintf_router.py)
+  or add an I2C backend that
+  reuses [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
 
 ## sedsprintf Router
 
-The I2C router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes inside logical `KIND_DATA` packets.
+The I2C router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes inside logical
+`KIND_DATA` packets.
 
 Example:
 

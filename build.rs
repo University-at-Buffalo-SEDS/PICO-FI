@@ -66,8 +66,8 @@ fn main() {
 
 fn load_json_config() -> JsonConfig {
     let config_path = env::var("PICO_FI_CONFIG").unwrap_or_else(|_| "pico-fi.json".to_owned());
-    let text = fs::read_to_string(&config_path)
-        .unwrap_or_else(|_| panic!("failed to read {config_path}"));
+    let text =
+        fs::read_to_string(&config_path).unwrap_or_else(|_| panic!("failed to read {config_path}"));
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("failed to parse {config_path}"))
 }
 
@@ -163,7 +163,8 @@ fn render_usb_names(usb: Option<&JsonUsbConfig>) -> String {
         product = render_optional_string(usb.product.as_deref(), Some("pico-fi USB Bridge")),
         serial_number = render_optional_string(usb.serial_number.as_deref(), Some("PICO-FI")),
         comm_interface = render_optional_string(usb.comm_interface.as_deref(), Some("pico-fi CDC")),
-        data_interface = render_optional_string(usb.data_interface.as_deref(), Some("pico-fi data")),
+        data_interface =
+        render_optional_string(usb.data_interface.as_deref(), Some("pico-fi data")),
     )
 }
 
@@ -188,5 +189,8 @@ fn parse_ipv4(value: Option<&str>, field: &str) -> String {
     }
 
     assert!(count == 4, "invalid ipv4 address in {field}");
-    format!("[{}, {}, {}, {}]", octets[0], octets[1], octets[2], octets[3])
+    format!(
+        "[{}, {}, {}, {}]",
+        octets[0], octets[1], octets[2], octets[3]
+    )
 }

@@ -386,8 +386,8 @@ mod tests {
     /// Verifies the client-mode shell command parser.
     #[test]
     fn parses_client() {
-        let cmd = parse_command("set client 10.0.0.5 7000")
-            .expect("client config command should parse");
+        let cmd =
+            parse_command("set client 10.0.0.5 7000").expect("client config command should parse");
         assert_eq!(
             cmd,
             Command::SetClient {
@@ -400,32 +400,28 @@ mod tests {
     /// Verifies the upstream-mode shell command parser.
     #[test]
     fn parses_upstream_test() {
-        let cmd = parse_command("set upstream test")
-            .expect("upstream mode command should parse");
+        let cmd = parse_command("set upstream test").expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Test));
     }
 
     /// Verifies the upstream-mode shell command parser accepts I2C.
     #[test]
     fn parses_upstream_i2c() {
-        let cmd = parse_command("set upstream i2c")
-            .expect("upstream mode command should parse");
+        let cmd = parse_command("set upstream i2c").expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::I2c));
     }
 
     /// Verifies the upstream-mode shell command accepts SPI.
     #[test]
     fn parses_upstream_spi() {
-        let cmd = parse_command("set upstream spi")
-            .expect("upstream mode command should parse");
+        let cmd = parse_command("set upstream spi").expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Spi));
     }
 
     /// Verifies the upstream-mode shell command accepts USB CDC.
     #[test]
     fn parses_upstream_usb() {
-        let cmd = parse_command("set upstream usb")
-            .expect("upstream mode command should parse");
+        let cmd = parse_command("set upstream usb").expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Usb));
     }
 }

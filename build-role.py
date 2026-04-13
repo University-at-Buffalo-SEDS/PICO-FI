@@ -6,9 +6,9 @@ import argparse
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
+import sys
 
 ROOT = Path(__file__).resolve().parent
 TARGET = "thumbv6m-none-eabi"

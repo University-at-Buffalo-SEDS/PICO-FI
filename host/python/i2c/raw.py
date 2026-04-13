@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import ctypes
-import fcntl
 import os
+
+import fcntl
 
 I2C_M_RD = 0x0001
 I2C_RDWR = 0x0707

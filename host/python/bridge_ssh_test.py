@@ -8,14 +8,13 @@ import collections
 import queue
 import re
 import shlex
-import signal
 import socket
 import subprocess
-import sys
 import threading
-import time
 from pathlib import Path
 
+import sys
+import time
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UART_TEST = REPO_ROOT / "host/python/uart/test.py"
@@ -59,7 +58,7 @@ def build_frame(payload: bytes, magic: int) -> bytes:
     frame = bytearray(FRAME_SIZE)
     frame[0] = magic
     frame[1] = len(payload)
-    frame[2 : 2 + len(payload)] = payload
+    frame[2: 2 + len(payload)] = payload
     return bytes(frame)
 
 
@@ -70,7 +69,7 @@ def parse_frame(frame: bytes) -> tuple[int, bytes]:
     length = frame[1]
     if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
         return 0, b""
-    return magic, bytes(frame[2 : 2 + length])
+    return magic, bytes(frame[2: 2 + length])
 
 
 class LocalUartSession:
@@ -338,11 +337,11 @@ def run_local_uart_recv(python_bin: str, port: str, speed: int, expect: str | No
 
 
 def run_local_telemetry_send(
-    python_bin: str,
-    port: str,
-    speed: int,
-    text: str,
-    sender: str,
+        python_bin: str,
+        port: str,
+        speed: int,
+        text: str,
+        sender: str,
 ) -> int:
     return run_checked(
         [
@@ -362,10 +361,10 @@ def run_local_telemetry_send(
 
 
 def spawn_local_telemetry_recv(
-    python_bin: str,
-    port: str,
-    speed: int,
-    expect: str,
+        python_bin: str,
+        port: str,
+        speed: int,
+        expect: str,
 ) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [
@@ -389,10 +388,10 @@ def spawn_local_telemetry_recv(
 
 
 def run_remote_telemetry_send(
-    target: str,
-    text: str,
-    speed: int,
-    sender: str,
+        target: str,
+        text: str,
+        speed: int,
+        sender: str,
 ) -> int:
     rc = stage_remote_spi_tools(target)
     if rc != 0:
@@ -407,9 +406,9 @@ def run_remote_telemetry_send(
 
 
 def spawn_remote_telemetry_recv(
-    target: str,
-    speed: int,
-    expect: str,
+        target: str,
+        speed: int,
+        expect: str,
 ) -> subprocess.Popen[str]:
     return subprocess.Popen(
         build_ssh_command(
@@ -430,7 +429,8 @@ def spawn_remote_telemetry_recv(
 def start_remote_echo_server(target: str, bind_host: str, bind_port: int) -> subprocess.Popen[str]:
     server_code = (
         "import socket\n"
-        f"s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(({bind_host!r}, {bind_port})); s.listen(1)\n"
+        f"s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(({bind_host!r}, "
+        f"{bind_port})); s.listen(1)\n"
         "print('READY', flush=True)\n"
         "conn, _ = s.accept()\n"
         "conn.settimeout(10.0)\n"
@@ -466,10 +466,10 @@ def start_remote_echo_server(target: str, bind_host: str, bind_port: int) -> sub
 
 
 def start_remote_bridge_echo_client(
-    target: str,
-    pico_host: str,
-    pico_port: int,
-    handshake_magic: bytes = LINK_HANDSHAKE_MAGIC,
+        target: str,
+        pico_host: str,
+        pico_port: int,
+        handshake_magic: bytes = LINK_HANDSHAKE_MAGIC,
 ) -> subprocess.Popen[str]:
     server_code = (
         "import socket, sys, time\n"
@@ -534,9 +534,9 @@ def stop_process(proc: subprocess.Popen[str]) -> None:
 
 
 def run_and_capture(
-    cmd: list[str],
-    cwd: Path | None = None,
-    timeout_s: float | None = None,
+        cmd: list[str],
+        cwd: Path | None = None,
+        timeout_s: float | None = None,
 ) -> tuple[int, str]:
     print("+", " ".join(shlex.quote(part) for part in cmd))
     completed = subprocess.run(
@@ -566,9 +566,9 @@ def wait_checked(proc: subprocess.Popen[str], timeout_s: float, label: str) -> t
 
 
 def spawn_remote_spi_recv(
-    target: str,
-    speed: int,
-    expect: str,
+        target: str,
+        speed: int,
+        expect: str,
 ) -> subprocess.Popen[str]:
     return subprocess.Popen(
         build_ssh_command(
@@ -721,12 +721,12 @@ class LineProcessSession:
 
 
 def start_local_uart_router(
-    python_bin: str,
-    port: str,
-    speed: int,
-    listen_port: int,
-    forward_port: int,
-    sender: str,
+        python_bin: str,
+        port: str,
+        speed: int,
+        listen_port: int,
+        forward_port: int,
+        sender: str,
 ) -> LineProcessSession:
     return LineProcessSession(
         [
@@ -750,11 +750,11 @@ def start_local_uart_router(
 
 
 def start_remote_spi_router(
-    target: str,
-    speed: int,
-    listen_port: int,
-    forward_port: int,
-    sender: str,
+        target: str,
+        speed: int,
+        listen_port: int,
+        forward_port: int,
+        sender: str,
 ) -> LineProcessSession:
     return LineProcessSession(
         build_ssh_command(
@@ -1199,7 +1199,8 @@ def main() -> int:
     link_soak.add_argument("--iterations", type=int, default=10)
     telemetry_soak = subparsers.add_parser(
         "telemetry-router-soak",
-        help="Run local UART and remote SPI telemetry router nodes and verify UDP payloads flow across the firmware bridge",
+        help="Run local UART and remote SPI telemetry router nodes and verify UDP payloads flow across the firmware "
+             "bridge",
     )
     telemetry_soak.add_argument("--iterations", type=int, default=10)
     telemetry_soak.add_argument("--local-router-listen-port", type=int, default=9100)
@@ -1226,11 +1227,16 @@ def main() -> int:
     spi_echo = subparsers.add_parser("spi-echo", help="Run the remote SPI echo diagnostic via SSH")
     spi_echo.add_argument("text", nargs="?", default="/ping")
 
-    spi_data = subparsers.add_parser("spi-data-echo", help="Run an end-to-end SPI data echo test through the Ethernet bridge")
+    spi_data = subparsers.add_parser("spi-data-echo",
+                                     help="Run an end-to-end SPI data echo test through the Ethernet bridge")
     spi_data.add_argument("--text", default=None)
-    uart_to_spi = subparsers.add_parser("uart-to-spi", help="Send framed data into the local UART client Pico and receive it from the remote SPI server Pico")
+    uart_to_spi = subparsers.add_parser("uart-to-spi",
+                                        help="Send framed data into the local UART client Pico and receive it from "
+                                             "the remote SPI server Pico")
     uart_to_spi.add_argument("--text", default=None)
-    spi_to_uart = subparsers.add_parser("spi-to-uart", help="Send framed data into the remote SPI server Pico and receive it from the local UART client Pico")
+    spi_to_uart = subparsers.add_parser("spi-to-uart",
+                                        help="Send framed data into the remote SPI server Pico and receive it from "
+                                             "the local UART client Pico")
     spi_to_uart.add_argument("--text", default=None)
 
     subparsers.add_parser("uart-probe", help="Run the local UART probe")
@@ -1238,7 +1244,8 @@ def main() -> int:
     uart_command = subparsers.add_parser("uart-command", help="Run a local UART command")
     uart_command.add_argument("text")
 
-    uart_data = subparsers.add_parser("uart-data-echo", help="Start a remote TCP echo server and verify UART data loops back")
+    uart_data = subparsers.add_parser("uart-data-echo",
+                                      help="Start a remote TCP echo server and verify UART data loops back")
     uart_data.add_argument("--text", default=None)
 
     args = parser.parse_args()
@@ -1348,7 +1355,8 @@ def main() -> int:
     if args.command == "spi-to-uart":
         payload = args.text or args.payload
         recv_proc = subprocess.Popen(
-            [args.local_python, str(UART_TEST), "--port", args.uart_port, "--speed", str(args.uart_speed), "recv", "--expect", payload]
+            [args.local_python, str(UART_TEST), "--port", args.uart_port, "--speed", str(args.uart_speed), "recv",
+             "--expect", payload]
         )
         time.sleep(0.2)
         try:

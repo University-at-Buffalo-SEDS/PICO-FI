@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+
 import sys
 import time
 
@@ -57,12 +58,12 @@ def has_failure(lines: list[str]) -> bool:
 
 
 def poll_once(
-    bus_num: int,
-    device: int,
-    speed: int,
-    throttle: TransactionThrottle,
-    stream_printer: StreamPrinter,
-    poll_delay_s: float,
+        bus_num: int,
+        device: int,
+        speed: int,
+        throttle: TransactionThrottle,
+        stream_printer: StreamPrinter,
+        poll_delay_s: float,
 ) -> None:
     payload = poll_inbound_data(bus_num, device, speed, poll_delay_s, throttle)
     if payload:

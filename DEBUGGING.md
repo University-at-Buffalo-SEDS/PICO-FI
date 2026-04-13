@@ -40,7 +40,8 @@ This is the stable split for this repo:
 
 `probe-rs 0.31.0` requires Raspberry Pi Debug Probe firmware version `2.2.0` or newer.
 
-On this machine, `probe-rs` currently reports that the attached probe firmware is too old to use. Update the Debug Probe firmware first, then retry.
+On this machine, `probe-rs` currently reports that the attached probe firmware is too old to use. Update the Debug Probe
+firmware first, then retry.
 
 Raspberry Pi documents the update process here:
 
@@ -57,11 +58,13 @@ GDB_BIN=/custom/path/arm-none-eabi-gdb ./rustrover-gdb.sh --version
 
 ## RustRover notes
 
-RustRover can reliably do the build and attach parts, but for this target the flash step is best kept explicit. The working sequence is:
+RustRover can reliably do the build and attach parts, but for this target the flash step is best kept explicit. The
+working sequence is:
 
 1. `Build Firmware`
 2. `./flash-firmware.sh`
 3. `./start-debugger.sh`
 4. `Pico Debug`
 
-If breakpoints do not bind, rebuild and reflash once and confirm the RustRover symbol file still points at `target/thumbv6m-none-eabi/debug/pico-fi`.
+If breakpoints do not bind, rebuild and reflash once and confirm the RustRover symbol file still points at
+`target/thumbv6m-none-eabi/debug/pico-fi`.

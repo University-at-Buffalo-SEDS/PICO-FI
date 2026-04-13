@@ -7,15 +7,15 @@ use crate::bridge::spi_diag;
 use crate::bridge::spi_frame::SpiFrame;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
-use crate::shell::writeln_line;
 use crate::protocol::i2c::{
-    RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, make_response_frame, parse_request_frame,
+    make_response_frame, parse_request_frame, RequestFrame, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
-use embassy_futures::select::{Either, select};
+use crate::shell::writeln_line;
+use embassy_futures::select::{select, Either};
 use embassy_futures::yield_now;
+use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
-use embassy_net::tcp::TcpSocket;
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
 use portable_atomic::{AtomicBool, Ordering};
@@ -46,7 +46,7 @@ pub async fn run_client(
                 spi_rx.pop(),
                 connect_with_timeout(&mut socket, remote, port, runtime.connect_timeout_ms),
             )
-            .await
+                .await
             {
                 Either::First(frame) => {
                     handle_spi_request(frame, None, bridge_config, runtime.link_active, spi_tx)
@@ -59,7 +59,7 @@ pub async fn run_client(
                 }
             }
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         let _ = writeln_line(uart, "spi client: connected").await;
         if exchange_link_handshake(
             &mut socket,
@@ -67,8 +67,8 @@ pub async fn run_client(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             let _ = writeln_line(uart, "spi client: handshake failed").await;
             socket.abort();
@@ -86,7 +86,7 @@ pub async fn run_client(
             spi_rx,
             spi_tx,
         )
-        .await;
+            .await;
         let _ = writeln_line(uart, "spi client: session closed").await;
         socket.abort();
         let _ = socket.flush().await;
@@ -125,7 +125,7 @@ pub async fn run_server(
                 }
             }
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         let _ = writeln_line(uart, "spi server: accepted").await;
         if exchange_link_handshake(
             &mut socket,
@@ -133,8 +133,8 @@ pub async fn run_server(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             let _ = writeln_line(uart, "spi server: handshake failed").await;
             socket.abort();
@@ -152,7 +152,7 @@ pub async fn run_server(
             spi_rx,
             spi_tx,
         )
-        .await;
+            .await;
         let _ = writeln_line(uart, "spi server: session closed").await;
         socket.abort();
         let _ = socket.flush().await;
@@ -250,6 +250,6 @@ async fn handle_spi_request(
 fn looks_like_local_command(payload: &[u8]) -> bool {
     payload.first() == Some(&b'/')
         && payload
-            .iter()
-            .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
+        .iter()
+        .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
 }

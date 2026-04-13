@@ -4,18 +4,19 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import collections
 import queue
-import select
 import shutil
 import socket
-import sys
-import termios
 import threading
-import time
 import tty
 from dataclasses import dataclass, field
+
+import atexit
+import select
+import sys
+import termios
+import time
 
 try:
     from .raw import FRAME_SIZE, open_bus
@@ -167,7 +168,7 @@ class StreamPrinter:
             if newline < 0:
                 break
             line = self.pending[:newline]
-            self.pending = self.pending[newline + 1 :]
+            self.pending = self.pending[newline + 1:]
             if line:
                 self.prompt.print_line(line)
 
@@ -245,16 +246,16 @@ class TransactionThrottle:
 
 
 def exchange_frame(
-    bus_num: int,
-    device: int,
-    speed: int,
-    prompt: PromptState,
-    stream_printer: StreamPrinter,
-    magic: int,
-    payload: bytes,
-    poll_delay_s: float,
-    expect_command_reply: bool,
-    throttle: TransactionThrottle | None = None,
+        bus_num: int,
+        device: int,
+        speed: int,
+        prompt: PromptState,
+        stream_printer: StreamPrinter,
+        magic: int,
+        payload: bytes,
+        poll_delay_s: float,
+        expect_command_reply: bool,
+        throttle: TransactionThrottle | None = None,
 ) -> None:
     try:
         if throttle is not None:
@@ -316,11 +317,11 @@ def exchange_frame(
 
 
 def poll_inbound_data(
-    bus_num: int,
-    device: int,
-    speed: int,
-    poll_delay_s: float,
-    throttle: TransactionThrottle | None = None,
+        bus_num: int,
+        device: int,
+        speed: int,
+        poll_delay_s: float,
+        throttle: TransactionThrottle | None = None,
 ) -> bytes:
     try:
         if throttle is not None:

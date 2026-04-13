@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
-import sys
 import types
 import unittest
 from unittest import mock
+
+import sys
 
 if "spidev" not in sys.modules:
     sys.modules["spidev"] = types.SimpleNamespace(SpiDev=object)
@@ -73,7 +74,7 @@ class TimingSensitiveBus:
             return bytes(lt.FRAME_SIZE)
         magic = raw[0]
         payload_len = raw[1]
-        payload = bytes(raw[2 : 2 + payload_len])
+        payload = bytes(raw[2: 2 + payload_len])
         if magic == lt.REQ_COMMAND_MAGIC and payload.startswith(b"/link"):
             return frame(lt.RESP_COMMAND_MAGIC, b"link up")
         return frame(lt.RESP_DATA_MAGIC, b"")
@@ -97,7 +98,7 @@ class RetryingCommandBus:
     def write_frame(self, raw: bytes) -> bytes:
         magic = raw[0]
         payload_len = raw[1]
-        payload = bytes(raw[2 : 2 + payload_len])
+        payload = bytes(raw[2: 2 + payload_len])
         if magic == lt.REQ_COMMAND_MAGIC and payload.startswith(b"/link"):
             self.command_writes += 1
             if self.command_writes == 1:
@@ -120,7 +121,7 @@ class LinkTerminalTimingTests(unittest.TestCase):
         throttle = lt.TransactionThrottle(min_gap_s=0.05)
 
         with mock.patch.object(lt, "open_bus", return_value=bus), mock.patch.object(
-            lt.time, "monotonic", side_effect=self.clock.monotonic
+                lt.time, "monotonic", side_effect=self.clock.monotonic
         ), mock.patch.object(lt.time, "sleep", side_effect=self.clock.sleep):
             lt.exchange_frame(
                 0,

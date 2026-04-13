@@ -1,7 +1,7 @@
 //! Small overwrite-on-full buffers for lossy bridge egress paths.
 
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use heapless::Deque;
 

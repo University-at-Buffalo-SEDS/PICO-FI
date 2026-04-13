@@ -364,7 +364,11 @@ fn process_complete_packet(
             if looks_like_local_command(payload) {
                 let line = trim_ascii_line(payload);
                 let response = render_local_bridge_command(bridge_config, link_active, line);
-                tx_packet.stage(KIND_COMMAND, nonzero_transfer_id(transfer_id), response.as_bytes());
+                tx_packet.stage(
+                    KIND_COMMAND,
+                    nonzero_transfer_id(transfer_id),
+                    response.as_bytes(),
+                );
             } else if let Ok(packet) = make_data_packet(payload) {
                 tx.push_overwrite(packet);
             } else {
@@ -499,8 +503,8 @@ fn make_data_packet(payload: &[u8]) -> Result<I2cPacket, ()> {
 fn looks_like_local_command(payload: &[u8]) -> bool {
     payload.first() == Some(&b'/')
         && payload
-            .iter()
-            .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
+        .iter()
+        .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
 }
 
 fn nonzero_transfer_id(value: u16) -> u16 {

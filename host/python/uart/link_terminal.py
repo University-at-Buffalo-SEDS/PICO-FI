@@ -4,19 +4,19 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import queue
-import select
 import shutil
 import socket
-import sys
-import termios
 import threading
-import time
 import tty
 from dataclasses import dataclass, field
 
+import atexit
+import select
 import serial
+import sys
+import termios
+import time
 
 FRAME_SIZE = 258
 PAYLOAD_MAX = FRAME_SIZE - 2
@@ -45,7 +45,7 @@ def build_frame(payload: bytes, magic: int) -> bytes:
     frame = bytearray(FRAME_SIZE)
     frame[0] = magic
     frame[1] = len(payload)
-    frame[2 : 2 + len(payload)] = payload
+    frame[2: 2 + len(payload)] = payload
     return bytes(frame)
 
 
@@ -56,7 +56,7 @@ def parse_frame(frame: bytes) -> tuple[int, bytes]:
     length = frame[1]
     if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
         return 0, b""
-    return magic, bytes(frame[2 : 2 + length])
+    return magic, bytes(frame[2: 2 + length])
 
 
 def read_frame(ser: serial.Serial, timeout_s: float) -> bytes | None:

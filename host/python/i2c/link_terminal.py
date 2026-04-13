@@ -4,18 +4,19 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import collections
 import queue
-import select
 import shutil
 import socket
-import sys
-import termios
 import threading
-import time
 import tty
 from dataclasses import dataclass, field
+
+import atexit
+import select
+import sys
+import termios
+import time
 
 try:
     from .protocol import KIND_COMMAND, KIND_DATA, KIND_ERROR, read_packet, write_packet
@@ -166,13 +167,13 @@ def input_loop(outbound: "queue.Queue[str]", prompt: PromptState) -> None:
 
 
 def exchange_packet(
-    bus,
-    prompt: PromptState,
-    kind: int,
-    payload: bytes,
-    poll_delay_s: float,
-    raw_mode: bool,
-    transfer_id: int,
+        bus,
+        prompt: PromptState,
+        kind: int,
+        payload: bytes,
+        poll_delay_s: float,
+        raw_mode: bool,
+        transfer_id: int,
 ) -> None:
     try:
         write_packet(bus, I2C_ADDR, payload, kind=kind, transfer_id=transfer_id, chunk_delay_s=CHUNK_DELAY_S)

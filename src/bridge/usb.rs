@@ -4,11 +4,11 @@ use crate::bridge::commands::render_local_bridge_command;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake};
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_futures::yield_now;
+use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
-use embassy_net::tcp::TcpSocket;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_time::{Duration, Timer};
@@ -40,7 +40,10 @@ async fn write_usb_packet(
     let mut chunk_count = 0usize;
     while offset < bytes.len() {
         let end = bytes.len().min(offset + 64);
-        sender.write_packet(&bytes[offset..end]).await.map_err(|_| ())?;
+        sender
+            .write_packet(&bytes[offset..end])
+            .await
+            .map_err(|_| ())?;
         offset = end;
         chunk_count += 1;
         if chunk_count >= 4 {
@@ -93,7 +96,7 @@ async fn handle_usb_input(
                         link_active,
                         command_state.buf.as_str(),
                     )
-                    .await?;
+                        .await?;
                     command_state.buf.clear();
                     command_state.active = false;
                     command_state.at_line_start = true;
@@ -143,10 +146,7 @@ async fn flush_command_bytes(
     Ok(())
 }
 
-async fn forward_usb_bytes(
-    socket: Option<&mut TcpSocket<'_>>,
-    bytes: &[u8],
-) -> Result<(), ()> {
+async fn forward_usb_bytes(socket: Option<&mut TcpSocket<'_>>, bytes: &[u8]) -> Result<(), ()> {
     if let Some(socket) = socket {
         if !bytes.is_empty() {
             crate::net::write_socket(socket, bytes).await?;
@@ -167,7 +167,12 @@ async fn session(
     let mut command_state = LocalCommandState::new();
 
     loop {
-        match select(receiver.read_packet(&mut usb_buf), socket.read(&mut net_buf)).await {
+        match select(
+            receiver.read_packet(&mut usb_buf),
+            socket.read(&mut net_buf),
+        )
+            .await
+        {
             Either::First(Ok(usb_n)) => {
                 if usb_n == 0 {
                     yield_now().await;
@@ -181,7 +186,7 @@ async fn session(
                     &mut command_state,
                     Some(socket),
                 )
-                .await?;
+                    .await?;
             }
             Either::First(Err(_)) => return Err(()),
             Either::Second(Ok(net_n)) => {
@@ -222,15 +227,15 @@ pub async fn run_client(
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             true,
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -239,7 +244,14 @@ pub async fn run_client(
         }
         runtime.link_active.store(true, Ordering::Relaxed);
 
-        let _ = session(sender, receiver, &mut socket, bridge_config, runtime.link_active).await;
+        let _ = session(
+            sender,
+            receiver,
+            &mut socket,
+            bridge_config,
+            runtime.link_active,
+        )
+            .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -265,15 +277,15 @@ pub async fn run_server(
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             false,
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -282,7 +294,14 @@ pub async fn run_server(
         }
         runtime.link_active.store(true, Ordering::Relaxed);
 
-        let _ = session(sender, receiver, &mut socket, bridge_config, runtime.link_active).await;
+        let _ = session(
+            sender,
+            receiver,
+            &mut socket,
+            bridge_config,
+            runtime.link_active,
+        )
+            .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);

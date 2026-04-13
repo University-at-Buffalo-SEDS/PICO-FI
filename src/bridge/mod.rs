@@ -11,5 +11,5 @@ pub mod spi_frame;
 pub mod spi_hw_task;
 pub mod spi_pio;
 pub mod test;
-pub mod usb;
 pub mod uart;
+pub mod usb;

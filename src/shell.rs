@@ -1,8 +1,10 @@
 //! UART-facing configuration shell and basic line output helpers.
 
-use crate::config::{BridgeConfig, Command, UpstreamMode, apply_command, parse_command, render_config};
+use crate::config::{
+    apply_command, parse_command, render_config, BridgeConfig, Command, UpstreamMode,
+};
 use crate::storage::ConfigStorage;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
@@ -51,7 +53,8 @@ pub async fn configuration_shell(
 
     while Instant::now() < deadline {
         let mut line = String::<128>::new();
-        match read_line_with_timeout(uart, &mut line, 100, deadline, abort_on_non_shell_byte).await {
+        match read_line_with_timeout(uart, &mut line, 100, deadline, abort_on_non_shell_byte).await
+        {
             Ok(ReadLineOutcome::Ready) => {}
             Ok(ReadLineOutcome::Idle) => continue,
             Ok(ReadLineOutcome::BusyTraffic) => return config,

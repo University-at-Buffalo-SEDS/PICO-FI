@@ -6,14 +6,14 @@ use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
 use crate::protocol::i2c::{
-    FRAME_SIZE, PAYLOAD_MAX, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RequestFrame, RESP_COMMAND_MAGIC,
-    RESP_DATA_MAGIC, make_response_frame, parse_request_frame,
+    make_response_frame, parse_request_frame, RequestFrame, FRAME_SIZE, PAYLOAD_MAX,
+    REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_futures::yield_now;
+use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
-use embassy_net::tcp::TcpSocket;
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read, Write};
@@ -65,7 +65,7 @@ pub async fn run_client(
                     runtime.link_active,
                     &mut egress_ring,
                 )
-                .await?;
+                    .await?;
 
                 if !egress_ring.is_empty() {
                     flush_uart_egress(uart_tx, &mut egress_ring).await;
@@ -78,15 +78,15 @@ pub async fn run_client(
                 }
             }
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             true,
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -123,7 +123,12 @@ pub async fn run_server(
             let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
 
             loop {
-                match select(socket.accept(port), Timer::after_millis(UART_PRECONNECT_NET_SLICE_MS)).await {
+                match select(
+                    socket.accept(port),
+                    Timer::after_millis(UART_PRECONNECT_NET_SLICE_MS),
+                )
+                    .await
+                {
                     Either::First(Ok(())) => break,
                     Either::First(Err(_)) => {
                         Timer::after_millis(runtime.reconnect_delay_ms).await;
@@ -139,7 +144,7 @@ pub async fn run_server(
                     runtime.link_active,
                     &mut egress_ring,
                 )
-                .await?;
+                    .await?;
 
                 if !egress_ring.is_empty() {
                     flush_uart_egress(uart_tx, &mut egress_ring).await;
@@ -148,15 +153,15 @@ pub async fn run_server(
                 yield_now().await;
             }
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             false,
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -194,7 +199,8 @@ async fn session(
         }
 
         if tx_chunk_pos < tx_chunk_len {
-            let written = write_uart_chunk_lossy(uart_tx, &tx_chunk[tx_chunk_pos..tx_chunk_len]).await;
+            let written =
+                write_uart_chunk_lossy(uart_tx, &tx_chunk[tx_chunk_pos..tx_chunk_len]).await;
             tx_chunk_pos = (tx_chunk_pos + written).min(tx_chunk_len);
             consecutive_tx_chunks += 1;
             if tx_chunk_pos >= tx_chunk_len {
@@ -212,15 +218,16 @@ async fn session(
                 socket.read(&mut net_buf),
                 read_uart_frame_lossy(uart_rx, &mut uart_frame),
             )
-            .await
+                .await
             {
                 Either::First(Ok(net_n)) => {
                     if net_n == 0 {
                         return Ok(());
                     }
-                    egress_ring.push_overwrite_slice(
-                        &make_response_frame(RESP_DATA_MAGIC, &net_buf[..net_n]),
-                    );
+                    egress_ring.push_overwrite_slice(&make_response_frame(
+                        RESP_DATA_MAGIC,
+                        &net_buf[..net_n],
+                    ));
                 }
                 Either::First(Err(_)) => return Err(()),
                 Either::Second(()) => {
@@ -231,7 +238,7 @@ async fn session(
                         link_active,
                         &mut egress_ring,
                     )
-                    .await?;
+                        .await?;
                 }
             }
         }
@@ -322,7 +329,7 @@ async fn service_preconnect_uart(
         read_uart_frame_lossy(uart_rx, uart_frame),
         Timer::after_millis(UART_PRECONNECT_UART_SLICE_MS),
     )
-    .await
+        .await
     {
         Either::First(()) => {
             handle_uart_request(uart_frame, None, bridge_config, link_active, egress_ring).await?;

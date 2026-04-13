@@ -33,7 +33,8 @@ On macOS, use `/dev/cu.*` for host-initiated traffic rather than `/dev/tty.*`.
 
 ## Boot Window
 
-Immediately after reset, UART is briefly attached to the boot/config shell. During that window the Pico emits plain ASCII text.
+Immediately after reset, UART is briefly attached to the boot/config shell. During that window the Pico emits plain
+ASCII text.
 
 After startup finishes, UART switches to framed runtime packets.
 
@@ -41,7 +42,8 @@ Practical implication:
 
 - wait a few seconds after reset before sending framed traffic
 - do not mix boot-shell text with runtime binary frames on the same open session
-- the firmware now resynchronizes on valid `0xA5` and `0xA6` request starts, so a few stray shell/debug-probe bytes no longer permanently poison framing
+- the firmware now resynchronizes on valid `0xA5` and `0xA6` request starts, so a few stray shell/debug-probe bytes no
+  longer permanently poison framing
 
 ## Frame Format
 
@@ -61,7 +63,8 @@ Constants:
 - response data magic: `0x5A`
 - response command magic: `0x5B`
 
-The firmware parser is currently shared with the SPI/I2C framed protocol code in [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs).
+The firmware parser is currently shared with the SPI/I2C framed protocol code
+in [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs).
 
 ## Semantics
 
@@ -101,7 +104,8 @@ Important constraint:
 
 - only one host process should own the UART device at a time
 
-If two host tools write to the same UART simultaneously, the Pico will see corrupted framing and can reply with `error invalid uart frame`.
+If two host tools write to the same UART simultaneously, the Pico will see corrupted framing and can reply with
+`error invalid uart frame`.
 
 ## Minimal Driver Algorithm
 
@@ -177,7 +181,8 @@ Telemetry decode note:
 
 ## sedsprintf Router
 
-The router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes over the UART framed data path.
+The router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes over the UART framed
+data path.
 
 Example:
 
@@ -194,7 +199,8 @@ That means:
 
 - the UART wire protocol still carries only normal `0xA5` framed payloads
 - the payload bytes happen to be serialized telemetry packets
-- the shared router path currently sends `SP6:`-armored packets, while the interactive telemetry tools can also decode raw serialized packets
+- the shared router path currently sends `SP6:`-armored packets, while the interactive telemetry tools can also decode
+  raw serialized packets
 
 ## References
 

@@ -2,6 +2,7 @@
 """SPI-based test tool for Pico-Fi communication."""
 
 import argparse
+
 import time
 
 try:
@@ -74,16 +75,16 @@ def flush_stale_command_frames(bus) -> None:
 
 
 def spi_exchange(
-    bus_num: int,
-    device: int,
-    speed: int,
-    payload: bytes,
-    magic: int = REQ_MAGIC,
-    require_valid_response: bool = True,
-    expect_command_reply: bool = False,
-    await_nonempty_data: bool = False,
-    expected_text: str | None = None,
-    verbose_raw: bool = False,
+        bus_num: int,
+        device: int,
+        speed: int,
+        payload: bytes,
+        magic: int = REQ_MAGIC,
+        require_valid_response: bool = True,
+        expect_command_reply: bool = False,
+        await_nonempty_data: bool = False,
+        expected_text: str | None = None,
+        verbose_raw: bool = False,
 ) -> int:
     bus = None
     try:
@@ -189,11 +190,11 @@ def spi_echo_test(bus_num: int, device: int, speed: int, payload: bytes) -> int:
 
 
 def spi_recv_via_pull(
-    bus_num: int,
-    device: int,
-    speed: int,
-    expected_text: str | None = None,
-    verbose_raw: bool = False,
+        bus_num: int,
+        device: int,
+        speed: int,
+        expected_text: str | None = None,
+        verbose_raw: bool = False,
 ) -> int:
     bus = None
     try:
@@ -278,7 +279,8 @@ def main() -> int:
     )
     send_parser = subparsers.add_parser("send", help="Send framed data and only require a valid immediate response")
     send_parser.add_argument("text")
-    recv_parser = subparsers.add_parser("recv", help="Poll with empty framed data frames until non-empty data is returned")
+    recv_parser = subparsers.add_parser("recv",
+                                        help="Poll with empty framed data frames until non-empty data is returned")
     recv_parser.add_argument(
         "--expect",
         default="",

@@ -7,12 +7,12 @@ use crate::bridge::spi_frame::SpiFrame;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
-    FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
-    RequestFrame, make_response_frame, parse_request_frame,
+    make_response_frame, parse_request_frame, RequestFrame, FRAME_SIZE, REQ_COMMAND_MAGIC,
+    REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
 use core::hint::spin_loop;
-use embassy_futures::yield_now;
 use embassy_executor::Spawner;
+use embassy_futures::yield_now;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, SPI1};
 use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
@@ -126,9 +126,7 @@ pub async fn spi_poll_task(
                     transport.stage_response(response)
                 }
                 TransactionResult::Partial {
-                    received,
-                    expected,
-                    ..
+                    received, expected, ..
                 } => {
                     let response = make_response_frame(
                         RESP_COMMAND_MAGIC,
@@ -211,7 +209,10 @@ fn reset_spi1_transaction_state() {
     regs.cr1().modify(|w| w.set_sse(true));
 }
 
-async fn spi1_slave_transfer(tx_frame: &[u8; FRAME_SIZE], rx_frame: &mut [u8; FRAME_SIZE]) -> (usize, usize) {
+async fn spi1_slave_transfer(
+    tx_frame: &[u8; FRAME_SIZE],
+    rx_frame: &mut [u8; FRAME_SIZE],
+) -> (usize, usize) {
     let status_before = read_spi1_status();
     let (received, written) = spi1_manual_transfer(tx_frame, rx_frame).await;
     let status_after = read_spi1_status();
@@ -232,7 +233,10 @@ fn read_spi1_status() -> u8 {
         | ((sr.bsy() as u8) << 4)
 }
 
-async fn spi1_manual_transfer(tx_frame: &[u8; FRAME_SIZE], rx_frame: &mut [u8; FRAME_SIZE]) -> (usize, usize) {
+async fn spi1_manual_transfer(
+    tx_frame: &[u8; FRAME_SIZE],
+    rx_frame: &mut [u8; FRAME_SIZE],
+) -> (usize, usize) {
     let regs = rp_pac::SPI1;
 
     let mut tx_index = 0usize;
@@ -311,7 +315,12 @@ fn should_preserve_staged_response(frame: &[u8; FRAME_SIZE], written: usize) -> 
     }
 }
 
-fn render_spi_diag(kind: &str, received: usize, expected: usize, preview: &[u8]) -> heapless::String<96> {
+fn render_spi_diag(
+    kind: &str,
+    received: usize,
+    expected: usize,
+    preview: &[u8],
+) -> heapless::String<96> {
     let mut out = heapless::String::<96>::new();
     let _ = core::fmt::write(&mut out, format_args!("{kind} r={received} e={expected}"));
     for byte in preview.iter().take(8) {
@@ -394,7 +403,8 @@ fn finalize_transaction(
             None => {
                 if let Some(line) = extract_ascii_command(&frame) {
                     if line.starts_with('/') {
-                        let response = render_local_bridge_command(bridge_config, link_active, line);
+                        let response =
+                            render_local_bridge_command(bridge_config, link_active, line);
                         return Some(make_response_frame(RESP_COMMAND_MAGIC, response.as_bytes()));
                     }
                 }

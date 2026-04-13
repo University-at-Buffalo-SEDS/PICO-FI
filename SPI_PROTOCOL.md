@@ -109,7 +109,8 @@ To fetch pending inbound data:
 
 1. Send a `0xA6` frame whose payload is `/pull\n`.
 2. If the same transfer returns `0x5A` with non-zero length, consume it.
-3. Otherwise keep issuing additional `258` byte transfers until a queued `0x5A` with data arrives or your timeout expires.
+3. Otherwise keep issuing additional `258` byte transfers until a queued `0x5A` with data arrives or your timeout
+   expires.
 
 To issue a local Pico command:
 
@@ -195,7 +196,8 @@ Malformed captures are failed closed and can produce:
 
 ## sedsprintf Router
 
-The router wraps UDP payloads in `sedsprintf_rs_2026` serialized packets and sends those bytes over the normal SPI framed data path.
+The router wraps UDP payloads in `sedsprintf_rs_2026` serialized packets and sends those bytes over the normal SPI
+framed data path.
 
 Example:
 

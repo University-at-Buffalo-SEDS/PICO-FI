@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import queue
-import select
 import shutil
 import socket
-import sys
-import termios
 import threading
-import time
 import tty
 from dataclasses import dataclass, field
+
+import atexit
+import select
+import sys
+import termios
+import time
 
 try:
     from .telemetry_cli import build_adapter

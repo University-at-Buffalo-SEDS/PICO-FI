@@ -50,7 +50,8 @@ Current note:
 Telemetry validation:
 
 - `telemetry_cli.py`: send or receive one serialized telemetry packet over UART or SPI
-- `telemetry_terminal.py`: interactive terminal that sends each typed line as one serialized telemetry packet and prints decoded packets it receives
+- `telemetry_terminal.py`: interactive terminal that sends each typed line as one serialized telemetry packet and prints
+  decoded packets it receives
 
 ## Interactive Tooling
 
@@ -71,12 +72,15 @@ python3 host/python/telemetry_terminal.py --sender spi-node spi --bus 0 --device
 
 Use the plain bridge terminals when you want to validate the transport itself with normal text payloads.
 
-Use the telemetry terminal when you want to validate the firmware with the binary payload of a serialized telemetry packet.
+Use the telemetry terminal when you want to validate the firmware with the binary payload of a serialized telemetry
+packet.
 
 Current telemetry decode behavior:
 
-- `telemetry_cli.py` and `telemetry_terminal.py` accept either armored packets with the `SP6:` prefix or raw serialized `sedsprintf_rs_2026` packets
-- received packets are rendered using the packet library string conversion when available, with a field-by-field fallback otherwise
+- `telemetry_cli.py` and `telemetry_terminal.py` accept either armored packets with the `SP6:` prefix or raw serialized
+  `sedsprintf_rs_2026` packets
+- received packets are rendered using the packet library string conversion when available, with a field-by-field
+  fallback otherwise
 
 ## Example Commands
 
@@ -119,16 +123,19 @@ These helpers use the same transport adapters as the routers and terminals:
 
 - UART telemetry rides inside normal `0xA5` UART data frames
 - SPI telemetry rides inside normal `0xA5` SPI data frames
-- the payload bytes may be either raw serialized `sedsprintf_rs_2026` packets or `SP6:`-armored packets, depending on the producer
+- the payload bytes may be either raw serialized `sedsprintf_rs_2026` packets or `SP6:`-armored packets, depending on
+  the producer
 
 ## sedsprintf Routers
 
-The router scripts listen on local UDP, serialize those datagrams as `sedsprintf_rs_2026` packets, and send them over the selected Pico-Fi backend.
+The router scripts listen on local UDP, serialize those datagrams as `sedsprintf_rs_2026` packets, and send them over
+the selected Pico-Fi backend.
 
 Current router note:
 
 - the shared UDP routers currently transmit armored `SP6:` packets
-- the telemetry CLI and telemetry terminal are more permissive on receive and accept both armored and raw serialized packets
+- the telemetry CLI and telemetry terminal are more permissive on receive and accept both armored and raw serialized
+  packets
 
 Examples:
 

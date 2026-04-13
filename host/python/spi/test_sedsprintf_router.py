@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
-import sys
 import types
 import unittest
 from unittest import mock
+
+import sys
 
 if "spidev" not in sys.modules:
     sys.modules["spidev"] = types.SimpleNamespace(SpiDev=object)

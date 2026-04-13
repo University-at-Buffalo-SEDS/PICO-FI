@@ -1,10 +1,10 @@
 //! Flash-backed persistence for the bridge configuration shell.
 
 use crate::config::{AddressMode, BridgeConfig, BridgeMode, Ipv4Config, UpstreamMode};
-use embassy_rp::Peri;
-use embassy_rp::flash::{ERASE_SIZE, Flash};
 use embassy_rp::flash::Blocking;
+use embassy_rp::flash::{Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
+use embassy_rp::Peri;
 
 /// Total onboard flash size configured by the linker script.
 const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024;
@@ -38,7 +38,9 @@ impl ConfigStorage {
     /// Loads a previously persisted config override if one exists and validates.
     pub fn load(&mut self) -> Option<BridgeConfig> {
         let mut buf = [0u8; RECORD_SIZE];
-        self.flash.blocking_read(CONFIG_SECTOR_OFFSET, &mut buf).ok()?;
+        self.flash
+            .blocking_read(CONFIG_SECTOR_OFFSET, &mut buf)
+            .ok()?;
         decode_record(&buf)
     }
 
@@ -46,7 +48,10 @@ impl ConfigStorage {
     pub fn save(&mut self, config: BridgeConfig) -> Result<(), ()> {
         let buf = encode_record(config);
         self.flash
-            .blocking_erase(CONFIG_SECTOR_OFFSET, CONFIG_SECTOR_OFFSET + ERASE_SIZE as u32)
+            .blocking_erase(
+                CONFIG_SECTOR_OFFSET,
+                CONFIG_SECTOR_OFFSET + ERASE_SIZE as u32,
+            )
             .map_err(|_| ())?;
         self.flash
             .blocking_write(CONFIG_SECTOR_OFFSET, &buf)
@@ -56,7 +61,10 @@ impl ConfigStorage {
     /// Clears any persisted override so the compiled defaults apply again.
     pub fn reset(&mut self) -> Result<(), ()> {
         self.flash
-            .blocking_erase(CONFIG_SECTOR_OFFSET, CONFIG_SECTOR_OFFSET + ERASE_SIZE as u32)
+            .blocking_erase(
+                CONFIG_SECTOR_OFFSET,
+                CONFIG_SECTOR_OFFSET + ERASE_SIZE as u32,
+            )
             .map_err(|_| ())
     }
 }

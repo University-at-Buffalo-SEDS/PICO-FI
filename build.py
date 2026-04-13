@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
-import argparse
 
+import sys
 
 ROOT = Path(__file__).resolve().parent
 TARGET = "thumbv6m-none-eabi"

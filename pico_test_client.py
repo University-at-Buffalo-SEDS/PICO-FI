@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import socket
-import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
 
+import sys
 
 DEFAULT_HOST = "192.168.7.2"
 DEFAULT_PORT = 5000
@@ -80,15 +80,15 @@ class PicoTestGui:
         buttons.pack(fill="x")
 
         for idx, (label, command) in enumerate(
-            [
-                ("Ping", "ping"),
-                ("LED On", "led on"),
-                ("LED Off", "led off"),
-                ("Toggle", "led toggle"),
-                ("Status", "led status"),
-                ("Blink 100", "led blink 100"),
-                ("Help", "help"),
-            ]
+                [
+                    ("Ping", "ping"),
+                    ("LED On", "led on"),
+                    ("LED Off", "led off"),
+                    ("Toggle", "led toggle"),
+                    ("Status", "led status"),
+                    ("Blink 100", "led blink 100"),
+                    ("Help", "help"),
+                ]
         ):
             tk.Button(
                 buttons,

@@ -6,11 +6,11 @@ use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_futures::yield_now;
+use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
-use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Timer};
 use heapless::Vec;
 use portable_atomic::{AtomicBool, Ordering};
@@ -45,15 +45,15 @@ pub async fn run_client(
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             true,
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -69,7 +69,7 @@ pub async fn run_client(
             i2c_rx,
             i2c_tx,
         )
-        .await;
+            .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -95,15 +95,15 @@ pub async fn run_server(
             Timer::after_millis(runtime.reconnect_delay_ms).await;
             continue;
         }
-        socket.set_timeout(None);
+        socket.set_timeout(Some(Duration::from_millis(runtime.session_timeout_ms)));
         if exchange_link_handshake(
             &mut socket,
             false,
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-        .await
-        .is_err()
+            .await
+            .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -119,7 +119,7 @@ pub async fn run_server(
             i2c_rx,
             i2c_tx,
         )
-        .await;
+            .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -138,7 +138,8 @@ async fn session(
     loop {
         match select(i2c_rx.pop(), socket.read(&mut net_buf)).await {
             Either::First(packet) => {
-                handle_i2c_request(packet, Some(socket), bridge_config, link_active, i2c_tx).await?;
+                handle_i2c_request(packet, Some(socket), bridge_config, link_active, i2c_tx)
+                    .await?;
             }
             Either::Second(Ok(net_n)) => {
                 if net_n == 0 {
@@ -175,8 +176,7 @@ async fn handle_i2c_request(
         }
         KIND_COMMAND => {
             let line = trim_ascii_line(packet.payload.as_slice());
-            let response =
-                render_local_bridge_command(bridge_config, link_active, line);
+            let response = render_local_bridge_command(bridge_config, link_active, line);
             i2c_tx.push_overwrite(make_packet(KIND_COMMAND, response.as_bytes())?);
             Ok(())
         }
@@ -190,5 +190,8 @@ async fn handle_i2c_request(
 fn make_packet(kind: u8, payload: &[u8]) -> Result<I2cPacket, ()> {
     let mut data = Vec::<u8, I2C_PACKET_MAX>::new();
     data.extend_from_slice(payload).map_err(|_| ())?;
-    Ok(I2cPacket { kind, payload: data })
+    Ok(I2cPacket {
+        kind,
+        payload: data,
+    })
 }

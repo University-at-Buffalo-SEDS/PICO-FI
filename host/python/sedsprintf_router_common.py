@@ -7,10 +7,11 @@ import argparse
 import base64
 import os
 import socket
-import sys
-import time
 from pathlib import Path
 from typing import Protocol
+
+import sys
+import time
 
 ARMOR_PREFIX = b"SP6:"
 
@@ -109,7 +110,7 @@ def armor_packet(packet) -> bytes:
 def decode_armored_packet(sedsprintf, payload: bytes):
     if not payload.startswith(ARMOR_PREFIX):
         return None
-    encoded = payload[len(ARMOR_PREFIX) :]
+    encoded = payload[len(ARMOR_PREFIX):]
     try:
         raw = base64.urlsafe_b64decode(encoded)
         return sedsprintf.deserialize_packet_py(raw)

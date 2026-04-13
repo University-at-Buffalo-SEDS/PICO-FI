@@ -1,13 +1,13 @@
 //! TCP test mode used for quick LED and connectivity checks.
 
 use crate::bridge::commands::trim_ascii_line;
+use crate::net::write_socket;
+use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
-use embassy_net::tcp::TcpSocket;
 use embassy_rp::gpio::Output;
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
-use crate::net::write_socket;
 
 /// Runs the test bridge in TCP client mode.
 pub async fn run_client(
@@ -58,7 +58,7 @@ async fn session(
         socket,
         b"commands: ping, led on, led off, led toggle, led blink <ms>, led status, help\r\n",
     )
-    .await?;
+        .await?;
 
     let mut net_buf = [0u8; 256];
     let mut led_on = false;
@@ -101,7 +101,11 @@ async fn handle_command<'a>(
             if *led_on { "ok led on" } else { "ok led off" }
         }
         "led status" => {
-            if *led_on { "led on" } else { "led off" }
+            if *led_on {
+                "led on"
+            } else {
+                "led off"
+            }
         }
         _ => {
             if let Some(delay_ms) = parse_blink_command(line) {
