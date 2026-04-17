@@ -16,7 +16,7 @@ use bridge::overwrite_queue::OverwriteQueue;
 use bridge::runtime::BridgeRuntime;
 use bridge::spi_frame::SpiFrame;
 use bridge::spi_hw_task::spi_poll_task;
-use config::{BridgeConfig, BridgeMode, UpstreamMode, COMPILED_USB_DEVICE_NAMES};
+use config::{BridgeConfig, BridgeMode, UartPort, UpstreamMode, COMPILED_USB_DEVICE_NAMES};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
@@ -25,7 +25,7 @@ use embassy_rp::i2c_slave::{Config as I2cSlaveConfig, I2cSlave};
 use embassy_rp::interrupt::InterruptExt as _;
 use embassy_rp::peripherals::{
     DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, I2C0, PIN_10, PIN_11, PIN_12, PIN_13, PIO1, SPI1, UART0,
-    USB,
+    UART1, USB,
 };
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb;
@@ -46,6 +46,7 @@ use storage::ConfigStorage;
 bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>, dma::InterruptHandler<DMA_CH2>, dma::InterruptHandler<DMA_CH3>;
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
+    UART1_IRQ => uart::BufferedInterruptHandler<UART1>;
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<I2C0>;
     PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
@@ -117,6 +118,35 @@ fn disable_uart0() {
     });
     embassy_rp::interrupt::Interrupt::UART0_IRQ.disable();
     embassy_rp::interrupt::Interrupt::UART0_IRQ.unpend();
+}
+
+fn disable_uart1() {
+    let regs = rp_pac::UART1;
+    regs.uartimsc().write_value(Default::default());
+    regs.uartdmacr().write_value(Default::default());
+    regs.uartcr().write(|w| {
+        w.set_uarten(false);
+        w.set_txe(false);
+        w.set_rxe(false);
+    });
+    regs.uarticr().write(|w| {
+        w.set_rtic(true);
+        w.set_txic(true);
+        w.set_rxic(true);
+        w.set_feic(true);
+        w.set_peic(true);
+        w.set_beic(true);
+        w.set_oeic(true);
+    });
+    embassy_rp::interrupt::Interrupt::UART1_IRQ.disable();
+    embassy_rp::interrupt::Interrupt::UART1_IRQ.unpend();
+}
+
+fn disable_selected_uart(port: UartPort) {
+    match port {
+        UartPort::Uart0 => disable_uart0(),
+        UartPort::Uart1 => disable_uart1(),
+    }
 }
 
 /// Drives the onboard LED from either heartbeat mode or explicit local commands.
@@ -205,19 +235,6 @@ async fn app(spawner: Spawner) {
         Timer::after_millis(100).await;
     }
 
-    let mut uart_config = uart::Config::default();
-    uart_config.baudrate = 115_200;
-    let uart = BufferedUart::new(
-        p.UART0,
-        p.PIN_0,
-        p.PIN_1,
-        Irqs,
-        UART_TX_BUF.init([0; 512]),
-        UART_RX_BUF.init([0; 512]),
-        uart_config,
-    );
-    let mut uart = Some(uart);
-
     let mut config_storage = ConfigStorage::new(p.FLASH);
     let compiled_config = BridgeConfig::default();
     let initial_config = if matches!(
@@ -232,6 +249,29 @@ async fn app(spawner: Spawner) {
     } else {
         config_storage.load().unwrap_or(compiled_config)
     };
+    let mut uart_config = uart::Config::default();
+    uart_config.baudrate = 115_200;
+    let uart = match initial_config.uart_port {
+        UartPort::Uart0 => BufferedUart::new(
+            p.UART0,
+            p.PIN_0,
+            p.PIN_1,
+            Irqs,
+            UART_TX_BUF.init([0; 512]),
+            UART_RX_BUF.init([0; 512]),
+            uart_config,
+        ),
+        UartPort::Uart1 => BufferedUart::new(
+            p.UART1,
+            p.PIN_4,
+            p.PIN_5,
+            Irqs,
+            UART_TX_BUF.init([0; 512]),
+            UART_RX_BUF.init([0; 512]),
+            uart_config,
+        ),
+    };
+    let mut uart = Some(uart);
     let bridge_config = configuration_shell(
         uart.as_mut()
             .expect("configuration shell requires the boot UART"),
@@ -254,9 +294,9 @@ async fn app(spawner: Spawner) {
     }
 
     let upstream_i2c = if matches!(bridge_config.upstream_mode, UpstreamMode::I2c) {
-        // Release UART0 before reusing GPIO0/GPIO1 as the I2C0 upstream bus.
+        // Release the selected UART, and fully disable UART0 if I2C needs GPIO0/GPIO1.
         drop(uart.take());
-        disable_uart0();
+        disable_selected_uart(bridge_config.uart_port);
         let mut i2c_config = I2cSlaveConfig::default();
         i2c_config.addr = 0x55;
         i2c_config.general_call = false;

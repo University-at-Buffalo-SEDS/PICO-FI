@@ -1,6 +1,6 @@
 //! Flash-backed persistence for the bridge configuration shell.
 
-use crate::config::{AddressMode, BridgeConfig, BridgeMode, Ipv4Config, UpstreamMode};
+use crate::config::{AddressMode, BridgeConfig, BridgeMode, Ipv4Config, UartPort, UpstreamMode};
 use embassy_rp::flash::Blocking;
 use embassy_rp::flash::{Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
@@ -16,7 +16,7 @@ const CONFIG_SECTOR_OFFSET: u32 = (FLASH_SIZE_BYTES - ERASE_SIZE) as u32;
 const CONFIG_MAGIC: [u8; 4] = *b"PCFG";
 
 /// Persistence format version for forward compatibility.
-const CONFIG_VERSION: u8 = 1;
+const CONFIG_VERSION: u8 = 2;
 
 /// Size of the serialized config record stored in flash.
 const RECORD_SIZE: usize = 64;
@@ -98,6 +98,7 @@ fn encode_record(config: BridgeConfig) -> [u8; RECORD_SIZE] {
     }
 
     buf[32] = encode_upstream_mode(config.upstream_mode);
+    buf[33] = encode_uart_port(config.uart_port);
     let checksum = checksum32(&buf[..60]);
     buf[60..64].copy_from_slice(&checksum.to_le_bytes());
     buf
@@ -148,11 +149,18 @@ fn decode_record(buf: &[u8; RECORD_SIZE]) -> Option<BridgeConfig> {
         _ => return None,
     };
 
+    let uart_port = match buf[33] {
+        0 => UartPort::Uart0,
+        1 => UartPort::Uart1,
+        _ => return None,
+    };
+
     Some(BridgeConfig {
         mac_address: buf[5..11].try_into().ok()?,
         address_mode,
         bridge_mode,
         upstream_mode,
+        uart_port,
     })
 }
 
@@ -183,6 +191,14 @@ fn encode_upstream_mode(mode: UpstreamMode) -> u8 {
         UpstreamMode::SpiEcho => 5,
         UpstreamMode::SpiStatic => 6,
         UpstreamMode::SpiLineHigh => 7,
+    }
+}
+
+/// Encodes the selected UART into the compact flash record representation.
+fn encode_uart_port(port: UartPort) -> u8 {
+    match port {
+        UartPort::Uart0 => 0,
+        UartPort::Uart1 => 1,
     }
 }
 

@@ -55,6 +55,15 @@ pub enum UpstreamMode {
     Test,
 }
 
+/// Which RP2040 UART peripheral should be used for shell/diagnostics/UART bridging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UartPort {
+    /// Uses UART0 on GPIO0/GPIO1.
+    Uart0,
+    /// Uses UART1 on GPIO4/GPIO5.
+    Uart1,
+}
+
 /// Full runtime bridge configuration assembled from compiled defaults and shell overrides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
@@ -66,6 +75,8 @@ pub struct BridgeConfig {
     pub bridge_mode: BridgeMode,
     /// Which local upstream transport should feed the TCP bridge.
     pub upstream_mode: UpstreamMode,
+    /// Which hardware UART peripheral provides console/UART bridge access.
+    pub uart_port: UartPort,
 }
 
 /// Compile-time USB CDC descriptor strings.
@@ -245,6 +256,15 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
         }
         UpstreamMode::Test => {
             let _ = out.push_str(" upstream=test");
+        }
+    }
+
+    match config.uart_port {
+        UartPort::Uart0 => {
+            let _ = out.push_str(" uart=uart0");
+        }
+        UartPort::Uart1 => {
+            let _ = out.push_str(" uart=uart1");
         }
     }
 

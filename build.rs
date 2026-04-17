@@ -32,6 +32,7 @@ struct JsonBridgeConfig {
 #[derive(Deserialize)]
 struct JsonUpstreamConfig {
     transport: String,
+    uart: Option<String>,
     usb: Option<JsonUsbConfig>,
 }
 
@@ -76,10 +77,11 @@ fn render_generated_config(config: JsonConfig) -> String {
     let address_mode = render_address_mode(&config.network);
     let bridge_mode = render_bridge_mode(&config.bridge);
     let upstream = render_upstream_mode(&config.upstream);
+    let uart_port = render_uart_port(&config.upstream);
     let usb_names = render_usb_names(config.upstream.usb.as_ref());
 
     format!(
-        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n}};\n\
+        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n    uart_port: {uart_port},\n}};\n\
 pub const COMPILED_USB_DEVICE_NAMES: UsbDeviceNames = {usb_names};\n"
     )
 }
@@ -152,6 +154,14 @@ fn render_upstream_mode(upstream: &JsonUpstreamConfig) -> String {
         "spi_line_high" | "spilinehigh" | "spi_line" => "UpstreamMode::SpiLineHigh".to_owned(),
         "test" => "UpstreamMode::Test".to_owned(),
         other => panic!("unsupported upstream.transport: {other}"),
+    }
+}
+
+fn render_uart_port(upstream: &JsonUpstreamConfig) -> String {
+    match upstream.uart.as_deref().unwrap_or("uart0") {
+        "uart0" => "UartPort::Uart0".to_owned(),
+        "uart1" => "UartPort::Uart1".to_owned(),
+        other => panic!("unsupported upstream.uart: {other}"),
     }
 }
 
