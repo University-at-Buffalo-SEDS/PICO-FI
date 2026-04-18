@@ -1,7 +1,7 @@
 //! UART upstream bridge implementation using framed request/response packets.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::overwrite_queue::OverwriteByteRing;
+use crate::bridge::overwrite_queue::OverwriteBytePacketRing;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
@@ -18,7 +18,8 @@ use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read, Write};
 use portable_atomic::{AtomicBool, Ordering};
 
-const UART_EGRESS_RING_BYTES: usize = 8192;
+const UART_EGRESS_RING_PACKETS: usize = 8;
+const UART_EGRESS_PACKET_BYTES: usize = UART_PAYLOAD_MAX + UART_FRAME_HEADER_SIZE;
 const UART_EGRESS_CHUNK_BYTES: usize = 256;
 const UART_PAYLOAD_MAX: usize = 4096;
 const UART_FRAME_HEADER_SIZE: usize = FRAME_HEADER_SIZE;
@@ -26,6 +27,8 @@ const UART_RETRY_DELAY_MS: u64 = 10;
 const UART_FLUSH_BATCH_CHUNKS: usize = 4;
 const UART_PRECONNECT_NET_SLICE_MS: u64 = 50;
 const UART_PRECONNECT_UART_SLICE_MS: u64 = 1;
+
+type UartEgressRing = OverwriteBytePacketRing<UART_EGRESS_RING_PACKETS, UART_EGRESS_PACKET_BYTES>;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum UartFrameKind {
@@ -74,7 +77,7 @@ pub async fn run_client(
         {
             let (uart_tx, uart_rx) = uart.split_ref();
             let mut uart_frame = UartFrame::new();
-            let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
+            let mut egress_ring = UartEgressRing::new();
 
             loop {
                 if connect_with_timeout(&mut socket, remote, port, UART_PRECONNECT_NET_SLICE_MS)
@@ -147,7 +150,7 @@ pub async fn run_server(
         {
             let (uart_tx, uart_rx) = uart.split_ref();
             let mut uart_frame = UartFrame::new();
-            let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
+            let mut egress_ring = UartEgressRing::new();
 
             loop {
                 match select(
@@ -213,7 +216,7 @@ async fn session(
     let mut uart_frame = UartFrame::new();
     let mut net_buf = [0u8; UART_PAYLOAD_MAX];
     let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
-    let mut egress_ring = OverwriteByteRing::<UART_EGRESS_RING_BYTES>::new();
+    let mut egress_ring = UartEgressRing::new();
     let mut tx_chunk_len = 0usize;
     let mut tx_chunk_pos = 0usize;
     let mut consecutive_tx_chunks = 0usize;
@@ -221,13 +224,14 @@ async fn session(
 
     loop {
         if tx_chunk_pos >= tx_chunk_len && !egress_ring.is_empty() {
-            tx_chunk_len = egress_ring.pop_into(&mut tx_chunk);
+            tx_chunk_len = egress_ring.peek_into(&mut tx_chunk);
             tx_chunk_pos = 0;
         }
 
         if tx_chunk_pos < tx_chunk_len {
             let written =
                 write_uart_chunk_lossy(uart_tx, &tx_chunk[tx_chunk_pos..tx_chunk_len]).await;
+            egress_ring.consume(written);
             tx_chunk_pos = (tx_chunk_pos + written).min(tx_chunk_len);
             consecutive_tx_chunks += 1;
             if tx_chunk_pos >= tx_chunk_len {
@@ -276,7 +280,7 @@ async fn handle_uart_request(
     socket: Option<&mut TcpSocket<'_>>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
+    egress_ring: &mut UartEgressRing,
 ) -> Result<(), ()> {
     match frame.kind {
         UartFrameKind::Data => {
@@ -298,11 +302,7 @@ async fn handle_uart_request(
     }
 }
 
-fn push_uart_frame(
-    egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
-    kind: UartFrameKind,
-    payload: &[u8],
-) {
+fn push_uart_frame(egress_ring: &mut UartEgressRing, kind: UartFrameKind, payload: &[u8]) {
     let len = payload.len().min(UART_PAYLOAD_MAX);
     let mut header = [0u8; UART_FRAME_HEADER_SIZE];
     match kind {
@@ -316,18 +316,14 @@ fn push_uart_frame(
         }
     }
     header[2..4].copy_from_slice(&(len as u16).to_le_bytes());
-    egress_ring.push_overwrite_slice(&header);
-    egress_ring.push_overwrite_slice(&payload[..len]);
+    egress_ring.push_overwrite_slices(&[&header, &payload[..len]]);
 }
 
-async fn flush_uart_egress(
-    uart_tx: &mut impl Write,
-    egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
-) {
+async fn flush_uart_egress(uart_tx: &mut impl Write, egress_ring: &mut UartEgressRing) {
     let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
     let mut flushed_chunks = 0usize;
     while !egress_ring.is_empty() {
-        let chunk_len = egress_ring.pop_into(&mut tx_chunk);
+        let chunk_len = egress_ring.peek_into(&mut tx_chunk);
         if chunk_len == 0 {
             break;
         }
@@ -337,10 +333,11 @@ async fn flush_uart_egress(
                 break;
             }
             Ok(written) if written < chunk_len => {
-                egress_ring.push_overwrite_slice(&tx_chunk[written..chunk_len]);
+                egress_ring.consume(written);
                 break;
             }
             Ok(_) => {
+                egress_ring.consume(chunk_len);
                 let _ = uart_tx.flush().await;
             }
         }
@@ -358,7 +355,7 @@ async fn service_preconnect_uart(
     uart_frame: &mut UartFrame,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    egress_ring: &mut OverwriteByteRing<UART_EGRESS_RING_BYTES>,
+    egress_ring: &mut UartEgressRing,
 ) -> Result<(), ()> {
     match select(
         read_uart_frame_lossy(uart_rx, uart_frame),

@@ -1,7 +1,7 @@
 //! Hardware SPI1 slave task for framed upstream transfers.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::overwrite_queue::OverwriteQueue;
+use crate::bridge::overwrite_queue::{OverwriteQueue, PACKET_QUEUE_DEPTH};
 use crate::bridge::spi_diag;
 use crate::bridge::spi_frame::SpiFrame;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
@@ -35,8 +35,8 @@ pub async fn spi_poll_task(
     _spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<SpiFrame, 8>,
-    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
+    tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
 ) -> ! {
     if matches!(
         bridge_config.upstream_mode,
@@ -344,8 +344,8 @@ fn finalize_transaction(
     result: TransactionResult,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<SpiFrame, 8>,
-    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
+    tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
     pending_pull_response: &mut Option<[u8; FRAME_SIZE]>,
 ) -> Option<[u8; FRAME_SIZE]> {
     match result {
@@ -425,7 +425,7 @@ fn finalize_transaction(
 }
 
 fn pull_queued_response(
-    rx_resp: &'static OverwriteQueue<SpiFrame, 8>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
     pending_pull_response: &mut Option<[u8; FRAME_SIZE]>,
 ) -> [u8; FRAME_SIZE] {
     if let Some(resp) = pending_pull_response {

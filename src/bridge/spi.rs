@@ -1,7 +1,7 @@
 //! SPI upstream bridge implementation.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::overwrite_queue::OverwriteQueue;
+use crate::bridge::overwrite_queue::{OverwriteQueue, PACKET_QUEUE_DEPTH};
 use crate::bridge::runtime::BridgeRuntime;
 use crate::bridge::spi_diag;
 use crate::bridge::spi_frame::SpiFrame;
@@ -27,8 +27,8 @@ pub async fn run_client(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
-    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     Timer::after_millis(runtime.startup_delay_ms).await;
@@ -101,8 +101,8 @@ pub async fn run_server(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
-    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -164,8 +164,8 @@ async fn session(
     socket: &mut TcpSocket<'_>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    spi_rx: &'static OverwriteQueue<SpiFrame, 8>,
-    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; 256];
 
@@ -194,7 +194,7 @@ async fn handle_spi_request(
     socket: Option<&mut TcpSocket<'_>>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    spi_tx: &'static OverwriteQueue<SpiFrame, 8>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     match parse_request_frame(&frame.data) {
         Some(RequestFrame::Data(payload)) => {

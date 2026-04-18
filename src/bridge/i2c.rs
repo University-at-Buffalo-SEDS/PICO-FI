@@ -2,7 +2,7 @@
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::i2c_task::{I2C_PACKET_MAX, I2cPacket};
-use crate::bridge::overwrite_queue::OverwriteQueue;
+use crate::bridge::overwrite_queue::{OverwriteQueue, PACKET_QUEUE_DEPTH};
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
@@ -25,8 +25,8 @@ pub async fn run_client(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    i2c_rx: &'static OverwriteQueue<I2cPacket, 8>,
-    i2c_tx: &'static OverwriteQueue<I2cPacket, 8>,
+    i2c_rx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
+    i2c_tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     let remote = Ipv4Address::new(host[0], host[1], host[2], host[3]);
     Timer::after_millis(runtime.startup_delay_ms).await;
@@ -82,8 +82,8 @@ pub async fn run_server(
     port: u16,
     bridge_config: BridgeConfig,
     runtime: BridgeRuntime<'_>,
-    i2c_rx: &'static OverwriteQueue<I2cPacket, 8>,
-    i2c_tx: &'static OverwriteQueue<I2cPacket, 8>,
+    i2c_rx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
+    i2c_tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     loop {
         let mut rx_buf = [0u8; 2048];
@@ -130,8 +130,8 @@ async fn session(
     socket: &mut TcpSocket<'_>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    i2c_rx: &'static OverwriteQueue<I2cPacket, 8>,
-    i2c_tx: &'static OverwriteQueue<I2cPacket, 8>,
+    i2c_rx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
+    i2c_tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; I2C_PACKET_MAX];
 
@@ -159,7 +159,7 @@ async fn handle_i2c_request(
     socket: Option<&mut TcpSocket<'_>>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    i2c_tx: &'static OverwriteQueue<I2cPacket, 8>,
+    i2c_tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) -> Result<(), ()> {
     match packet.kind {
         KIND_DATA => {

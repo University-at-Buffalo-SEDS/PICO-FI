@@ -1,7 +1,7 @@
 //! Dedicated I2C polling task for the slot-based upstream protocol.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::overwrite_queue::OverwriteQueue;
+use crate::bridge::overwrite_queue::{OverwriteQueue, PACKET_QUEUE_DEPTH};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
     REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, build_frame_into,
@@ -304,8 +304,8 @@ pub async fn i2c_poll_task(
     i2c: &mut I2cSlave<'static, I2C0>,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<I2cPacket, 8>,
-    rx_resp: &'static OverwriteQueue<I2cPacket, 8>,
+    tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
+    rx_resp: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) -> ! {
     let mut transaction_buf = [0u8; LISTEN_BUFFER_SIZE];
     let mut rx_packet = RxPacketState::new();
@@ -357,7 +357,7 @@ fn handle_write_slot(
     last_transfer_id: &mut u16,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<I2cPacket, 8>,
+    tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) {
     match decode_slot(raw) {
         Ok(None) => {}
@@ -388,7 +388,7 @@ fn process_complete_packet(
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
     tx_packet: &mut TxPacketState,
-    tx: &'static OverwriteQueue<I2cPacket, 8>,
+    tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
 ) {
     match parse_request_bytes(payload) {
         Some(RequestFrame::Command(command_payload)) => {
@@ -463,7 +463,7 @@ fn process_complete_packet(
 
 fn stage_response_packet(
     tx_packet: &mut TxPacketState,
-    rx_resp: &'static OverwriteQueue<I2cPacket, 8>,
+    rx_resp: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
     transfer_id: u16,
 ) {
     if tx_packet.has_pending() {
