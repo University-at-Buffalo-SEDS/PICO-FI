@@ -5,44 +5,96 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use heapless::Deque;
 
-pub const PACKET_QUEUE_DEPTH: usize = 16;
+// I2C packets carry a 4 KiB inline payload, so keep this depth bounded to avoid
+// exhausting RP2040 RAM under burst traffic.
+pub const I2C_PACKET_QUEUE_DEPTH: usize = 8;
+pub const I2C_PACKET_QUEUE_BYTES: usize = 8192;
+pub const SPI_PACKET_QUEUE_DEPTH: usize = 32;
+pub const SPI_PACKET_QUEUE_BYTES: usize = 8192;
 
-pub struct OverwriteQueue<T, const N: usize> {
-    queue: Mutex<CriticalSectionRawMutex, Deque<T, N>>,
+pub trait QueueItem {
+    fn queued_len(&self) -> usize;
+}
+
+struct QueueState<T, const N: usize> {
+    queue: Deque<T, N>,
+    queued_bytes: usize,
+}
+
+impl<T, const N: usize> QueueState<T, N> {
+    const fn new() -> Self {
+        Self {
+            queue: Deque::new(),
+            queued_bytes: 0,
+        }
+    }
+}
+
+pub struct OverwriteQueue<T, const N: usize, const MAX_BYTES: usize> {
+    state: Mutex<CriticalSectionRawMutex, QueueState<T, N>>,
     ready: Signal<CriticalSectionRawMutex, ()>,
 }
 
-impl<T, const N: usize> OverwriteQueue<T, N> {
+impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, MAX_BYTES> {
     pub const fn new() -> Self {
         Self {
-            queue: Mutex::new(Deque::new()),
+            state: Mutex::new(QueueState::new()),
             ready: Signal::new(),
         }
     }
 
-    pub fn push_overwrite(&self, item: T) {
-        unsafe {
-            self.queue.lock_mut(|queue| {
-                if queue.is_full() {
-                    let _ = queue.pop_front();
-                }
-                let _ = queue.push_back(item);
-            });
+    pub fn push_overwrite(&self, item: T) -> bool {
+        let item_len = item.queued_len();
+        if item_len > MAX_BYTES {
+            return false;
         }
-        self.ready.signal(());
+
+        let pushed = unsafe {
+            self.state.lock_mut(|state| {
+                while state.queue.is_full()
+                    || state.queued_bytes.saturating_add(item_len) > MAX_BYTES
+                {
+                    match state.queue.pop_front() {
+                        Some(dropped) => {
+                            state.queued_bytes =
+                                state.queued_bytes.saturating_sub(dropped.queued_len());
+                        }
+                        None => break,
+                    }
+                }
+
+                if state.queue.push_back(item).is_ok() {
+                    state.queued_bytes = state.queued_bytes.saturating_add(item_len);
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+        if pushed {
+            self.ready.signal(());
+        }
+        pushed
     }
 
     pub fn try_pop(&self) -> Option<T> {
-        unsafe { self.queue.lock_mut(|queue| queue.pop_front()) }
+        unsafe {
+            self.state.lock_mut(|state| {
+                let item = state.queue.pop_front()?;
+                state.queued_bytes = state.queued_bytes.saturating_sub(item.queued_len());
+                Some(item)
+            })
+        }
     }
 
     pub fn try_pop_latest(&self) -> Option<T> {
         unsafe {
-            self.queue.lock_mut(|queue| {
-                let mut latest = queue.pop_front()?;
-                while let Some(next) = queue.pop_front() {
+            self.state.lock_mut(|state| {
+                let mut latest = state.queue.pop_front()?;
+                while let Some(next) = state.queue.pop_front() {
                     latest = next;
                 }
+                state.queued_bytes = 0;
                 Some(latest)
             })
         }

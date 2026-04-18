@@ -1,7 +1,9 @@
 //! Hardware SPI1 slave task for framed upstream transfers.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::overwrite_queue::{OverwriteQueue, PACKET_QUEUE_DEPTH};
+use crate::bridge::overwrite_queue::{
+    OverwriteQueue, SPI_PACKET_QUEUE_BYTES, SPI_PACKET_QUEUE_DEPTH,
+};
 use crate::bridge::spi_diag;
 use crate::bridge::spi_frame::SpiFrame;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
@@ -35,8 +37,8 @@ pub async fn spi_poll_task(
     _spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
-    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    tx: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
 ) -> ! {
     if matches!(
         bridge_config.upstream_mode,
@@ -238,9 +240,10 @@ async fn spi1_manual_transfer(
     rx_frame: &mut [u8; FRAME_SIZE],
 ) -> (usize, usize) {
     let regs = rp_pac::SPI1;
+    let tx_len = frame_wire_len(tx_frame);
 
     let mut tx_index = 0usize;
-    while tx_index < SPI_TX_PRELOAD_BYTES && tx_index < FRAME_SIZE && regs.sr().read().tnf() {
+    while tx_index < SPI_TX_PRELOAD_BYTES && tx_index < tx_len && regs.sr().read().tnf() {
         regs.dr().write(|w| w.set_data(tx_frame[tx_index] as u16));
         tx_index += 1;
     }
@@ -277,7 +280,7 @@ async fn spi1_manual_transfer(
             idle_spins = 0;
         }
 
-        while tx_index < FRAME_SIZE && regs.sr().read().tnf() {
+        while tx_index < tx_len && regs.sr().read().tnf() {
             regs.dr().write(|w| w.set_data(tx_frame[tx_index] as u16));
             tx_index += 1;
             if tx_index >= SPI_TX_PRELOAD_BYTES && !cs_low && !regs.sr().read().rne() {
@@ -285,7 +288,7 @@ async fn spi1_manual_transfer(
             }
         }
 
-        if !cs_low && !regs.sr().read().bsy() && !regs.sr().read().rne() && tx_index >= FRAME_SIZE {
+        if !cs_low && !regs.sr().read().bsy() && !regs.sr().read().rne() && tx_index >= tx_len {
             break;
         }
 
@@ -297,6 +300,16 @@ async fn spi1_manual_transfer(
     }
 
     (rx_index, rx_index.min(tx_index))
+}
+
+fn frame_wire_len(frame: &[u8; FRAME_SIZE]) -> usize {
+    if !matches!(
+        (frame[0], frame[1]),
+        (REQ_DATA_MAGIC, RESP_DATA_MAGIC) | (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC)
+    ) {
+        return FRAME_HEADER_SIZE;
+    }
+    (u16::from_le_bytes([frame[2], frame[3]]) as usize + FRAME_HEADER_SIZE).min(FRAME_SIZE)
 }
 
 fn cs_asserted() -> bool {
@@ -344,8 +357,8 @@ fn finalize_transaction(
     result: TransactionResult,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
-    tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
-    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    tx: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
     pending_pull_response: &mut Option<[u8; FRAME_SIZE]>,
 ) -> Option<[u8; FRAME_SIZE]> {
     match result {
@@ -380,7 +393,7 @@ fn finalize_transaction(
                 } else if payload.is_empty() {
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
                 } else if is_strict_forward_frame(&frame) {
-                    tx.push_overwrite(SpiFrame { data: frame });
+                    let _ = tx.push_overwrite(SpiFrame::from_raw_frame(frame));
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
                 } else {
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
@@ -397,7 +410,7 @@ fn finalize_transaction(
                 if payload.is_empty() {
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
                 } else if is_strict_forward_frame(&frame) {
-                    tx.push_overwrite(SpiFrame { data: frame });
+                    let _ = tx.push_overwrite(SpiFrame::from_raw_frame(frame));
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
                 } else {
                     Some(make_response_frame(RESP_DATA_MAGIC, b""))
@@ -425,15 +438,16 @@ fn finalize_transaction(
 }
 
 fn pull_queued_response(
-    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
     pending_pull_response: &mut Option<[u8; FRAME_SIZE]>,
 ) -> [u8; FRAME_SIZE] {
     if let Some(resp) = pending_pull_response {
         return *resp;
     }
     if let Some(resp) = rx_resp.try_pop_latest() {
-        *pending_pull_response = Some(resp.data);
-        return resp.data;
+        let frame = resp.as_frame();
+        *pending_pull_response = Some(frame);
+        return frame;
     }
     make_response_frame(RESP_DATA_MAGIC, b"")
 }

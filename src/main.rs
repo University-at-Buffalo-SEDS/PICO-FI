@@ -12,7 +12,10 @@ mod storage;
 
 use bridge::commands::{set_led_state, take_led_activity, take_led_command};
 use bridge::i2c_task::{I2cPacket, i2c_poll_task};
-use bridge::overwrite_queue::{OverwriteQueue, PACKET_QUEUE_DEPTH};
+use bridge::overwrite_queue::{
+    I2C_PACKET_QUEUE_BYTES, I2C_PACKET_QUEUE_DEPTH, OverwriteQueue, SPI_PACKET_QUEUE_BYTES,
+    SPI_PACKET_QUEUE_DEPTH,
+};
 use bridge::runtime::BridgeRuntime;
 use bridge::spi_frame::SpiFrame;
 use bridge::spi_hw_task::spi_poll_task;
@@ -67,10 +70,20 @@ static USB_CDC_STATE: StaticCell<UsbCdcState<'static>> = StaticCell::new();
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 /// Channel for I2C frames from polling task to bridge session.
-static I2C_FRAME_QUEUE: OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH> = OverwriteQueue::new();
-static I2C_RESPONSE_QUEUE: OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH> = OverwriteQueue::new();
-static SPI_FRAME_QUEUE: OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH> = OverwriteQueue::new();
-static SPI_RESPONSE_QUEUE: OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH> = OverwriteQueue::new();
+static I2C_FRAME_QUEUE: OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES> =
+    OverwriteQueue::new();
+static I2C_RESPONSE_QUEUE: OverwriteQueue<
+    I2cPacket,
+    I2C_PACKET_QUEUE_DEPTH,
+    I2C_PACKET_QUEUE_BYTES,
+> = OverwriteQueue::new();
+static SPI_FRAME_QUEUE: OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES> =
+    OverwriteQueue::new();
+static SPI_RESPONSE_QUEUE: OverwriteQueue<
+    SpiFrame,
+    SPI_PACKET_QUEUE_DEPTH,
+    SPI_PACKET_QUEUE_BYTES,
+> = OverwriteQueue::new();
 
 /// Shared link-state flag consumed by status reporting and heartbeat LED behavior.
 static LINK_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -450,10 +463,10 @@ async fn run_bridge_mode(
     usb_sender: Option<&mut UsbCdcSender>,
     usb_receiver: Option<&mut UsbCdcReceiver>,
     status_led: Option<&mut Output<'static>>,
-    i2c_rx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
-    i2c_tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
-    spi_rx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
-    spi_tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    i2c_rx: &'static OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>,
+    i2c_tx: &'static OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>,
+    spi_rx: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
+    spi_tx: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
 ) -> Result<(), ()> {
     let runtime = BridgeRuntime {
         link_active: &LINK_ACTIVE,
@@ -588,8 +601,8 @@ async fn i2c_controller_task(
     mut i2c: I2cSlave<'static, I2C0>,
     bridge_config: BridgeConfig,
     link_active: &'static AtomicBool,
-    tx: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
-    rx_resp: &'static OverwriteQueue<I2cPacket, PACKET_QUEUE_DEPTH>,
+    tx: &'static OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>,
+    rx_resp: &'static OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>,
 ) {
     i2c_poll_task(&mut i2c, bridge_config, link_active, tx, rx_resp).await
 }
@@ -606,8 +619,8 @@ async fn spi_controller_task(
     spawner: Spawner,
     bridge_config: BridgeConfig,
     link_active: &'static AtomicBool,
-    tx: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
-    rx_resp: &'static OverwriteQueue<SpiFrame, PACKET_QUEUE_DEPTH>,
+    tx: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
+    rx_resp: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
 ) {
     spi_poll_task(
         spi1,
