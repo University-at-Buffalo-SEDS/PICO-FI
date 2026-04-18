@@ -1,7 +1,7 @@
 //! Local bridge command rendering shared by UART and I2C control paths.
 
 use crate::bridge::spi_diag;
-use crate::config::{render_config, BridgeConfig};
+use crate::config::{BridgeConfig, render_config};
 use heapless::String;
 use portable_atomic::{AtomicBool, AtomicU8, Ordering};
 

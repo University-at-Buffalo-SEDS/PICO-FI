@@ -174,7 +174,7 @@ fn render_usb_names(usb: Option<&JsonUsbConfig>) -> String {
         serial_number = render_optional_string(usb.serial_number.as_deref(), Some("PICO-FI")),
         comm_interface = render_optional_string(usb.comm_interface.as_deref(), Some("pico-fi CDC")),
         data_interface =
-        render_optional_string(usb.data_interface.as_deref(), Some("pico-fi data")),
+            render_optional_string(usb.data_interface.as_deref(), Some("pico-fi data")),
     )
 }
 

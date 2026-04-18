@@ -47,31 +47,29 @@ Practical implication:
 
 ## Frame Format
 
-Every UART request and response is exactly `258` bytes:
+Every UART request and response is variable length:
 
-- byte `0`: magic
-- byte `1`: payload length `N`
-- bytes `2..(2+N)`: payload
-- remaining bytes: zero padding
+- byte `0`: request magic
+- byte `1`: response/sync magic
+- bytes `2..3`: payload length `N`, little-endian `u16`
+- bytes `4..(4+N)`: payload
 
 Constants:
 
-- frame size: `258`
-- max payload: `256`
+- header size: `4`
+- max payload: `4096`
 - request data magic: `0xA5`
 - request command magic: `0xA6`
 - response data magic: `0x5A`
 - response command magic: `0x5B`
 
-The firmware parser is currently shared with the SPI/I2C framed protocol code
-in [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs).
+Data frames use the sync pair `0xA5 0x5A`. Command frames use `0xA6 0x5B`.
 
 ## Semantics
 
 `0xA5` request:
 
 - carries bridged data bytes
-- empty payload is a poll for pending inbound data
 
 `0xA6` request:
 
@@ -80,7 +78,6 @@ in [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i
 `0x5A` response:
 
 - carries bridged data
-- or an empty acknowledgement / empty poll result
 
 `0x5B` response:
 
@@ -92,12 +89,11 @@ in [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i
 When the Ethernet bridge session is active:
 
 - non-empty `0xA5` payloads are forwarded across the bridge
-- empty `0xA5` payloads poll for pending bridged data
 - `0xA6` payloads are handled locally as Pico commands
 
 Before the bridge session is active:
 
-- `0xA5` requests still parse and typically receive an empty `0x5A`
+- `0xA5` requests still parse but are dropped because no socket is available
 - `0xA6` requests still work for local Pico commands
 
 Important constraint:
@@ -111,43 +107,41 @@ If two host tools write to the same UART simultaneously, the Pico will see corru
 
 To send bridged data:
 
-1. Build a `258` byte frame with magic `0xA5`.
-2. Put the payload length in byte `1`.
-3. Copy the payload into bytes `2..`.
-4. Zero-fill the rest.
-5. Write all `258` bytes.
-6. Read exactly `258` bytes back.
+1. Write sync bytes `0xA5 0x5A`.
+2. Write the payload length as little-endian `u16`.
+3. Write exactly `N` payload bytes.
 
 To poll for inbound bridged data:
 
-1. Send an empty `0xA5` frame.
-2. Read exactly `258` bytes back.
-3. If the reply magic is `0x5A` and length is non-zero, bytes `2..(2+N)` are the inbound data.
-4. If the reply magic is `0x5A` and length is zero, no data is pending.
+1. Read until sync bytes `0xA5 0x5A`.
+2. Read the little-endian `u16` payload length.
+3. Read exactly `N` payload bytes.
 
 To issue a local Pico command:
 
-1. Send a `0xA6` frame whose payload is ASCII and usually newline-terminated, for example `/link\n`.
-2. Read a `0x5B` response.
+1. Write sync bytes `0xA6 0x5B`.
+2. Write the payload length as little-endian `u16`.
+3. Write the ASCII command payload, usually newline-terminated, for example `/link\n`.
+4. Read a `0xA6 0x5B` command response.
 
 ## Example Frames
 
 Send bridged payload `hello`:
 
 ```text
-a5 05 68 65 6c 6c 6f 00 00 ...
+a5 5a 05 00 68 65 6c 6c 6f
 ```
 
-Poll for inbound data:
+Inbound bridged payload `hello`:
 
 ```text
-a5 00 00 00 00 00 ...
+a5 5a 05 00 68 65 6c 6c 6f
 ```
 
 Send local command `/ping\n`:
 
 ```text
-a6 06 2f 70 69 6e 67 0a 00 ...
+a6 5b 06 00 2f 70 69 6e 67 0a
 ```
 
 ## Host Tools

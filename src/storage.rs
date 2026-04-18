@@ -1,10 +1,10 @@
 //! Flash-backed persistence for the bridge configuration shell.
 
 use crate::config::{AddressMode, BridgeConfig, BridgeMode, Ipv4Config, UartPort, UpstreamMode};
-use embassy_rp::flash::Blocking;
-use embassy_rp::flash::{Flash, ERASE_SIZE};
-use embassy_rp::peripherals::FLASH;
 use embassy_rp::Peri;
+use embassy_rp::flash::Blocking;
+use embassy_rp::flash::{ERASE_SIZE, Flash};
+use embassy_rp::peripherals::FLASH;
 
 /// Total onboard flash size configured by the linker script.
 const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024;

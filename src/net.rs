@@ -1,19 +1,19 @@
 //! Ethernet bring-up and TCP transport helpers.
 
-use crate::config::{AddressMode, BridgeConfig};
 use crate::Irqs;
+use crate::config::{AddressMode, BridgeConfig};
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{
     Config as NetConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
 };
+use embassy_rp::Peri;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{
     DMA_CH0, DMA_CH1, PIN_16, PIN_17, PIN_18, PIN_19, PIN_20, PIN_21, SPI0,
 };
 use embassy_rp::spi::{self, Async};
-use embassy_rp::Peri;
 use embassy_time::{Delay, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use heapless::Vec;
@@ -81,8 +81,8 @@ pub async fn bring_up_network(
             int,
             reset,
         )
-            .await
-            .map_err(|_| "w5500 init failed")?;
+        .await
+        .map_err(|_| "w5500 init failed")?;
 
     let net_config = match bridge_config.address_mode {
         AddressMode::Dhcp => NetConfig::dhcpv4(Default::default()),
@@ -157,7 +157,7 @@ pub async fn exchange_link_handshake(
             read_socket_exact(socket, &mut buf),
             Timer::after_millis(timeout_ms),
         )
-            .await
+        .await
         {
             Either::First(Ok(())) if buf == handshake_magic => Ok(()),
             _ => Err(()),
@@ -167,7 +167,7 @@ pub async fn exchange_link_handshake(
             read_socket_exact(socket, &mut buf),
             Timer::after_millis(timeout_ms),
         )
-            .await
+        .await
         {
             Either::First(Ok(())) if buf == handshake_magic => {
                 write_socket(socket, handshake_magic).await
@@ -188,7 +188,7 @@ pub async fn connect_with_timeout(
         socket.connect((remote, port)),
         Timer::after_millis(timeout_ms),
     )
-        .await
+    .await
     {
         Either::First(Ok(())) => Ok(()),
         Either::First(Err(_)) | Either::Second(()) => {

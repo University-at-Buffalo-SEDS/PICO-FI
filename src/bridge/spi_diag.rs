@@ -1,7 +1,7 @@
 //! Shared SPI transport diagnostics for field debugging.
 
 use heapless::String;
-use portable_atomic::{AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicU8, AtomicU32, Ordering};
 
 const KIND_UNKNOWN: u8 = 0;
 const KIND_IDLE: u8 = 1;

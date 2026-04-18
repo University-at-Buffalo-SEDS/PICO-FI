@@ -11,12 +11,12 @@ mod shell;
 mod storage;
 
 use bridge::commands::{set_led_state, take_led_activity, take_led_command};
-use bridge::i2c_task::{i2c_poll_task, I2cPacket};
+use bridge::i2c_task::{I2cPacket, i2c_poll_task};
 use bridge::overwrite_queue::OverwriteQueue;
 use bridge::runtime::BridgeRuntime;
 use bridge::spi_frame::SpiFrame;
 use bridge::spi_hw_task::spi_poll_task;
-use config::{BridgeConfig, BridgeMode, UartPort, UpstreamMode, COMPILED_USB_DEVICE_NAMES};
+use config::{BridgeConfig, BridgeMode, COMPILED_USB_DEVICE_NAMES, UartPort, UpstreamMode};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
@@ -30,10 +30,10 @@ use embassy_rp::peripherals::{
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb;
 use embassy_time::Timer;
+use embassy_usb::Builder as UsbBuilder;
 use embassy_usb::class::cdc_acm::{
     CdcAcmClass, Receiver as UsbReceiver, Sender as UsbSender, State as UsbCdcState,
 };
-use embassy_usb::Builder as UsbBuilder;
 use embassy_usb::{Config as UsbConfig, UsbDevice};
 #[allow(unused_imports)]
 use panic_halt as _;
@@ -278,7 +278,7 @@ async fn app(spawner: Spawner) {
         &mut config_storage,
         initial_config,
     )
-        .await;
+    .await;
     if let Some(uart) = uart.as_mut() {
         let _ = drain_uart_rx(uart, 10, 100).await;
     }
@@ -289,7 +289,7 @@ async fn app(spawner: Spawner) {
                     .take()
                     .expect("heartbeat mode requires ownership of the status LED"),
             )
-                .expect("heartbeat task token allocation failed"),
+            .expect("heartbeat task token allocation failed"),
         );
     }
 
@@ -318,7 +318,7 @@ async fn app(spawner: Spawner) {
                 &I2C_FRAME_QUEUE,
                 &I2C_RESPONSE_QUEUE,
             )
-                .expect("i2c controller task token allocation failed"),
+            .expect("i2c controller task token allocation failed"),
         );
         Some(())
     } else {
@@ -346,7 +346,7 @@ async fn app(spawner: Spawner) {
                 &SPI_FRAME_QUEUE,
                 &SPI_RESPONSE_QUEUE,
             )
-                .expect("spi controller task token allocation failed"),
+            .expect("spi controller task token allocation failed"),
         );
         Some(())
     } else {
@@ -400,7 +400,7 @@ async fn app(spawner: Spawner) {
         p.DMA_CH1,
         bridge_config,
     )
-        .await
+    .await
     {
         Ok(stack) => stack,
         Err(err) => loop {
@@ -430,7 +430,7 @@ async fn app(spawner: Spawner) {
         &SPI_FRAME_QUEUE,
         &SPI_RESPONSE_QUEUE,
     )
-        .await;
+    .await;
 
     let _ = result;
 
@@ -475,7 +475,7 @@ async fn run_bridge_mode(
                 bridge_config,
                 runtime,
             )
-                .await
+            .await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
             bridge::uart::run_server(
@@ -485,7 +485,7 @@ async fn run_bridge_mode(
                 bridge_config,
                 runtime,
             )
-                .await
+            .await
         }
         (BridgeMode::TcpClient { host, port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
             Some(_) => {
@@ -512,7 +512,7 @@ async fn run_bridge_mode(
                         bridge_config,
                         runtime,
                     )
-                        .await
+                    .await
                 }
                 _ => Err(()),
             }
@@ -538,7 +538,7 @@ async fn run_bridge_mode(
                     spi_rx,
                     spi_tx,
                 )
-                    .await
+                .await
             }
             None => Err(()),
         },
@@ -553,7 +553,7 @@ async fn run_bridge_mode(
                     spi_rx,
                     spi_tx,
                 )
-                    .await
+                .await
             }
             None => Err(()),
         },
@@ -568,7 +568,7 @@ async fn run_bridge_mode(
                 port,
                 status_led.expect("test client mode requires a status LED"),
             )
-                .await
+            .await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Test) => {
             bridge::test::run_server(
@@ -577,7 +577,7 @@ async fn run_bridge_mode(
                 port,
                 status_led.expect("test server mode requires a status LED"),
             )
-                .await
+            .await
         }
     }
 }
@@ -623,7 +623,7 @@ async fn spi_controller_task(
         tx,
         rx_resp,
     )
-        .await
+    .await
 }
 
 /// Starts the Embassy executor and launches the async application task.

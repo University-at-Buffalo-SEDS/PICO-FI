@@ -7,16 +7,16 @@ use crate::bridge::spi_frame::SpiFrame;
 use crate::bridge::spi_pio::{PioSpiTransportState, TransactionResult};
 use crate::config::BridgeConfig;
 use crate::protocol::i2c::{
-    make_response_frame, parse_request_frame, RequestFrame, FRAME_SIZE, REQ_COMMAND_MAGIC,
-    REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
+    FRAME_HEADER_SIZE, FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC,
+    RESP_DATA_MAGIC, RequestFrame, make_response_frame, parse_request_frame,
 };
 use core::hint::spin_loop;
 use embassy_executor::Spawner;
 use embassy_futures::yield_now;
+use embassy_rp::Peri;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, SPI1};
 use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
-use embassy_rp::Peri;
 use embassy_time::Timer;
 use portable_atomic::AtomicBool;
 
@@ -304,13 +304,16 @@ fn cs_asserted() -> bool {
 }
 
 fn is_default_empty_data_response(frame: &[u8; FRAME_SIZE]) -> bool {
-    frame[0] == RESP_DATA_MAGIC && frame[1] == 0
+    frame[0] == REQ_DATA_MAGIC
+        && frame[1] == RESP_DATA_MAGIC
+        && u16::from_le_bytes([frame[2], frame[3]]) == 0
 }
 
 fn should_preserve_staged_response(frame: &[u8; FRAME_SIZE], written: usize) -> bool {
-    match frame[0] {
-        RESP_COMMAND_MAGIC => written < frame[1] as usize + 2,
-        RESP_DATA_MAGIC if frame[1] != 0 => written < frame[1] as usize + 2,
+    let len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+    match (frame[0], frame[1]) {
+        (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC) => written < len + FRAME_HEADER_SIZE,
+        (REQ_DATA_MAGIC, RESP_DATA_MAGIC) if len != 0 => written < len + FRAME_HEADER_SIZE,
         _ => false,
     }
 }
@@ -330,8 +333,8 @@ fn render_spi_diag(
 }
 
 fn expected_len_from_frame(frame: &[u8; FRAME_SIZE], received: usize) -> usize {
-    if received >= 2 {
-        (frame[1] as usize + 2).min(FRAME_SIZE)
+    if received >= FRAME_HEADER_SIZE {
+        (u16::from_le_bytes([frame[2], frame[3]]) as usize + FRAME_HEADER_SIZE).min(FRAME_SIZE)
     } else {
         0
     }
@@ -436,14 +439,19 @@ fn pull_queued_response(
 }
 
 fn is_strict_forward_frame(frame: &[u8; FRAME_SIZE]) -> bool {
-    if !matches!(frame[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+    if !matches!(
+        (frame[0], frame[1]),
+        (REQ_DATA_MAGIC, RESP_DATA_MAGIC) | (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC)
+    ) {
         return false;
     }
-    let len = frame[1] as usize;
-    if len > FRAME_SIZE - 2 {
+    let len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+    if len > FRAME_SIZE - FRAME_HEADER_SIZE {
         return false;
     }
-    frame[2 + len..].iter().all(|&byte| byte == 0)
+    frame[FRAME_HEADER_SIZE + len..]
+        .iter()
+        .all(|&byte| byte == 0)
 }
 
 fn extract_ascii_command(frame: &[u8; FRAME_SIZE]) -> Option<&str> {

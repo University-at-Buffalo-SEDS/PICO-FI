@@ -3,6 +3,10 @@
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::config::BridgeConfig;
+use crate::protocol::i2c::{
+    REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, build_frame_into,
+    parse_request_bytes,
+};
 use embassy_futures::yield_now;
 use embassy_rp::i2c_slave::{Command, I2cSlave, ReadStatus};
 use embassy_rp::peripherals::I2C0;
@@ -28,7 +32,7 @@ const FLAG_START: u8 = 0x01;
 const FLAG_END: u8 = 0x02;
 
 const PARTIAL_PACKET_TIMEOUT: Duration = Duration::from_millis(50);
-pub const I2C_PACKET_MAX: usize = 1024;
+pub const I2C_PACKET_MAX: usize = 4096;
 const INVALID_SLOT_MSG: &[u8] = b"error invalid i2c slot";
 const INVALID_KIND_MSG: &[u8] = b"error invalid i2c kind";
 const OVERSIZE_MSG: &[u8] = b"error i2c payload too large";
@@ -214,8 +218,35 @@ impl TxPacketState {
 
     fn stage_bridge_packet(&mut self, transfer_id: u16, packet: I2cPacket) {
         match packet.kind {
-            KIND_DATA | KIND_COMMAND | KIND_ERROR => {
-                self.stage(packet.kind, transfer_id, packet.payload.as_slice())
+            KIND_DATA => {
+                let mut framed = [0u8; I2C_PACKET_MAX];
+                if let Some(len) =
+                    build_frame_into(RESP_DATA_MAGIC, packet.payload.as_slice(), &mut framed)
+                {
+                    self.stage(packet.kind, transfer_id, &framed[..len])
+                } else {
+                    self.stage_error(transfer_id, OVERSIZE_MSG)
+                }
+            }
+            KIND_COMMAND => {
+                let mut framed = [0u8; I2C_PACKET_MAX];
+                if let Some(len) =
+                    build_frame_into(RESP_COMMAND_MAGIC, packet.payload.as_slice(), &mut framed)
+                {
+                    self.stage(packet.kind, transfer_id, &framed[..len])
+                } else {
+                    self.stage_error(transfer_id, OVERSIZE_MSG)
+                }
+            }
+            KIND_ERROR => {
+                let mut framed = [0u8; I2C_PACKET_MAX];
+                if let Some(len) =
+                    build_frame_into(RESP_COMMAND_MAGIC, packet.payload.as_slice(), &mut framed)
+                {
+                    self.stage(packet.kind, transfer_id, &framed[..len])
+                } else {
+                    self.stage_error(transfer_id, OVERSIZE_MSG)
+                }
             }
             _ => self.stage_error(transfer_id, INVALID_SLOT_MSG),
         };
@@ -359,33 +390,74 @@ fn process_complete_packet(
     tx_packet: &mut TxPacketState,
     tx: &'static OverwriteQueue<I2cPacket, 8>,
 ) {
-    match kind {
-        KIND_COMMAND => {
-            if looks_like_local_command(payload) {
-                let line = trim_ascii_line(payload);
+    match parse_request_bytes(payload) {
+        Some(RequestFrame::Command(command_payload)) => {
+            if looks_like_local_command(command_payload) {
+                let line = trim_ascii_line(command_payload);
                 let response = render_local_bridge_command(bridge_config, link_active, line);
-                tx_packet.stage(
-                    KIND_COMMAND,
-                    nonzero_transfer_id(transfer_id),
-                    response.as_bytes(),
-                );
-            } else if let Ok(packet) = make_data_packet(payload) {
+                let mut framed = [0u8; I2C_PACKET_MAX];
+                if let Some(len) =
+                    build_frame_into(RESP_COMMAND_MAGIC, response.as_bytes(), &mut framed)
+                {
+                    tx_packet.stage(
+                        KIND_COMMAND,
+                        nonzero_transfer_id(transfer_id),
+                        &framed[..len],
+                    );
+                } else {
+                    tx_packet.stage_error(nonzero_transfer_id(transfer_id), OVERSIZE_MSG);
+                }
+            } else if let Ok(packet) = make_packet(KIND_DATA, command_payload) {
                 tx.push_overwrite(packet);
             } else {
                 tx_packet.stage_error(nonzero_transfer_id(transfer_id), OVERSIZE_MSG);
             }
         }
-        KIND_DATA => {
-            if payload.is_empty() {
+        Some(RequestFrame::Data(data_payload)) => {
+            if data_payload.is_empty() {
                 return;
             }
-            if let Ok(packet) = make_data_packet(payload) {
+            if let Ok(packet) = make_packet(KIND_DATA, data_payload) {
                 tx.push_overwrite(packet);
             } else {
                 tx_packet.stage_error(nonzero_transfer_id(transfer_id), OVERSIZE_MSG);
             }
         }
-        _ => tx_packet.stage_error(nonzero_transfer_id(transfer_id), INVALID_KIND_MSG),
+        None => match kind {
+            KIND_COMMAND => {
+                if looks_like_local_command(payload) {
+                    let line = trim_ascii_line(payload);
+                    let response = render_local_bridge_command(bridge_config, link_active, line);
+                    let mut framed = [0u8; I2C_PACKET_MAX];
+                    if let Some(len) =
+                        build_frame_into(REQ_COMMAND_MAGIC, response.as_bytes(), &mut framed)
+                    {
+                        tx_packet.stage(
+                            KIND_COMMAND,
+                            nonzero_transfer_id(transfer_id),
+                            &framed[..len],
+                        );
+                    } else {
+                        tx_packet.stage_error(nonzero_transfer_id(transfer_id), OVERSIZE_MSG);
+                    }
+                } else if let Ok(packet) = make_packet(KIND_DATA, payload) {
+                    tx.push_overwrite(packet);
+                } else {
+                    tx_packet.stage_error(nonzero_transfer_id(transfer_id), OVERSIZE_MSG);
+                }
+            }
+            KIND_DATA => {
+                if payload.is_empty() {
+                    return;
+                }
+                if let Ok(packet) = make_packet(KIND_DATA, payload) {
+                    tx.push_overwrite(packet);
+                } else {
+                    tx_packet.stage_error(nonzero_transfer_id(transfer_id), OVERSIZE_MSG);
+                }
+            }
+            _ => tx_packet.stage_error(nonzero_transfer_id(transfer_id), INVALID_KIND_MSG),
+        },
     }
 }
 
@@ -491,11 +563,11 @@ fn encode_slot(
     raw
 }
 
-fn make_data_packet(payload: &[u8]) -> Result<I2cPacket, ()> {
+fn make_packet(kind: u8, payload: &[u8]) -> Result<I2cPacket, ()> {
     let mut data = Vec::<u8, I2C_PACKET_MAX>::new();
     data.extend_from_slice(payload).map_err(|_| ())?;
     Ok(I2cPacket {
-        kind: KIND_DATA,
+        kind,
         payload: data,
     })
 }
@@ -503,8 +575,8 @@ fn make_data_packet(payload: &[u8]) -> Result<I2cPacket, ()> {
 fn looks_like_local_command(payload: &[u8]) -> bool {
     payload.first() == Some(&b'/')
         && payload
-        .iter()
-        .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
+            .iter()
+            .all(|&byte| byte == b'\n' || byte == b'\r' || (32..=126).contains(&byte))
 }
 
 fn nonzero_transfer_id(value: u16) -> u16 {

@@ -1,10 +1,10 @@
 //! UART-facing configuration shell and basic line output helpers.
 
 use crate::config::{
-    apply_command, parse_command, render_config, BridgeConfig, Command, UpstreamMode,
+    BridgeConfig, Command, UpstreamMode, apply_command, parse_command, render_config,
 };
 use crate::storage::ConfigStorage;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};

@@ -1,16 +1,16 @@
 //! I2C upstream bridge implementation.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::i2c_task::{I2cPacket, I2C_PACKET_MAX};
+use crate::bridge::i2c_task::{I2C_PACKET_MAX, I2cPacket};
 use crate::bridge::overwrite_queue::OverwriteQueue;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Timer};
 use heapless::Vec;
 use portable_atomic::{AtomicBool, Ordering};
@@ -52,8 +52,8 @@ pub async fn run_client(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-            .await
-            .is_err()
+        .await
+        .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -69,7 +69,7 @@ pub async fn run_client(
             i2c_rx,
             i2c_tx,
         )
-            .await;
+        .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -102,8 +102,8 @@ pub async fn run_server(
             runtime.handshake_magic,
             runtime.handshake_timeout_ms,
         )
-            .await
-            .is_err()
+        .await
+        .is_err()
         {
             socket.abort();
             let _ = socket.flush().await;
@@ -119,7 +119,7 @@ pub async fn run_server(
             i2c_rx,
             i2c_tx,
         )
-            .await;
+        .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);

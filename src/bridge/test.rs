@@ -2,9 +2,9 @@
 
 use crate::bridge::commands::trim_ascii_line;
 use crate::net::write_socket;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_rp::gpio::Output;
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
@@ -58,7 +58,7 @@ async fn session(
         socket,
         b"commands: ping, led on, led off, led toggle, led blink <ms>, led status, help\r\n",
     )
-        .await?;
+    .await?;
 
     let mut net_buf = [0u8; 256];
     let mut led_on = false;

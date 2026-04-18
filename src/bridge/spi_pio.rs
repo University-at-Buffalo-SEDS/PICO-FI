@@ -1,7 +1,8 @@
 //! Framing helpers for the upstream PIO-backed SPI slave transport.
 
 use crate::protocol::i2c::{
-    make_response_frame, FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_DATA_MAGIC,
+    FRAME_HEADER_SIZE, FRAME_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC,
+    RESP_DATA_MAGIC, make_response_frame,
 };
 /// Result of one CS-bounded SPI transaction as seen by the future PIO backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,8 +55,9 @@ impl PioSpiTransportState {
         let mut preview = [0u8; 8];
         let preview_len = scan_len.min(preview.len());
         preview[..preview_len].copy_from_slice(&rx_frame[..preview_len]);
-        let expected = if received >= 2 || (rx_frame[0] != 0 || rx_frame[1] != 0) {
-            (rx_frame[1] as usize + 2).min(FRAME_SIZE)
+        let expected = if received >= FRAME_HEADER_SIZE || rx_frame[..2] != [0, 0] {
+            (u16::from_le_bytes([rx_frame[2], rx_frame[3]]) as usize + FRAME_HEADER_SIZE)
+                .min(FRAME_SIZE)
         } else {
             FRAME_SIZE
         };
@@ -82,7 +84,10 @@ fn normalize_request_frame(
 ) -> ([u8; FRAME_SIZE], usize) {
     let received = received.min(FRAME_SIZE);
     let scan_len = received.max(8).min(FRAME_SIZE);
-    if matches!(rx_frame[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+    if matches!(
+        (rx_frame[0], rx_frame[1]),
+        (REQ_DATA_MAGIC, RESP_DATA_MAGIC) | (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC)
+    ) {
         return (*rx_frame, received);
     }
 
@@ -93,7 +98,13 @@ fn normalize_request_frame(
     }
 
     for offset in 1..scan_len {
-        if !matches!(rx_frame[offset], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
+        if !matches!(
+            (
+                rx_frame[offset],
+                rx_frame.get(offset + 1).copied().unwrap_or(0)
+            ),
+            (REQ_DATA_MAGIC, RESP_DATA_MAGIC) | (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC)
+        ) {
             continue;
         }
 
@@ -117,7 +128,7 @@ fn recover_missing_magic_command_frame(
     scan_len: usize,
 ) -> Option<([u8; FRAME_SIZE], usize)> {
     let len = rx_frame[0] as usize;
-    if len == 0 || len > FRAME_SIZE - 2 {
+    if len == 0 || len > FRAME_SIZE - FRAME_HEADER_SIZE {
         return None;
     }
     if rx_frame[1] as usize != len {
@@ -130,10 +141,11 @@ fn recover_missing_magic_command_frame(
 
     let mut normalized = [0u8; FRAME_SIZE];
     normalized[0] = REQ_COMMAND_MAGIC;
-    normalized[1] = len as u8;
-    normalized[2..2 + len].copy_from_slice(&rx_frame[2..2 + len]);
+    normalized[1] = RESP_COMMAND_MAGIC;
+    normalized[2..4].copy_from_slice(&(len as u16).to_le_bytes());
+    normalized[4..4 + len].copy_from_slice(&rx_frame[2..2 + len]);
 
-    let adjusted_received = (len + 2).min(FRAME_SIZE).max(received);
+    let adjusted_received = (len + FRAME_HEADER_SIZE).min(FRAME_SIZE).max(received);
     Some((normalized, adjusted_received))
 }
 
