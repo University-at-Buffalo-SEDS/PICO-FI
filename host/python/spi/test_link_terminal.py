@@ -73,8 +73,8 @@ class TimingSensitiveBus:
         if not self._stable():
             return bytes(lt.FRAME_SIZE)
         magic = raw[0]
-        payload_len = raw[1]
-        payload = bytes(raw[2: 2 + payload_len])
+        payload_len = int.from_bytes(raw[2:4], "little")
+        payload = bytes(raw[lt.FRAME_HEADER_SIZE:lt.FRAME_HEADER_SIZE + payload_len])
         if magic == lt.REQ_COMMAND_MAGIC and payload.startswith(b"/link"):
             return frame(lt.RESP_COMMAND_MAGIC, b"link up")
         return frame(lt.RESP_DATA_MAGIC, b"")
@@ -97,8 +97,8 @@ class RetryingCommandBus:
 
     def write_frame(self, raw: bytes) -> bytes:
         magic = raw[0]
-        payload_len = raw[1]
-        payload = bytes(raw[2: 2 + payload_len])
+        payload_len = int.from_bytes(raw[2:4], "little")
+        payload = bytes(raw[lt.FRAME_HEADER_SIZE:lt.FRAME_HEADER_SIZE + payload_len])
         if magic == lt.REQ_COMMAND_MAGIC and payload.startswith(b"/link"):
             self.command_writes += 1
             if self.command_writes == 1:

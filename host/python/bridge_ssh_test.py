@@ -22,8 +22,11 @@ TELEMETRY_CLI = REPO_ROOT / "host/python/telemetry_cli.py"
 SPI_TEST_DIR = REPO_ROOT / "host/python/spi"
 REMOTE_SPI_STAGE = "/tmp/pico-fi-spi-test"
 LINK_HANDSHAKE_MAGIC = b"PICOFI1"
-FRAME_SIZE = 258
-PAYLOAD_MAX = FRAME_SIZE - 2
+FRAME_HEADER_SIZE = 4
+PAYLOAD_MAX = 4096
+UART_FRAME_MAX = FRAME_HEADER_SIZE + PAYLOAD_MAX
+SPI_FRAME_SIZE = 260
+SPI_PAYLOAD_MAX = SPI_FRAME_SIZE - FRAME_HEADER_SIZE
 REQ_DATA_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
@@ -55,21 +58,28 @@ def format_bytes(data: bytes, limit: int = 16) -> str:
 
 def build_frame(payload: bytes, magic: int) -> bytes:
     payload = payload[:PAYLOAD_MAX]
-    frame = bytearray(FRAME_SIZE)
+    frame = bytearray(FRAME_HEADER_SIZE + len(payload))
     frame[0] = magic
-    frame[1] = len(payload)
-    frame[2: 2 + len(payload)] = payload
+    frame[1] = RESP_COMMAND_MAGIC if magic == REQ_COMMAND_MAGIC else RESP_DATA_MAGIC
+    frame[2:4] = len(payload).to_bytes(2, "little")
+    frame[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + len(payload)] = payload
     return bytes(frame)
 
 
 def parse_frame(frame: bytes) -> tuple[int, bytes]:
-    if len(frame) != FRAME_SIZE:
+    if len(frame) < FRAME_HEADER_SIZE:
         return 0, b""
-    magic = frame[0]
-    length = frame[1]
-    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
+    first, second = frame[0], frame[1]
+    if (first, second) == (REQ_DATA_MAGIC, RESP_DATA_MAGIC):
+        magic = RESP_DATA_MAGIC
+    elif (first, second) == (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC):
+        magic = RESP_COMMAND_MAGIC
+    else:
         return 0, b""
-    return magic, bytes(frame[2: 2 + length])
+    length = int.from_bytes(frame[2:4], "little")
+    if length > PAYLOAD_MAX or len(frame) < FRAME_HEADER_SIZE + length:
+        return 0, b""
+    return magic, bytes(frame[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + length])
 
 
 class LocalUartSession:
@@ -109,15 +119,28 @@ class LocalUartSession:
 
     def _read_frame(self, timeout_s: float) -> bytes | None:
         deadline = time.monotonic() + timeout_s
-        buf = bytearray()
-        while time.monotonic() < deadline and len(buf) < FRAME_SIZE:
-            chunk = self.ser.read(FRAME_SIZE - len(buf))
+        header = bytearray()
+        while time.monotonic() < deadline and len(header) < FRAME_HEADER_SIZE:
+            chunk = self.ser.read(FRAME_HEADER_SIZE - len(header))
             if chunk:
-                buf.extend(chunk)
-        if len(buf) == FRAME_SIZE:
-            return bytes(buf)
-        if buf:
-            self._record(f"short frame {len(buf)} bytes: {format_bytes(bytes(buf))}")
+                header.extend(chunk)
+        if len(header) != FRAME_HEADER_SIZE:
+            if header:
+                self._record(f"short header {len(header)} bytes: {format_bytes(bytes(header))}")
+            return None
+        length = int.from_bytes(header[2:4], "little")
+        if length > PAYLOAD_MAX:
+            self._record(f"oversize frame length {length}: {format_bytes(bytes(header))}")
+            return bytes(header)
+        payload = bytearray()
+        while time.monotonic() < deadline and len(payload) < length:
+            chunk = self.ser.read(length - len(payload))
+            if chunk:
+                payload.extend(chunk)
+        if len(payload) == length:
+            return bytes(header + payload)
+        if payload:
+            self._record(f"short payload {len(payload)}/{length} bytes: {format_bytes(bytes(header + payload))}")
         return None
 
     def _send_frame(self, magic: int, payload: bytes) -> None:

@@ -13,6 +13,7 @@ try:
     from .raw import FRAME_SIZE, open_bus
     from .test import (
         COMMAND_POLL_LIMIT,
+        PAYLOAD_MAX,
         PULL_COMMAND,
         REQ_COMMAND_MAGIC,
         REQ_MAGIC,
@@ -30,6 +31,7 @@ except ImportError:
     from raw import FRAME_SIZE, open_bus
     from test import (
         COMMAND_POLL_LIMIT,
+        PAYLOAD_MAX,
         PULL_COMMAND,
         REQ_COMMAND_MAGIC,
         REQ_MAGIC,
@@ -40,7 +42,7 @@ except ImportError:
 
 
 class SpiRouterAdapter:
-    payload_limit = FRAME_SIZE - 2
+    payload_limit = PAYLOAD_MAX
     send_poll_attempts = 2
     send_poll_sleep_s = 0.002
     poll_sleep_s = 0.002

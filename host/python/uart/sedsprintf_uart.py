@@ -10,6 +10,14 @@ import serial
 import sys
 import time
 
+try:
+    from .test import REQ_DATA_MAGIC, RESP_DATA_MAGIC, build_frame, parse_frame, read_frame
+except ImportError:
+    import os
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test import REQ_DATA_MAGIC, RESP_DATA_MAGIC, build_frame, parse_frame, read_frame
+
 
 def load_sedsprintf():
     try:
@@ -60,16 +68,11 @@ def format_bytes(data: bytes, limit: int = 32) -> str:
 
 
 def read_reply(ser: serial.Serial, timeout_s: float) -> bytes:
-    deadline = time.monotonic() + timeout_s
-    buf = bytearray()
-    while time.monotonic() < deadline:
-        chunk = ser.read(512)
-        if chunk:
-            buf.extend(chunk)
-            continue
-        if buf:
-            break
-    return bytes(buf)
+    frame = read_frame(ser, timeout_s)
+    magic, _, payload = parse_frame(frame)
+    if magic == RESP_DATA_MAGIC:
+        return payload
+    return b""
 
 
 def main() -> int:
@@ -148,9 +151,9 @@ def main() -> int:
 
     with open_serial(args.port, args.baud) as ser:
         ser.reset_input_buffer()
-        ser.write(encoded)
+        ser.write(build_frame(encoded, REQ_DATA_MAGIC))
         ser.flush()
-        print(f"Sent {len(encoded)} bytes on {args.port} @ {args.baud}")
+        print(f"Sent {len(encoded)} payload bytes on {args.port} @ {args.baud}")
 
         if not args.read_reply:
             return 0

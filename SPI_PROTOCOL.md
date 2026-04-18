@@ -39,23 +39,28 @@ Important constraint:
 
 ## Transfer Format
 
-Each Linux SPI transaction is exactly one `258` byte framed transfer:
+Each SPI request/response frame is encoded as `header + payload`:
 
-- byte `0`: magic
-- byte `1`: payload length `N`
-- bytes `2..(2+N)`: payload
-- remaining bytes: zero padding
+- byte `0`: request magic
+- byte `1`: response/sync magic
+- bytes `2..3`: payload length `N`, little-endian `u16`
+- bytes `4..(4+N)`: payload
 
 Constants:
 
-- frame size: `258`
+- maximum frame buffer: `260`
+- header size: `4`
 - max payload: `256`
 - request data magic: `0xA5`
 - request command magic: `0xA6`
 - response data magic: `0x5A`
 - response command magic: `0x5B`
 
-One Pico response is returned on the same full-duplex transfer, or on a later poll if the response is queued.
+Data frames use the sync pair `0xA5 0x5A`. Command frames use `0xA6 0x5B`.
+
+One Pico response is returned on the same full-duplex transaction, or on a later poll if the response is queued. The
+Pico stages only the active `header + payload_len` bytes; host tools may still clock a larger poll transaction when
+they do not know the queued response length in advance.
 
 ## Semantics
 
@@ -94,22 +99,29 @@ The host tools use:
 
 The relevant logic is in [src/bridge/spi.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi.rs).
 
+Queue behavior:
+
+- SPI ingress and response queues drop whole frames, never individual bytes
+- each queue is capped at `32` frames and `8192` queued frame bytes
+- queued frames store only the active `header + payload` bytes
+- if a new frame would exceed the byte cap, old frames are dropped until it fits
+- if a single frame is larger than the byte cap, that frame is dropped
+
 ## Minimal Driver Algorithm
 
 To send bridged data:
 
-1. Build a `258` byte frame with magic `0xA5`.
-2. Set byte `1` to payload length.
-3. Copy the payload into bytes `2..`.
-4. Zero-fill the rest.
-5. Perform one `258` byte SPI transfer.
-6. Parse the returned `258` byte response frame.
+1. Build a frame with sync bytes `0xA5 0x5A`.
+2. Write the payload length as little-endian `u16`.
+3. Copy the payload into bytes `4..`.
+4. Perform one SPI transfer containing the active `4 + N` bytes.
+5. Parse any returned response frame.
 
 To fetch pending inbound data:
 
 1. Send a `0xA6` frame whose payload is `/pull\n`.
 2. If the same transfer returns `0x5A` with non-zero length, consume it.
-3. Otherwise keep issuing additional `258` byte transfers until a queued `0x5A` with data arrives or your timeout
+3. Otherwise keep issuing poll transfers until a queued `0x5A` with data arrives or your timeout
    expires.
 
 To issue a local Pico command:
@@ -122,19 +134,19 @@ To issue a local Pico command:
 Send bridged payload `hello`:
 
 ```text
-a5 05 68 65 6c 6c 6f 00 00 ...
+a5 5a 05 00 68 65 6c 6c 6f
 ```
 
 Poll inbound queue:
 
 ```text
-a6 06 2f 70 75 6c 6c 0a 00 ...
+a6 5b 06 00 2f 70 75 6c 6c 0a
 ```
 
 Send local command `/link\n`:
 
 ```text
-a6 06 2f 6c 69 6e 6b 0a 00 ...
+a6 5b 06 00 2f 6c 69 6e 6b 0a
 ```
 
 ## Response Timing Model
@@ -144,7 +156,7 @@ SPI is the most stateful host transport in this repo.
 Practical rules for driver authors:
 
 - treat every transaction as request plus possible reply
-- keep chip select asserted for the whole `258` byte transfer
+- keep chip select asserted for each complete `header + payload` frame
 - do not split a single frame across multiple SPI transactions
 - be prepared to poll after sends to retrieve queued inbound data or delayed command replies
 

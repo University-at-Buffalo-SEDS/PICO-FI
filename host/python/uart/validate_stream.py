@@ -8,8 +8,8 @@ import argparse
 import serial
 import time
 
-FRAME_SIZE = 258
-PAYLOAD_MAX = FRAME_SIZE - 2
+FRAME_HEADER_SIZE = 4
+PAYLOAD_MAX = 4096
 
 REQ_DATA_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
@@ -39,9 +39,7 @@ def format_bytes(data: bytes, limit: int = 32) -> str:
 
 
 def is_valid_magic(byte: int, mode: str) -> bool:
-    if mode == "request":
-        return byte in (REQ_DATA_MAGIC, REQ_COMMAND_MAGIC)
-    return byte in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC)
+    return byte in (REQ_DATA_MAGIC, REQ_COMMAND_MAGIC)
 
 
 class FirmwareStyleValidator:
@@ -58,37 +56,35 @@ class FirmwareStyleValidator:
 
         if len(self.buf) == 1:
             self.buf.append(byte)
-            if byte > PAYLOAD_MAX:
-                msg = f"invalid length {byte}, resync"
+            expected_second = RESP_COMMAND_MAGIC if self.buf[0] == REQ_COMMAND_MAGIC else RESP_DATA_MAGIC
+            if byte != expected_second:
+                msg = f"invalid second header byte 0x{byte:02x}, resync"
                 if is_valid_magic(byte, self.mode):
                     self.buf[:] = bytes([byte])
                     return ("resync", msg + f" on magic 0x{byte:02x}")
                 self.buf.clear()
                 return ("reject", msg)
-            return ("len", f"length={byte}")
+            return ("pair", f"header pair 0x{self.buf[0]:02x} 0x{byte:02x}")
 
         self.buf.append(byte)
-        if len(self.buf) < FRAME_SIZE:
+        if len(self.buf) < FRAME_HEADER_SIZE:
             return None
 
-        frame = bytes(self.buf)
-        self.buf.clear()
-
-        payload_len = frame[1]
+        payload_len = int.from_bytes(self.buf[2:4], "little")
         if payload_len > PAYLOAD_MAX:
+            frame = bytes(self.buf)
+            self.buf.clear()
             return ("reject", f"frame length out of range: {payload_len}")
 
-        pad = frame[2 + payload_len:]
-        if any(byte != 0 for byte in pad):
-            first_bad = next(idx for idx, value in enumerate(pad, start=2 + payload_len) if value != 0)
-            return (
-                "reject",
-                f"non-zero padding at offset {first_bad}: {frame[first_bad]:02x}; "
-                f"frame={format_bytes(frame, 48)}",
-            )
+        frame_len = FRAME_HEADER_SIZE + payload_len
+        if len(self.buf) < frame_len:
+            return None
+
+        frame = bytes(self.buf[:frame_len])
+        del self.buf[:frame_len]
 
         magic = frame[0]
-        payload = frame[2: 2 + payload_len]
+        payload = frame[FRAME_HEADER_SIZE:frame_len]
         try:
             rendered = payload.decode("utf-8")
             payload_text = f" text={rendered!r}"

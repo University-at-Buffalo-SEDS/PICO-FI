@@ -16,9 +16,20 @@ use std::time::Duration;
 
 const I2C_M_RD: u16 = 0x0001;
 const I2C_RDWR: c_ulong = 0x0707;
-const FRAME_SIZE: usize = 258;
-const PAYLOAD_MAX: usize = FRAME_SIZE - 2;
-const CHUNK_SIZE: usize = 32;
+const FRAME_HEADER_SIZE: usize = 4;
+const PAYLOAD_MAX: usize = 4092;
+const SLOT_SIZE: usize = 32;
+const SLOT_HEADER_SIZE: usize = 18;
+const SLOT_PAYLOAD_SIZE: usize = SLOT_SIZE - SLOT_HEADER_SIZE;
+const SLOT_MAGIC0: u8 = 0x49;
+const SLOT_MAGIC1: u8 = 0x32;
+const SLOT_VERSION: u8 = 1;
+const KIND_IDLE: u8 = 0x00;
+const KIND_DATA: u8 = 0x01;
+const KIND_COMMAND: u8 = 0x02;
+const KIND_ERROR: u8 = 0x7F;
+const FLAG_START: u8 = 0x01;
+const FLAG_END: u8 = 0x02;
 
 const REQ_DATA_MAGIC: u8 = 0xA5;
 const REQ_COMMAND_MAGIC: u8 = 0xA6;
@@ -81,6 +92,7 @@ pub struct I2cBackend {
     addr: u16,
     chunk_delay: Duration,
     initial_wait: Duration,
+    next_transfer_id: u16,
 }
 
 impl I2cBackend {
@@ -96,6 +108,7 @@ impl I2cBackend {
             addr,
             chunk_delay: Duration::from_millis(1),
             initial_wait: Duration::from_millis(10),
+            next_transfer_id: 1,
         })
     }
 
@@ -156,14 +169,26 @@ impl I2cBackend {
 
     fn write_request(&mut self, magic: u8, payload: &[u8]) -> Result<()> {
         let payload = &payload[..payload.len().min(PAYLOAD_MAX)];
-        let mut frame = Vec::with_capacity(2 + payload.len());
+        let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
         frame.push(magic);
-        frame.push(payload.len() as u8);
+        frame.push(if magic == REQ_COMMAND_MAGIC {
+            RESP_COMMAND_MAGIC
+        } else {
+            RESP_DATA_MAGIC
+        });
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
         frame.extend_from_slice(payload);
 
-        for chunk in frame.chunks(CHUNK_SIZE) {
-            self.transfer_write(chunk)?;
-            if chunk.len() == CHUNK_SIZE {
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1).max(1);
+        let kind = if magic == REQ_COMMAND_MAGIC {
+            KIND_COMMAND
+        } else {
+            KIND_DATA
+        };
+        for slot in encode_slots(kind, transfer_id, &frame) {
+            self.transfer_write(&slot)?;
+            if frame.len() > SLOT_PAYLOAD_SIZE {
                 thread::sleep(self.chunk_delay);
             }
         }
@@ -171,18 +196,51 @@ impl I2cBackend {
     }
 
     fn read_frame(&mut self) -> Result<Frame> {
-        let mut raw = [0u8; FRAME_SIZE];
-        let mut offset = 0usize;
-        while offset < FRAME_SIZE {
-            let read_len = (FRAME_SIZE - offset).min(CHUNK_SIZE);
-            let dst = &mut raw[offset..offset + read_len];
-            self.transfer_read(dst)?;
-            offset += read_len;
-            if offset < FRAME_SIZE {
-                thread::sleep(self.chunk_delay);
+        let mut active = false;
+        let mut kind = KIND_IDLE;
+        let mut transfer_id = 0u16;
+        let mut total_len = 0usize;
+        let mut next_offset = 0usize;
+        let mut raw = Vec::new();
+
+        loop {
+            let mut slot = [0u8; SLOT_SIZE];
+            self.transfer_read(&mut slot)?;
+            if let Some(decoded) = decode_slot(&slot)? {
+                if (decoded.flags & FLAG_START) != 0 {
+                    active = true;
+                    kind = decoded.kind;
+                    transfer_id = decoded.transfer_id;
+                    total_len = decoded.total_len;
+                    next_offset = decoded.data.len();
+                    raw.clear();
+                    raw.extend_from_slice(&decoded.data);
+                } else if active
+                    && decoded.kind == kind
+                    && decoded.transfer_id == transfer_id
+                    && decoded.offset == next_offset
+                {
+                    next_offset += decoded.data.len();
+                    raw.extend_from_slice(&decoded.data);
+                } else {
+                    return Err(Error::InvalidFrame {
+                        magic: decoded.kind,
+                        len: decoded.total_len,
+                    });
+                }
+
+                if (decoded.flags & FLAG_END) != 0 {
+                    if next_offset != total_len {
+                        return Err(Error::InvalidFrame {
+                            magic: kind,
+                            len: total_len,
+                        });
+                    }
+                    return parse_response(kind, &raw);
+                }
             }
+            thread::sleep(self.chunk_delay);
         }
-        parse_response(&raw)
     }
 
     fn transfer_write(&mut self, data: &[u8]) -> Result<()> {
@@ -219,19 +277,124 @@ impl I2cBackend {
     }
 }
 
-fn parse_response(raw: &[u8; FRAME_SIZE]) -> Result<Frame> {
-    let magic = raw[0];
-    let len = raw[1] as usize;
+fn parse_response(slot_kind: u8, raw: &[u8]) -> Result<Frame> {
+    if raw.len() < FRAME_HEADER_SIZE {
+        return Err(Error::InvalidFrame {
+            magic: slot_kind,
+            len: raw.len(),
+        });
+    }
+    let magic = match (raw[0], raw[1]) {
+        (REQ_DATA_MAGIC, RESP_DATA_MAGIC) => RESP_DATA_MAGIC,
+        (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC) => RESP_COMMAND_MAGIC,
+        _ => slot_kind,
+    };
+    let len = u16::from_le_bytes([raw[2], raw[3]]) as usize;
     if len > PAYLOAD_MAX {
         return Err(Error::InvalidFrame { magic, len });
     }
+    let payload_end = FRAME_HEADER_SIZE + len;
+    if payload_end > raw.len() {
+        return Err(Error::InvalidFrame { magic, len });
+    }
 
-    let payload = raw[2..2 + len].to_vec();
+    let payload = raw[FRAME_HEADER_SIZE..payload_end].to_vec();
     match magic {
         RESP_DATA_MAGIC => Ok(Frame::Data(payload)),
         RESP_COMMAND_MAGIC => Ok(Frame::Command(payload)),
         _ => Err(Error::InvalidFrame { magic, len }),
     }
+}
+
+struct DecodedSlot {
+    kind: u8,
+    flags: u8,
+    transfer_id: u16,
+    offset: usize,
+    total_len: usize,
+    data: Vec<u8>,
+}
+
+fn encode_slots(kind: u8, transfer_id: u16, payload: &[u8]) -> Vec<[u8; SLOT_SIZE]> {
+    let mut out = Vec::new();
+    let total_len = payload.len();
+    let mut offset = 0usize;
+    loop {
+        let end = (offset + SLOT_PAYLOAD_SIZE).min(total_len);
+        let chunk = &payload[offset..end];
+        let mut flags = 0u8;
+        if offset == 0 {
+            flags |= FLAG_START;
+        }
+        if end >= total_len {
+            flags |= FLAG_END;
+        }
+        out.push(encode_slot(
+            kind,
+            flags,
+            transfer_id,
+            offset,
+            total_len,
+            chunk,
+        ));
+        if end >= total_len {
+            break;
+        }
+        offset = end;
+    }
+    out
+}
+
+fn encode_slot(
+    kind: u8,
+    flags: u8,
+    transfer_id: u16,
+    offset: usize,
+    total_len: usize,
+    data: &[u8],
+) -> [u8; SLOT_SIZE] {
+    let mut raw = [0u8; SLOT_SIZE];
+    raw[0] = SLOT_MAGIC0;
+    raw[1] = SLOT_MAGIC1;
+    raw[2] = SLOT_VERSION;
+    raw[3] = kind;
+    raw[4] = flags;
+    raw[6..10].copy_from_slice(&(offset as u32).to_le_bytes());
+    raw[10..14].copy_from_slice(&(total_len as u32).to_le_bytes());
+    raw[14..16].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    raw[16..18].copy_from_slice(&transfer_id.to_le_bytes());
+    raw[SLOT_HEADER_SIZE..SLOT_HEADER_SIZE + data.len()].copy_from_slice(data);
+    raw
+}
+
+fn decode_slot(raw: &[u8; SLOT_SIZE]) -> Result<Option<DecodedSlot>> {
+    if raw.iter().all(|&byte| byte == 0x00)
+        || raw.iter().all(|&byte| byte == 0xFF)
+        || raw[3] == KIND_IDLE
+    {
+        return Ok(None);
+    }
+    if raw[0] != SLOT_MAGIC0 || raw[1] != SLOT_MAGIC1 || raw[2] != SLOT_VERSION {
+        return Err(Error::InvalidFrame {
+            magic: raw[0],
+            len: raw.len(),
+        });
+    }
+    let data_len = u16::from_le_bytes([raw[14], raw[15]]) as usize;
+    if data_len > SLOT_PAYLOAD_SIZE {
+        return Err(Error::InvalidFrame {
+            magic: raw[3],
+            len: data_len,
+        });
+    }
+    Ok(Some(DecodedSlot {
+        kind: raw[3],
+        flags: raw[4],
+        transfer_id: u16::from_le_bytes([raw[16], raw[17]]),
+        offset: u32::from_le_bytes([raw[6], raw[7], raw[8], raw[9]]) as usize,
+        total_len: u32::from_le_bytes([raw[10], raw[11], raw[12], raw[13]]) as usize,
+        data: raw[SLOT_HEADER_SIZE..SLOT_HEADER_SIZE + data_len].to_vec(),
+    }))
 }
 
 #[allow(dead_code)]
@@ -246,21 +409,25 @@ mod tests {
 
     #[test]
     fn parses_command_frame() {
-        let mut raw = [0u8; FRAME_SIZE];
-        raw[0] = RESP_COMMAND_MAGIC;
-        raw[1] = 4;
-        raw[2..6].copy_from_slice(b"pong");
-        assert_eq!(parse_response(&raw).unwrap(), Frame::Command(b"pong".to_vec()));
+        let mut raw = Vec::new();
+        raw.push(REQ_COMMAND_MAGIC);
+        raw.push(RESP_COMMAND_MAGIC);
+        raw.extend_from_slice(&4u16.to_le_bytes());
+        raw.extend_from_slice(b"pong");
+        assert_eq!(
+            parse_response(KIND_COMMAND, &raw).unwrap(),
+            Frame::Command(b"pong".to_vec())
+        );
     }
 
     #[test]
     fn rejects_bad_magic() {
-        let mut raw = [0u8; FRAME_SIZE];
-        raw[0] = 0x00;
-        raw[1] = 0;
         assert!(matches!(
-            parse_response(&raw),
-            Err(Error::InvalidFrame { magic: 0x00, len: 0 })
+            parse_response(KIND_ERROR, &[]),
+            Err(Error::InvalidFrame {
+                magic: KIND_ERROR,
+                len: 0
+            })
         ));
     }
 }

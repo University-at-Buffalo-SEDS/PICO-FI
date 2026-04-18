@@ -9,8 +9,9 @@ import serial
 import sys
 import time
 
-FRAME_SIZE = 258
-PAYLOAD_MAX = FRAME_SIZE - 2
+FRAME_HEADER_SIZE = 4
+PAYLOAD_MAX = 4096
+FRAME_SIZE = FRAME_HEADER_SIZE + PAYLOAD_MAX
 REQ_DATA_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
@@ -38,32 +39,49 @@ def open_serial(port: str, speed: int) -> serial.Serial:
 
 def build_frame(payload: bytes, magic: int) -> bytes:
     payload = payload[:PAYLOAD_MAX]
-    frame = bytearray(FRAME_SIZE)
+    frame = bytearray(FRAME_HEADER_SIZE + len(payload))
     frame[0] = magic
-    frame[1] = len(payload)
-    frame[2: 2 + len(payload)] = payload
+    frame[1] = RESP_COMMAND_MAGIC if magic == REQ_COMMAND_MAGIC else RESP_DATA_MAGIC
+    frame[2:4] = len(payload).to_bytes(2, "little")
+    frame[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + len(payload)] = payload
     return bytes(frame)
 
 
 def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
-    if len(frame) != FRAME_SIZE:
+    if len(frame) < FRAME_HEADER_SIZE:
         return 0, 0, b""
-    magic = frame[0]
-    length = frame[1]
-    if magic not in (RESP_DATA_MAGIC, RESP_COMMAND_MAGIC) or length > PAYLOAD_MAX:
+    first, second = frame[0], frame[1]
+    if (first, second) == (REQ_DATA_MAGIC, RESP_DATA_MAGIC):
+        magic = RESP_DATA_MAGIC
+    elif (first, second) == (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC):
+        magic = RESP_COMMAND_MAGIC
+    else:
         return 0, 0, b""
-    payload = bytes(frame[2: 2 + length])
+    length = int.from_bytes(frame[2:4], "little")
+    if length > PAYLOAD_MAX or len(frame) < FRAME_HEADER_SIZE + length:
+        return 0, 0, b""
+    payload = bytes(frame[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + length])
     return magic, length, payload
+
+
+def read_exact(ser: serial.Serial, length: int, deadline: float) -> bytes:
+    buf = bytearray()
+    while time.monotonic() < deadline and len(buf) < length:
+        chunk = ser.read(length - len(buf))
+        if chunk:
+            buf.extend(chunk)
+    return bytes(buf)
 
 
 def read_frame(ser: serial.Serial, timeout_s: float) -> bytes:
     deadline = time.monotonic() + timeout_s
-    buf = bytearray()
-    while time.monotonic() < deadline and len(buf) < FRAME_SIZE:
-        chunk = ser.read(FRAME_SIZE - len(buf))
-        if chunk:
-            buf.extend(chunk)
-    return bytes(buf)
+    header = read_exact(ser, FRAME_HEADER_SIZE, deadline)
+    if len(header) != FRAME_HEADER_SIZE:
+        return header
+    length = int.from_bytes(header[2:4], "little")
+    if length > PAYLOAD_MAX:
+        return header
+    return header + read_exact(ser, length, deadline)
 
 
 def uart_exchange(
@@ -84,16 +102,16 @@ def uart_exchange(
             print(f"Sent: {format_bytes(tx)}...")
 
             rx = read_frame(ser, 2.0)
-            if len(rx) != FRAME_SIZE:
+            if len(rx) < FRAME_HEADER_SIZE:
                 if await_nonempty_data and magic == REQ_DATA_MAGIC and not payload:
                     for _ in range(DATA_POLL_LIMIT):
                         time.sleep(0.05)
                         ser.write(tx)
                         ser.flush()
                         rx = read_frame(ser, 0.5)
-                        if len(rx) == FRAME_SIZE:
+                        if len(rx) >= FRAME_HEADER_SIZE:
                             break
-                if len(rx) != FRAME_SIZE:
+                if len(rx) < FRAME_HEADER_SIZE:
                     print("ERROR: No UART frame response")
                     return 1
 
@@ -104,7 +122,7 @@ def uart_exchange(
                     ser.write(tx)
                     ser.flush()
                     rx = read_frame(ser, 0.5)
-                    if len(rx) != FRAME_SIZE:
+                    if len(rx) < FRAME_HEADER_SIZE:
                         continue
                     magic_val, length, body = parse_frame(rx)
                     if magic_val == RESP_DATA_MAGIC and body:

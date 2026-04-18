@@ -6,15 +6,15 @@ import argparse
 import time
 
 try:
-    from .raw import FRAME_SIZE, open_bus
+    from .raw import FRAME_HEADER_SIZE, FRAME_SIZE, open_bus
 except ImportError:
     import os
     import sys
 
     sys.path.append(os.path.dirname(__file__))
-    from raw import FRAME_SIZE, open_bus
+    from raw import FRAME_HEADER_SIZE, FRAME_SIZE, open_bus
 
-PAYLOAD_MAX = FRAME_SIZE - 2
+PAYLOAD_MAX = FRAME_SIZE - FRAME_HEADER_SIZE
 REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_MAGIC = 0x5A
@@ -27,28 +27,43 @@ DATA_POLL_LIMIT = 500
 PROBE_PAUSE_S = 0.02
 
 
+def header_for_magic(magic: int) -> tuple[int, int]:
+    if magic in (REQ_MAGIC, RESP_MAGIC):
+        return REQ_MAGIC, RESP_MAGIC
+    if magic in (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC):
+        return REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC
+    raise ValueError(f"unsupported frame magic: 0x{magic:02x}")
+
+
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
     payload = payload[:PAYLOAD_MAX]
-    frame = bytearray(FRAME_SIZE)
-    frame[0] = magic
-    frame[1] = len(payload)
-    frame[2:2 + len(payload)] = payload
+    h0, h1 = header_for_magic(magic)
+    frame = bytearray(FRAME_HEADER_SIZE + len(payload))
+    frame[0] = h0
+    frame[1] = h1
+    frame[2:4] = len(payload).to_bytes(2, "little")
+    frame[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + len(payload)] = payload
     return bytes(frame)
 
 
 def parse_frame(frame: bytes) -> tuple[int, int, bytes]:
-    if len(frame) != FRAME_SIZE:
+    if len(frame) < FRAME_HEADER_SIZE:
         return 0, 0, b""
-    for offset in range(0, min(2, FRAME_SIZE - 1)):
-        magic_val = frame[offset]
-        if magic_val not in (RESP_MAGIC, RESP_COMMAND_MAGIC):
+    for offset in range(0, min(2, len(frame) - (FRAME_HEADER_SIZE - 1))):
+        first = frame[offset]
+        second = frame[offset + 1]
+        if (first, second) == (REQ_MAGIC, RESP_MAGIC):
+            magic_val = RESP_MAGIC
+        elif (first, second) == (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC):
+            magic_val = RESP_COMMAND_MAGIC
+        else:
             continue
-        length = frame[offset + 1]
+        length = int.from_bytes(frame[offset + 2:offset + 4], "little")
         if length > PAYLOAD_MAX:
             continue
-        payload_start = offset + 2
+        payload_start = offset + FRAME_HEADER_SIZE
         payload_end = payload_start + length
-        if payload_end > FRAME_SIZE:
+        if payload_end > len(frame):
             continue
         return magic_val, length, bytes(frame[payload_start:payload_end])
     return 0, 0, b""

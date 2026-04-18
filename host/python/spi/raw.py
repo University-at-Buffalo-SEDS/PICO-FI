@@ -10,13 +10,16 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
         "error: spidev is required. Install it with `python3 -m pip install spidev`."
     ) from exc
 
-FRAME_SIZE = 258
+FRAME_SIZE = 260
+FRAME_HEADER_SIZE = 4
 REQ_MAGIC = 0xA5
+RESP_MAGIC = 0x5A
 
 
 def _empty_request_frame() -> bytes:
     frame = bytearray(FRAME_SIZE)
     frame[0] = REQ_MAGIC
+    frame[1] = RESP_MAGIC
     return bytes(frame)
 
 

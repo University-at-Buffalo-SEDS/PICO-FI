@@ -7,8 +7,8 @@ This document describes the current Pico-Fi I2C upstream transport as implemente
 - [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
 - [host/python/i2c/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/test.py)
 
-Unlike UART and SPI, I2C does not use a single fixed `258` byte wire frame. It uses chunked `32` byte slots that are
-reassembled into logical packets.
+Unlike UART and SPI, I2C does not use one contiguous wire frame. It uses chunked `32` byte slots that are reassembled
+into logical packets. Those logical packets carry the same `4` byte request/response header used by UART and SPI.
 
 ## Electrical Setup
 
@@ -95,6 +95,13 @@ Unknown kinds are answered with:
 
 - `KIND_ERROR`
 - payload `error invalid i2c frame`
+
+Queue behavior:
+
+- I2C ingress and response queues drop whole logical packets, never individual bytes
+- each queue is capped at `8` packets and `8192` queued payload bytes
+- if a new packet would exceed the byte cap, old packets are dropped until it fits
+- if a single packet is larger than the byte cap, that packet is dropped
 
 ## Minimal Driver Algorithm
 

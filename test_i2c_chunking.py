@@ -1,48 +1,33 @@
 #!/usr/bin/env python3
-"""
-Simple I2C chunking test - validates the 32-byte chunking logic
-"""
+"""Validate the current 32-byte slot chunking used by Pico-Fi I2C."""
 
-FRAME_SIZE = 258
-CHUNK_SIZE = 32
+from host.python.i2c.protocol import PAYLOAD_SIZE, SLOT_SIZE, decode_slot, encode_slots
 
 
-def test_chunking():
-    """Test that we can chunk 258 bytes into 32-byte pieces"""
-    test_data = bytes(range(256)) + b'\x00\x02'  # 258 bytes
+def main() -> int:
+    payload = bytes(range(64))
+    slots = encode_slots(payload, kind=0x01, transfer_id=1)
+    rebuilt = bytearray()
 
-    # Simulate sending in chunks
-    sent_chunks = []
-    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-        chunk = list(test_data[i:i + CHUNK_SIZE])
-        if chunk:
-            sent_chunks.append(len(chunk))
+    print(f"Logical payload: {len(payload)} bytes")
+    print(f"Slot size: {SLOT_SIZE} bytes")
+    print(f"Payload per slot: {PAYLOAD_SIZE} bytes")
+    print(f"Slots: {len(slots)}")
 
-    print(f"Total data: {FRAME_SIZE} bytes")
-    print(f"Chunk size: {CHUNK_SIZE} bytes max")
-    print(f"Chunks needed: {len(sent_chunks)}")
-    print(f"Chunk sizes: {sent_chunks}")
-    print(f"Total sent: {sum(sent_chunks)} bytes")
+    for index, raw in enumerate(slots, start=1):
+        slot = decode_slot(raw)
+        assert slot is not None
+        rebuilt.extend(slot.data)
+        print(
+            f"slot {index}: len={len(raw)} offset={slot.offset} "
+            f"data={len(slot.data)} flags=0x{slot.flags:02x}"
+        )
 
-    # Simulate receiving in chunks
-    received = bytearray()
-    for i in range(0, FRAME_SIZE, CHUNK_SIZE):
-        chunk_size = min(CHUNK_SIZE, FRAME_SIZE - len(received))
-        # Simulate receiving chunk_size bytes
-        chunk = test_data[i:i + chunk_size]
-        received.extend(chunk)
-
-    print(f"Total received: {len(received)} bytes")
-    print(f"Data match: {bytes(received) == test_data}")
-
-    if bytes(received) == test_data:
-        print("\n✅ Chunking logic is correct!")
-        return True
-    else:
-        print("\n❌ Chunking logic failed!")
-        return False
+    assert all(len(slot) == SLOT_SIZE for slot in slots)
+    assert bytes(rebuilt) == payload
+    print("I2C slot chunking test passed")
+    return 0
 
 
 if __name__ == "__main__":
-    success = test_chunking()
-    exit(0 if success else 1)
+    raise SystemExit(main())

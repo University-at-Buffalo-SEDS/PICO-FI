@@ -18,7 +18,10 @@ This directory contains the Linux and Python reference implementations for the P
 UART and SPI:
 
 - use the same logical request/response framing
-- frame size is `258` bytes
+- frame header is `4` bytes: request magic, response/sync magic, and little-endian `u16` payload length
+- UART frames are sent as exactly `header + payload`
+- SPI frames use the same logical header and a `260` byte maximum frame buffer; queued SPI frames store only
+  `header + payload`
 - request magics are `0xA5` for data and `0xA6` for commands
 - response magics are `0x5A` for data and `0x5B` for command replies
 
@@ -27,6 +30,13 @@ I2C:
 - uses `32` byte slots on the wire
 - reassembles those slots into logical packets
 - logical packet kinds are `KIND_DATA`, `KIND_COMMAND`, and `KIND_ERROR`
+
+Firmware queue behavior:
+
+- UART egress drops whole queued frames when its packet ring is full
+- I2C queues are capped at `8` packets and `8192` queued payload bytes
+- SPI queues are capped at `32` packets and `8192` queued frame bytes
+- oversized packets that cannot fit in the byte budget are dropped as whole packets
 
 Protocol details are documented in:
 

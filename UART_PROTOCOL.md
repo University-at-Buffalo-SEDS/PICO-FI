@@ -6,7 +6,7 @@ This document describes the current Pico-Fi UART upstream transport as implement
 - [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)
 - [host/python/uart/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/test.py)
 
-The UART runtime protocol is a fixed-size binary frame protocol. It is not line-oriented text mode.
+The UART runtime protocol is a variable-length binary frame protocol. It is not line-oriented text mode.
 
 ## Physical Link
 
@@ -102,6 +102,12 @@ Important constraint:
 
 If two host tools write to the same UART simultaneously, the Pico will see corrupted framing and can reply with
 `error invalid uart frame`.
+
+Queue behavior:
+
+- UART egress queues whole framed packets
+- when the queue is full, it drops whole queued frames, never individual bytes
+- frames are emitted as exactly `4 + payload_len` bytes
 
 ## Minimal Driver Algorithm
 

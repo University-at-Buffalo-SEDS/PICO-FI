@@ -12,8 +12,9 @@ use std::os::raw::{c_int, c_ulong};
 use std::thread;
 use std::time::Duration;
 
-const FRAME_SIZE: usize = 258;
-const PAYLOAD_MAX: usize = FRAME_SIZE - 2;
+const FRAME_SIZE: usize = 260;
+const FRAME_HEADER_SIZE: usize = 4;
+const PAYLOAD_MAX: usize = FRAME_SIZE - FRAME_HEADER_SIZE;
 const REQ_DATA_MAGIC: u8 = 0xA5;
 const REQ_COMMAND_MAGIC: u8 = 0xA6;
 const RESP_DATA_MAGIC: u8 = 0x5A;
@@ -33,10 +34,8 @@ const IOC_WRITE: u32 = 1;
 const SPI_IOC_MAGIC: u32 = b'k' as u32;
 
 const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> c_ulong {
-    ((dir << IOC_DIRSHIFT)
-        | (ty << IOC_TYPESHIFT)
-        | (nr << IOC_NRSHIFT)
-        | (size << IOC_SIZESHIFT)) as c_ulong
+    ((dir << IOC_DIRSHIFT) | (ty << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT))
+        as c_ulong
 }
 
 const fn iow<T>(ty: u32, nr: u32) -> c_ulong {
@@ -181,7 +180,7 @@ impl SpiBackend {
 
     fn write_request(&mut self, magic: u8, payload: &[u8]) -> Result<()> {
         let frame = build_request_frame(magic, payload);
-        let mut sink = [0u8; FRAME_SIZE];
+        let mut sink = vec![0u8; frame.len()];
         self.transfer(&frame, &mut sink)?;
         Ok(())
     }
@@ -235,11 +234,35 @@ fn ioctl_write<T>(fd: c_int, request: c_ulong, value: &mut T) -> Result<()> {
 }
 
 fn parse_response(raw: &[u8; FRAME_SIZE]) -> Result<Frame> {
-    let (magic, len, payload_start) = if raw[0] == 0 && matches!(raw[1], RESP_DATA_MAGIC | RESP_COMMAND_MAGIC) {
-        (raw[1], raw[2] as usize, 3usize)
-    } else {
-        (raw[0], raw[1] as usize, 2usize)
-    };
+    let (magic, len, payload_start) =
+        if matches!((raw[0], raw[1]), (REQ_DATA_MAGIC, RESP_DATA_MAGIC)) {
+            (
+                RESP_DATA_MAGIC,
+                u16::from_le_bytes([raw[2], raw[3]]) as usize,
+                FRAME_HEADER_SIZE,
+            )
+        } else if matches!((raw[0], raw[1]), (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC)) {
+            (
+                RESP_COMMAND_MAGIC,
+                u16::from_le_bytes([raw[2], raw[3]]) as usize,
+                FRAME_HEADER_SIZE,
+            )
+        } else if raw[0] == 0 && matches!((raw[1], raw[2]), (REQ_DATA_MAGIC, RESP_DATA_MAGIC)) {
+            (
+                RESP_DATA_MAGIC,
+                u16::from_le_bytes([raw[3], raw[4]]) as usize,
+                FRAME_HEADER_SIZE + 1,
+            )
+        } else if raw[0] == 0 && matches!((raw[1], raw[2]), (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC))
+        {
+            (
+                RESP_COMMAND_MAGIC,
+                u16::from_le_bytes([raw[3], raw[4]]) as usize,
+                FRAME_HEADER_SIZE + 1,
+            )
+        } else {
+            (raw[0], usize::MAX, FRAME_HEADER_SIZE)
+        };
     if len > PAYLOAD_MAX {
         return Err(Error::InvalidFrame { magic, len });
     }
@@ -256,12 +279,17 @@ fn parse_response(raw: &[u8; FRAME_SIZE]) -> Result<Frame> {
     }
 }
 
-fn build_request_frame(magic: u8, payload: &[u8]) -> [u8; FRAME_SIZE] {
+fn build_request_frame(magic: u8, payload: &[u8]) -> Vec<u8> {
     let payload = &payload[..payload.len().min(PAYLOAD_MAX)];
-    let mut frame = [0u8; FRAME_SIZE];
+    let mut frame = vec![0u8; FRAME_HEADER_SIZE + payload.len()];
     frame[0] = magic;
-    frame[1] = payload.len() as u8;
-    frame[2..2 + payload.len()].copy_from_slice(payload);
+    frame[1] = if magic == REQ_COMMAND_MAGIC {
+        RESP_COMMAND_MAGIC
+    } else {
+        RESP_DATA_MAGIC
+    };
+    frame[2..4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    frame[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload.len()].copy_from_slice(payload);
     frame
 }
 
@@ -272,28 +300,36 @@ mod tests {
     #[test]
     fn parses_spi_command_frame() {
         let mut raw = [0u8; FRAME_SIZE];
-        raw[0] = RESP_COMMAND_MAGIC;
-        raw[1] = 4;
-        raw[2..6].copy_from_slice(b"pong");
-        assert_eq!(parse_response(&raw).unwrap(), Frame::Command(b"pong".to_vec()));
+        raw[0] = REQ_COMMAND_MAGIC;
+        raw[1] = RESP_COMMAND_MAGIC;
+        raw[2..4].copy_from_slice(&4u16.to_le_bytes());
+        raw[4..8].copy_from_slice(b"pong");
+        assert_eq!(
+            parse_response(&raw).unwrap(),
+            Frame::Command(b"pong".to_vec())
+        );
     }
 
     #[test]
     fn parses_one_byte_shifted_command_frame() {
         let mut raw = [0u8; FRAME_SIZE];
-        raw[1] = RESP_COMMAND_MAGIC;
-        raw[2] = 4;
-        raw[3..7].copy_from_slice(b"pong");
-        assert_eq!(parse_response(&raw).unwrap(), Frame::Command(b"pong".to_vec()));
+        raw[1] = REQ_COMMAND_MAGIC;
+        raw[2] = RESP_COMMAND_MAGIC;
+        raw[3..5].copy_from_slice(&4u16.to_le_bytes());
+        raw[5..9].copy_from_slice(b"pong");
+        assert_eq!(
+            parse_response(&raw).unwrap(),
+            Frame::Command(b"pong".to_vec())
+        );
     }
 
     #[test]
     fn builds_full_sized_request_frame() {
         let frame = build_request_frame(REQ_COMMAND_MAGIC, b"/ping\n");
-        assert_eq!(frame.len(), FRAME_SIZE);
+        assert_eq!(frame.len(), 10);
         assert_eq!(frame[0], REQ_COMMAND_MAGIC);
-        assert_eq!(frame[1], 6);
-        assert_eq!(&frame[2..8], b"/ping\n");
-        assert!(frame[8..].iter().all(|&byte| byte == 0));
+        assert_eq!(frame[1], RESP_COMMAND_MAGIC);
+        assert_eq!(&frame[2..4], &6u16.to_le_bytes());
+        assert_eq!(&frame[4..10], b"/ping\n");
     }
 }

@@ -19,20 +19,22 @@ import termios
 import time
 
 try:
-    from .raw import FRAME_SIZE, open_bus
+    from .raw import FRAME_HEADER_SIZE, FRAME_SIZE, open_bus
     from .test import (
+        header_for_magic,
         parse_frame as parse_frame_full,
     )
 except ImportError:
     import os
 
     sys.path.append(os.path.dirname(__file__))
-    from raw import FRAME_SIZE, open_bus
+    from raw import FRAME_HEADER_SIZE, FRAME_SIZE, open_bus
     from test import (
+        header_for_magic,
         parse_frame as parse_frame_full,
     )
 
-PAYLOAD_MAX = FRAME_SIZE - 2
+PAYLOAD_MAX = FRAME_SIZE - FRAME_HEADER_SIZE
 REQ_MAGIC = 0xA5
 REQ_COMMAND_MAGIC = 0xA6
 RESP_DATA_MAGIC = 0x5A
@@ -45,10 +47,12 @@ PULL_COMMAND = b"/pull\n"
 
 def build_frame(payload: bytes, magic: int = REQ_MAGIC) -> bytes:
     payload = payload[:PAYLOAD_MAX]
-    frame = bytearray(FRAME_SIZE)
-    frame[0] = magic
-    frame[1] = len(payload)
-    frame[2:2 + len(payload)] = payload
+    h0, h1 = header_for_magic(magic)
+    frame = bytearray(FRAME_HEADER_SIZE + len(payload))
+    frame[0] = h0
+    frame[1] = h1
+    frame[2:4] = len(payload).to_bytes(2, "little")
+    frame[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + len(payload)] = payload
     return bytes(frame)
 
 

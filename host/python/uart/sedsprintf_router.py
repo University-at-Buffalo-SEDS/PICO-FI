@@ -10,6 +10,7 @@ try:
     from ..sedsprintf_router_common import add_router_args, run_udp_router
     from .test import (
         FRAME_SIZE,
+        PAYLOAD_MAX,
         REQ_DATA_MAGIC,
         RESP_DATA_MAGIC,
         build_frame,
@@ -26,6 +27,7 @@ except ImportError:
     from sedsprintf_router_common import add_router_args, run_udp_router
     from test import (
         FRAME_SIZE,
+        PAYLOAD_MAX,
         REQ_DATA_MAGIC,
         RESP_DATA_MAGIC,
         build_frame,
@@ -36,7 +38,7 @@ except ImportError:
 
 
 class UartRouterAdapter:
-    payload_limit = FRAME_SIZE - 2
+    payload_limit = PAYLOAD_MAX
     minimum_poll_s = 0.002
     send_reply_wait_s = 0.005
 
@@ -45,7 +47,7 @@ class UartRouterAdapter:
         self.pending: deque[bytes] = deque()
 
     def _capture(self, frame: bytes) -> bytes | None:
-        if len(frame) != FRAME_SIZE:
+        if len(frame) < 4:
             return None
         magic, _, payload = parse_frame(frame)
         if magic == RESP_DATA_MAGIC and payload:
