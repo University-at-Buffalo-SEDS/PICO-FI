@@ -25,6 +25,7 @@ class FakePacket:
                 str(self.packet_type).encode("utf-8"),
                 self.sender.encode("utf-8"),
                 b",".join(str(endpoint).encode("utf-8") for endpoint in self.endpoints),
+                str(self.timestamp_ms).encode("utf-8"),
                 self.payload,
             ]
         )
@@ -44,9 +45,15 @@ class FakeSedsprintf:
 
     @staticmethod
     def deserialize_packet_py(raw: bytes) -> FakePacket:
-        packet_type_raw, sender_raw, endpoints_raw, payload = raw.split(b"|", 3)
+        packet_type_raw, sender_raw, endpoints_raw, timestamp_raw, payload = raw.split(b"|", 4)
         endpoints = [int(value) for value in endpoints_raw.decode("utf-8").split(",") if value]
-        return FakePacket(int(packet_type_raw), sender_raw.decode("utf-8"), endpoints, 0, payload)
+        return FakePacket(
+            int(packet_type_raw),
+            sender_raw.decode("utf-8"),
+            endpoints,
+            int(timestamp_raw),
+            payload,
+        )
 
 
 class FakeListenSocket:
@@ -109,6 +116,26 @@ class FakeAdapter:
 
 
 class RouterCommonTests(unittest.TestCase):
+    def test_decode_packet_rejects_malformed_armored_and_raw_payloads(self) -> None:
+        self.assertIsNone(common.decode_packet(FakeSedsprintf, b"SP6:not-valid-base64"))
+        self.assertIsNone(common.decode_packet(FakeSedsprintf, b"not-a-packet"))
+
+    def test_armor_and_decode_preserve_large_timestamps(self) -> None:
+        for timestamp_ms in (0, 2**31, 2**32, 10**12, 10**15):
+            with self.subTest(timestamp_ms=timestamp_ms):
+                packet = FakePacket(
+                    FakeSedsprintf.DataType.MESSAGE_DATA,
+                    "router-end",
+                    [FakeSedsprintf.DataEndpoint.GROUND_STATION],
+                    timestamp_ms,
+                    b"payload",
+                )
+                decoded = common.decode_packet(FakeSedsprintf, common.armor_packet(packet))
+                self.assertIsNotNone(decoded)
+                assert decoded is not None
+                self.assertEqual(decoded.timestamp_ms, timestamp_ms)
+                self.assertEqual(decoded.payload, b"payload")
+
     def test_run_udp_router_wraps_and_unwraps_telemetry_payloads(self) -> None:
         listen = FakeListenSocket()
         forward = FakeForwardSocket()
@@ -129,7 +156,7 @@ class RouterCommonTests(unittest.TestCase):
                 common.socket,
                 "socket",
                 side_effect=[listen, forward],
-        ):
+        ), mock.patch.object(common.time, "time", return_value=9_876_543_210.123):
             rc = common.run_udp_router(adapter, args, "spi")
 
         self.assertEqual(rc, 0)
@@ -141,6 +168,7 @@ class RouterCommonTests(unittest.TestCase):
         raw = base64.urlsafe_b64decode(armored[len(common.ARMOR_PREFIX):])
         packet = FakeSedsprintf.deserialize_packet_py(raw)
         self.assertEqual(packet.sender, "uart-end")
+        self.assertEqual(packet.timestamp_ms, 9_876_543_210_123)
         self.assertEqual(packet.payload, b"udp-outbound")
 
 

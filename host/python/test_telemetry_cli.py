@@ -20,12 +20,13 @@ from host.python import telemetry_cli
 
 
 class FakePacket:
-    def __init__(self, sender: str, payload: bytes) -> None:
+    def __init__(self, sender: str, payload: bytes, timestamp_ms: int = 0) -> None:
         self.sender = sender
         self.payload = payload
+        self.timestamp_ms = timestamp_ms
 
     def serialize(self) -> bytes:
-        return self.sender.encode("utf-8") + b"|" + self.payload
+        return self.sender.encode("utf-8") + b"|" + str(self.timestamp_ms).encode("utf-8") + b"|" + self.payload
 
 
 class FakeSedsprintf:
@@ -38,12 +39,12 @@ class FakeSedsprintf:
     @staticmethod
     def make_packet(packet_type: int, sender: str, endpoints: list[int], timestamp_ms: int,
                     payload: bytes) -> FakePacket:
-        return FakePacket(sender, payload)
+        return FakePacket(sender, payload, timestamp_ms)
 
     @staticmethod
     def deserialize_packet_py(raw: bytes) -> FakePacket:
-        sender_raw, payload = raw.split(b"|", 1)
-        return FakePacket(sender_raw.decode("utf-8"), payload)
+        sender_raw, timestamp_raw, payload = raw.split(b"|", 2)
+        return FakePacket(sender_raw.decode("utf-8"), payload, int(timestamp_raw))
 
 
 class FakeAdapter:
@@ -79,7 +80,7 @@ class TelemetryCliTests(unittest.TestCase):
 
         with mock.patch.object(telemetry_cli, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
                 telemetry_cli, "build_adapter", return_value=adapter
-        ):
+        ), mock.patch.object(telemetry_cli.time, "time", return_value=12_345_678_901.234):
             rc = telemetry_cli.run_send(args)
 
         self.assertEqual(rc, 0)
@@ -88,7 +89,24 @@ class TelemetryCliTests(unittest.TestCase):
         armored = adapter.sent[0]
         self.assertTrue(armored.startswith(b"SP6:"))
         decoded = base64.urlsafe_b64decode(armored[4:])
-        self.assertEqual(decoded, b"uart-node|hello telemetry")
+        self.assertEqual(decoded, b"uart-node|12345678901234|hello telemetry")
+
+    def test_build_packet_supports_large_timestamp_values(self) -> None:
+        args = argparse.Namespace(
+            sender="uart-node",
+            packet_type="MESSAGE_DATA",
+            endpoint=["GROUND_STATION"],
+        )
+
+        with mock.patch.object(telemetry_cli, "load_sedsprintf", return_value=FakeSedsprintf), mock.patch.object(
+                telemetry_cli.time, "time", return_value=98_765_432_109.876):
+            packet = telemetry_cli.build_packet(args, "big time")
+
+        decoded = telemetry_cli.decode_packet(FakeSedsprintf, packet)
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertEqual(decoded.timestamp_ms, 98_765_432_109_876)
+        self.assertEqual(decoded.payload, b"big time")
 
     def test_run_recv_prints_decoded_payload(self) -> None:
         packet = FakePacket("spi-node", b"rx payload")
@@ -111,7 +129,7 @@ class TelemetryCliTests(unittest.TestCase):
         self.assertIn("sender=spi-node payload=rx payload", out.getvalue())
 
     def test_run_recv_accepts_raw_packet_payload(self) -> None:
-        packet = FakePacket("spi-node", b"rx payload")
+        packet = FakePacket("spi-node", b"rx payload", 4_294_967_296)
         adapter = FakeAdapter(packet.serialize())
         args = argparse.Namespace(
             timeout=0.1,

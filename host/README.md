@@ -210,6 +210,9 @@ Current unit coverage includes:
 - [host/python/test_sedsprintf_router_common.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/test_sedsprintf_router_common.py)
 - [host/python/spi/test_sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/spi/test_sedsprintf_router.py)
 - [host/python/test_telemetry_cli.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/test_telemetry_cli.py)
+- [host/python/test_bridge_framing.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/test_bridge_framing.py)
+- [host/python/test_transport_framing_roundtrip.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/test_transport_framing_roundtrip.py)
+- [host/python/test_bridge_transport_soak.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/test_bridge_transport_soak.py)
 
 Run them with:
 
@@ -217,5 +220,21 @@ Run them with:
 python3 -m unittest \
   host.python.test_sedsprintf_router_common \
   host.python.spi.test_sedsprintf_router \
-  host.python.test_telemetry_cli
+  host.python.test_telemetry_cli \
+  host.python.test_bridge_framing \
+  host.python.test_transport_framing_roundtrip \
+  host.python.test_bridge_transport_soak
+```
+
+Or run the framing plus long-duration simulated transport soak through Cargo:
+
+```bash
+cargo host-test
+```
+
+For a longer software-only fuzz/soak run with valid large-timestamp packets, malformed packets, random chunking, and
+bounded-buffer simulation, use:
+
+```bash
+python3 build.py --test-fuzz --fuzz-duration-s 600
 ```

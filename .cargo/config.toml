@@ -1,6 +1,9 @@
 [build]
 target = "thumbv6m-none-eabi"
 
+[alias]
+host-test = "test --target aarch64-apple-darwin --manifest-path host-tests/Cargo.toml"
+
 [target.thumbv6m-none-eabi]
 runner = "probe-rs run --chip RP2040"
 rustflags = [
