@@ -39,6 +39,7 @@ static WIZNET_STATE: StaticCell<embassy_net_wiznet::State<2, 2>> = StaticCell::n
 
 /// Number of bytes in the Ethernet bridge frame header.
 pub const BRIDGE_FRAME_HEADER_SIZE: usize = 4;
+const BRIDGE_FRAME_INLINE_WRITE_MAX: usize = 512;
 
 const BRIDGE_FRAME_MAGIC0: u8 = 0xB5;
 const BRIDGE_FRAME_MAGIC1: u8 = 0x4E;
@@ -237,6 +238,17 @@ pub async fn write_bridge_frame(socket: &mut TcpSocket<'_>, payload: &[u8]) -> R
     header[0] = BRIDGE_FRAME_MAGIC0;
     header[1] = BRIDGE_FRAME_MAGIC1;
     header[2..4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+
+    // Keep the common small-packet case in one TCP write to minimize
+    // latency from extra segmentation on the Ethernet leg.
+    if payload.len() + BRIDGE_FRAME_HEADER_SIZE <= BRIDGE_FRAME_INLINE_WRITE_MAX {
+        let mut frame = [0u8; BRIDGE_FRAME_INLINE_WRITE_MAX];
+        let frame_len = BRIDGE_FRAME_HEADER_SIZE + payload.len();
+        frame[..BRIDGE_FRAME_HEADER_SIZE].copy_from_slice(&header);
+        frame[BRIDGE_FRAME_HEADER_SIZE..frame_len].copy_from_slice(payload);
+        return write_socket(socket, &frame[..frame_len]).await;
+    }
+
     write_socket(socket, &header).await?;
     write_socket(socket, payload).await
 }

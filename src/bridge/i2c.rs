@@ -39,6 +39,7 @@ pub async fn run_client(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_nagle_enabled(false);
         socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -93,6 +94,7 @@ pub async fn run_server(
         let mut rx_buf = [0u8; 2048];
         let mut tx_buf = [0u8; 2048];
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+        socket.set_nagle_enabled(false);
         socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         if socket.accept(port).await.is_err() {

@@ -73,7 +73,7 @@ def add_router_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--listen-port", type=int, default=9000)
     parser.add_argument("--forward-host", default="127.0.0.1")
     parser.add_argument("--forward-port", type=int, default=9001)
-    parser.add_argument("--poll-ms", type=int, default=50)
+    parser.add_argument("--poll-ms", type=int, default=5)
     parser.add_argument("--sender", default=default_sender_label())
     parser.add_argument("--type", dest="packet_type", default="MESSAGE_DATA")
     parser.add_argument(
@@ -151,6 +151,9 @@ def run_udp_router(adapter: RouterAdapter, args: argparse.Namespace, backend_nam
     )
     print(f"sender={args.sender} packet_type={packet_type} endpoints={endpoints}")
 
+    poll_timeout_s = max(args.poll_ms / 1000.0, 0.001)
+    idle_sleep_s = min(poll_timeout_s, 0.005)
+
     try:
         while True:
             try:
@@ -181,22 +184,28 @@ def run_udp_router(adapter: RouterAdapter, args: argparse.Namespace, backend_nam
                             f"{len(data)}B {render_payload(data)!r}"
                         )
 
-            incoming = adapter.recv_payload(args.poll_ms / 1000.0)
-            if incoming:
+            saw_incoming = False
+            drain_limit = 8
+            for drain_index in range(drain_limit):
+                timeout_s = poll_timeout_s if drain_index == 0 and source is None else 0.0
+                incoming = adapter.recv_payload(timeout_s)
+                if not incoming:
+                    break
+                saw_incoming = True
                 packet = decode_armored_packet(sedsprintf, incoming)
                 if packet is None:
                     if args.debug:
                         print(f"[skip] non-sedsprintf payload: {render_payload(incoming)!r}")
-                else:
-                    payload = bytes(packet.payload)
-                    forward.sendto(payload, (args.forward_host, args.forward_port))
-                    print(
-                        f"[rx] {packet.sender} -> udp://{args.forward_host}:{args.forward_port} "
-                        f"{len(payload)}B {render_payload(payload)!r}"
-                    )
+                    continue
+                payload = bytes(packet.payload)
+                forward.sendto(payload, (args.forward_host, args.forward_port))
+                print(
+                    f"[rx] {packet.sender} -> udp://{args.forward_host}:{args.forward_port} "
+                    f"{len(payload)}B {render_payload(payload)!r}"
+                )
 
-            if source is None and incoming is None:
-                time.sleep(max(args.poll_ms / 1000.0, 0.01))
+            if source is None and not saw_incoming:
+                time.sleep(idle_sleep_s)
     except KeyboardInterrupt:
         return 0
     finally:
