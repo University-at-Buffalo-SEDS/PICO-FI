@@ -99,6 +99,10 @@ The host tools use:
 
 The relevant logic is in [src/bridge/spi.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/spi.rs).
 
+Across Ethernet, each bridged SPI payload is wrapped in a separate TCP bridge frame with header
+`0xB5 0x4E + little-endian u16 length`, so SPI frame boundaries are preserved instead of depending on raw TCP read
+chunking.
+
 Queue behavior:
 
 - SPI ingress and response queues drop whole frames, never individual bytes

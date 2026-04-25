@@ -85,6 +85,8 @@ When the bridge session is active:
 - non-empty `KIND_DATA` payloads are forwarded across the bridge
 - incoming network data is queued back to the I2C host as `KIND_DATA`
 - `KIND_COMMAND` is handled locally on the Pico
+- the TCP leg wraps each logical payload in a `0xB5 0x4E + u16 length` bridge frame so I2C packet boundaries remain
+  stable across Ethernet
 
 When the bridge session is not active:
 

@@ -25,6 +25,13 @@ UART and SPI:
 - request magics are `0xA5` for data and `0xA6` for commands
 - response magics are `0x5A` for data and `0x5B` for command replies
 
+Ethernet bridge session:
+
+- uses a separate `4` byte bridge frame on the TCP leg
+- frame header is `0xB5 0x4E` followed by a little-endian `u16` payload length
+- each local UART/SPI/I2C payload is sent as exactly one bridge frame on Ethernet
+- TCP reads are reassembled by this bridge frame, so transport message boundaries do not drift over time
+
 I2C:
 
 - uses `32` byte slots on the wire

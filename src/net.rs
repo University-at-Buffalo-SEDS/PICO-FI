@@ -37,6 +37,12 @@ static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 /// Shared W5500 driver state.
 static WIZNET_STATE: StaticCell<embassy_net_wiznet::State<2, 2>> = StaticCell::new();
 
+/// Number of bytes in the Ethernet bridge frame header.
+pub const BRIDGE_FRAME_HEADER_SIZE: usize = 4;
+
+const BRIDGE_FRAME_MAGIC0: u8 = 0xB5;
+const BRIDGE_FRAME_MAGIC1: u8 = 0x4E;
+
 /// Runs the background Embassy network stack task.
 #[embassy_executor::task]
 pub async fn net_task(mut runner: Runner<'static, embassy_net_wiznet::Device<'static>>) {
@@ -219,4 +225,38 @@ pub async fn write_socket(socket: &mut TcpSocket<'_>, mut buf: &[u8]) -> Result<
         buf = &buf[written..];
     }
     Ok(())
+}
+
+/// Writes one length-prefixed bridge payload to the TCP stream.
+pub async fn write_bridge_frame(socket: &mut TcpSocket<'_>, payload: &[u8]) -> Result<(), ()> {
+    if payload.len() > u16::MAX as usize {
+        return Err(());
+    }
+
+    let mut header = [0u8; BRIDGE_FRAME_HEADER_SIZE];
+    header[0] = BRIDGE_FRAME_MAGIC0;
+    header[1] = BRIDGE_FRAME_MAGIC1;
+    header[2..4].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    write_socket(socket, &header).await?;
+    write_socket(socket, payload).await
+}
+
+/// Reads one length-prefixed bridge payload from the TCP stream into `buf`.
+pub async fn read_bridge_frame(
+    socket: &mut TcpSocket<'_>,
+    buf: &mut [u8],
+) -> Result<usize, ()> {
+    let mut header = [0u8; BRIDGE_FRAME_HEADER_SIZE];
+    read_socket_exact(socket, &mut header).await?;
+    if header[0] != BRIDGE_FRAME_MAGIC0 || header[1] != BRIDGE_FRAME_MAGIC1 {
+        return Err(());
+    }
+
+    let len = u16::from_le_bytes([header[2], header[3]]) as usize;
+    if len > buf.len() {
+        return Err(());
+    }
+
+    read_socket_exact(socket, &mut buf[..len]).await?;
+    Ok(len)
 }

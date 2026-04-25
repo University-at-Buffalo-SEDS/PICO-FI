@@ -4,7 +4,9 @@ use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
 use crate::bridge::overwrite_queue::OverwriteBytePacketRing;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
-use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
+use crate::net::{
+    connect_with_timeout, exchange_link_handshake, read_bridge_frame, write_bridge_frame,
+};
 use crate::protocol::i2c::{
     FRAME_HEADER_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
@@ -246,15 +248,12 @@ async fn session(
         } else {
             consecutive_tx_chunks = 0;
             match select(
-                socket.read(&mut net_buf),
+                read_bridge_frame(socket, &mut net_buf),
                 read_uart_frame_lossy(uart_rx, &mut uart_frame),
             )
             .await
             {
                 Either::First(Ok(net_n)) => {
-                    if net_n == 0 {
-                        return Ok(());
-                    }
                     push_uart_frame(&mut egress_ring, UartFrameKind::Data, &net_buf[..net_n]);
                 }
                 Either::First(Err(_)) => return Err(()),
@@ -287,7 +286,7 @@ async fn handle_uart_request(
             let payload = frame.payload();
             if let Some(socket) = socket {
                 if !payload.is_empty() {
-                    write_socket(socket, payload).await?;
+                    write_bridge_frame(socket, payload).await?;
                 }
             }
             Ok(())

@@ -8,7 +8,9 @@ use crate::bridge::runtime::BridgeRuntime;
 use crate::bridge::spi_diag;
 use crate::bridge::spi_frame::SpiFrame;
 use crate::config::BridgeConfig;
-use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
+use crate::net::{
+    connect_with_timeout, exchange_link_handshake, read_bridge_frame, write_bridge_frame,
+};
 use crate::protocol::i2c::{
     RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, parse_request_bytes,
 };
@@ -172,11 +174,8 @@ async fn session(
     let mut net_buf = [0u8; 256];
 
     loop {
-        match select(socket.read(&mut net_buf), spi_rx.pop()).await {
+        match select(read_bridge_frame(socket, &mut net_buf), spi_rx.pop()).await {
             Either::First(Ok(net_n)) => {
-                if net_n == 0 {
-                    return Ok(());
-                }
                 let response = SpiFrame::response(RESP_DATA_MAGIC, &net_buf[..net_n]);
                 let preview = response.as_slice();
                 spi_diag::record_queued_response(preview[0], preview[1]);
@@ -210,7 +209,7 @@ async fn handle_spi_request(
             }
             if let Some(socket) = socket {
                 if !payload.is_empty() {
-                    write_socket(socket, payload).await?;
+                    write_bridge_frame(socket, payload).await?;
                 }
             } else {
                 let response = if payload.is_empty() {
@@ -230,7 +229,7 @@ async fn handle_spi_request(
                 let _ = spi_tx.push_overwrite(frame);
             } else if let Some(socket) = socket {
                 if !payload.is_empty() {
-                    write_socket(socket, payload).await?;
+                    write_bridge_frame(socket, payload).await?;
                 }
             } else {
                 let response = if payload.is_empty() {

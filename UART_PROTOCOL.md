@@ -90,6 +90,8 @@ When the Ethernet bridge session is active:
 
 - non-empty `0xA5` payloads are forwarded across the bridge
 - `0xA6` payloads are handled locally as Pico commands
+- the TCP leg adds its own `0xB5 0x4E + u16 length` bridge header so each UART payload stays packet-aligned across
+  Ethernet
 
 Before the bridge session is active:
 

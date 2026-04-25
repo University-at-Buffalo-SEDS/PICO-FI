@@ -7,7 +7,9 @@ use crate::bridge::overwrite_queue::{
 };
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
-use crate::net::{connect_with_timeout, exchange_link_handshake, write_socket};
+use crate::net::{
+    connect_with_timeout, exchange_link_handshake, read_bridge_frame, write_bridge_frame,
+};
 use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
@@ -138,15 +140,12 @@ async fn session(
     let mut net_buf = [0u8; I2C_PACKET_MAX];
 
     loop {
-        match select(i2c_rx.pop(), socket.read(&mut net_buf)).await {
+        match select(i2c_rx.pop(), read_bridge_frame(socket, &mut net_buf)).await {
             Either::First(packet) => {
                 handle_i2c_request(packet, Some(socket), bridge_config, link_active, i2c_tx)
                     .await?;
             }
             Either::Second(Ok(net_n)) => {
-                if net_n == 0 {
-                    return Ok(());
-                }
                 i2c_tx.push_overwrite(make_packet(KIND_DATA, &net_buf[..net_n])?);
             }
             Either::Second(Err(_)) => return Err(()),
@@ -168,7 +167,7 @@ async fn handle_i2c_request(
             let payload = packet.payload.as_slice();
             if let Some(socket) = socket {
                 if !payload.is_empty() {
-                    write_socket(socket, payload).await?;
+                    write_bridge_frame(socket, payload).await?;
                 }
                 i2c_tx.push_overwrite(make_packet(KIND_DATA, b"")?);
             } else if !payload.is_empty() {
