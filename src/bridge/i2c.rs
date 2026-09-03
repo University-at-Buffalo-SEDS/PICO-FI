@@ -171,10 +171,12 @@ async fn handle_i2c_request(
                 if !payload.is_empty() {
                     write_bridge_frame(socket, payload).await?;
                 }
-                i2c_tx.push_overwrite(make_packet(KIND_DATA, b"")?);
-            } else if !payload.is_empty() {
-                i2c_tx.push_overwrite(make_packet(KIND_DATA, b"")?);
             }
+            // A successful I2C write already acknowledges admission to the
+            // bridge queue. Do not enqueue an empty mailbox response: it used
+            // to share the overwrite queue with real inbound telemetry and
+            // could evict or supersede that telemetry under bidirectional
+            // load.
             Ok(())
         }
         KIND_COMMAND => {

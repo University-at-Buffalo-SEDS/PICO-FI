@@ -150,6 +150,12 @@ impl RxPacketState {
                 self.payload[self.next_offset..end].copy_from_slice(&slot.data[..slot.data_len]);
                 self.next_offset = end;
             }
+            // The timeout protects abandoned partial transfers. A valid
+            // continuation proves the host is still making progress, so give
+            // the remaining slots a fresh window. Large (for example 1 KiB)
+            // SEDSNet discovery frames can legitimately require dozens of
+            // 14-byte mailbox slots.
+            self.started_at = Some(Instant::now());
         }
 
         if (slot.flags & FLAG_END) != 0 {
