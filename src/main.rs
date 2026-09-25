@@ -263,7 +263,7 @@ async fn app(spawner: Spawner) {
         config_storage.load().unwrap_or(compiled_config)
     };
     let mut uart_config = uart::Config::default();
-    uart_config.baudrate = 115_200;
+    uart_config.baudrate = config::COMPILED_UART_BAUD_RATE;
     let uart = match initial_config.uart_port {
         UartPort::Uart0 => BufferedUart::new(
             p.UART0,

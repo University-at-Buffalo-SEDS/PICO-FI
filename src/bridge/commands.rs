@@ -49,7 +49,7 @@ pub fn render_local_bridge_command(
     match line {
         "/help" => {
             let _ = out.push_str(
-                "pico commands: /help /show /ping /link /spi /led <on|off|toggle|auto|status>",
+                "pico commands: /help /show /ping /link /spi /queues /led <on|off|toggle|auto|status>",
             );
         }
         "/show" => {
@@ -65,6 +65,9 @@ pub fn render_local_bridge_command(
             } else {
                 let _ = out.push_str("link down");
             }
+        }
+        "/queues" => {
+            let _ = out.push_str(super::overwrite_queue::render_diagnostics().as_str());
         }
         "/spi" => {
             let rendered = spi_diag::render_snapshot();

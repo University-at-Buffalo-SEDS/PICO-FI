@@ -10,6 +10,8 @@ use crate::protocol::i2c::{
     parse_request_bytes,
 };
 use embassy_futures::yield_now;
+#[path = "../protocol/i2c_packet.rs"]
+mod packet_v2;
 use embassy_rp::i2c_slave::{Command, I2cSlave, ReadStatus};
 use embassy_rp::peripherals::I2C0;
 use embassy_time::{Duration, Instant};
@@ -17,7 +19,7 @@ use heapless::Vec;
 use portable_atomic::AtomicBool;
 
 const SLOT_SIZE: usize = 32;
-const LISTEN_BUFFER_SIZE: usize = 64;
+const LISTEN_BUFFER_SIZE: usize = 4100;
 const SLOT_HEADER_SIZE: usize = 18;
 const SLOT_PAYLOAD_SIZE: usize = SLOT_SIZE - SLOT_HEADER_SIZE;
 
@@ -325,9 +327,43 @@ pub async fn i2c_poll_task(
     let mut rx_packet = RxPacketState::new();
     let mut tx_packet = TxPacketState::new();
     let mut last_transfer_id = 1u16;
+    let mut v2 = false;
+    let mut mailbox = packet_v2::Mailbox::new();
 
     loop {
-        match i2c.listen(&mut transaction_buf).await {
+        let command = i2c.listen(&mut transaction_buf).await;
+        if let Ok(Command::Write(len) | Command::WriteRead(len)) = &command {
+            let raw = &transaction_buf[..*len];
+            if raw == packet_v2::SELECT {
+                v2 = true;
+                rx_packet.reset();
+            } else if raw.first() == Some(&packet_v2::MAGIC) {
+                v2 = true;
+                handle_v2_write(raw, bridge_config, link_active, tx, &mut mailbox);
+            } else if raw.len() == SLOT_SIZE && raw[..3] == [SLOT_MAGIC0, SLOT_MAGIC1, SLOT_VERSION]
+            {
+                v2 = false;
+            }
+        }
+        if v2 {
+            match command {
+                Ok(Command::Read | Command::WriteRead(_)) => {
+                    if !mailbox.pending() {
+                        if let Some(response) = rx_resp.try_pop() {
+                            let _ = mailbox.stage(response.kind, response.payload.as_slice());
+                        }
+                    }
+                    if respond_v2(i2c, &mut mailbox).await.is_err() {
+                        i2c.reset();
+                    }
+                }
+                Err(_) => i2c.reset(),
+                _ => {}
+            }
+            yield_now().await;
+            continue;
+        }
+        match command {
             Ok(Command::Write(len)) => {
                 handle_write_slot(
                     &transaction_buf[..len.min(SLOT_SIZE)],
@@ -595,4 +631,60 @@ fn looks_like_local_command(payload: &[u8]) -> bool {
 
 fn nonzero_transfer_id(value: u16) -> u16 {
     if value == 0 { 1 } else { value }
+}
+
+fn handle_v2_write(
+    raw: &[u8],
+    bridge_config: BridgeConfig,
+    link_active: &AtomicBool,
+    tx: &'static OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>,
+    mailbox: &mut packet_v2::Mailbox,
+) {
+    let Ok((kind, payload)) = packet_v2::packet(raw) else {
+        return;
+    };
+    match kind {
+        packet_v2::DATA => {
+            if !payload.is_empty() {
+                if let Ok(packet) = make_packet(KIND_DATA, payload) {
+                    tx.push_overwrite(packet);
+                }
+            }
+        }
+        packet_v2::COMMAND => {
+            if looks_like_local_command(payload) && !mailbox.pending() {
+                let response = render_local_bridge_command(
+                    bridge_config,
+                    link_active,
+                    trim_ascii_line(payload),
+                );
+                let _ = mailbox.stage(packet_v2::COMMAND, response.as_bytes());
+            }
+        }
+        packet_v2::BOOTSEL if payload == b"BOOTSEL" => {
+            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+        }
+        _ => {}
+    }
+}
+
+async fn respond_v2(
+    i2c: &mut I2cSlave<'static, I2C0>,
+    mailbox: &mut packet_v2::Mailbox,
+) -> Result<(), ()> {
+    // The first read peeks at the header. The second repeats the header and
+    // reads precisely the advertised body. There is no inter-packet batching.
+    let header = mailbox.header();
+    match i2c.respond_to_read(&header).await {
+        Ok(ReadStatus::NeedMoreBytes) if mailbox.pending() && !mailbox.payload().is_empty() => {
+            let done = matches!(
+                i2c.respond_to_read(mailbox.payload()).await,
+                Ok(ReadStatus::Done)
+            );
+            mailbox.complete_body(done);
+            if done { Ok(()) } else { Err(()) }
+        }
+        Ok(ReadStatus::Done | ReadStatus::LeftoverBytes(_)) => Ok(()),
+        _ => Err(()),
+    }
 }

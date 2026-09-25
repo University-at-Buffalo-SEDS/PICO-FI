@@ -5,11 +5,13 @@ use crate::bridge::overwrite_queue::OverwriteBytePacketRing;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{
-    connect_with_timeout, exchange_link_handshake, read_bridge_frame, write_bridge_frame,
+    bridge_frame_reader, connect_with_timeout, exchange_link_handshake, read_bridge_frame,
+    write_bridge_frame,
 };
 use crate::protocol::i2c::{
     FRAME_HEADER_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
+use crate::protocol::stream::FrameReader;
 use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 use embassy_net::Ipv4Address;
@@ -39,6 +41,7 @@ enum UartFrameKind {
 }
 
 struct UartFrame {
+    reader: FrameReader,
     kind: UartFrameKind,
     len: usize,
     payload: [u8; UART_PAYLOAD_MAX],
@@ -47,6 +50,13 @@ struct UartFrame {
 impl UartFrame {
     const fn new() -> Self {
         Self {
+            reader: FrameReader::new(
+                [
+                    [REQ_DATA_MAGIC, RESP_DATA_MAGIC],
+                    [REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC],
+                ],
+                true,
+            ),
             kind: UartFrameKind::Data,
             len: 0,
             payload: [0; UART_PAYLOAD_MAX],
@@ -77,9 +87,9 @@ pub async fn run_client(
         socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
+        let mut uart_frame = UartFrame::new();
         {
             let (uart_tx, uart_rx) = uart.split_ref();
-            let mut uart_frame = UartFrame::new();
             let mut egress_ring = UartEgressRing::new();
 
             loop {
@@ -128,7 +138,14 @@ pub async fn run_client(
         }
         runtime.link_active.store(true, Ordering::Relaxed);
 
-        let _ = session(uart, &mut socket, bridge_config, runtime.link_active).await;
+        let _ = session(
+            uart,
+            &mut socket,
+            &mut uart_frame,
+            bridge_config,
+            runtime.link_active,
+        )
+        .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -151,9 +168,9 @@ pub async fn run_server(
         socket.set_keep_alive(Some(Duration::from_secs(3)));
 
         runtime.link_active.store(false, Ordering::Relaxed);
+        let mut uart_frame = UartFrame::new();
         {
             let (uart_tx, uart_rx) = uart.split_ref();
-            let mut uart_frame = UartFrame::new();
             let mut egress_ring = UartEgressRing::new();
 
             loop {
@@ -204,7 +221,14 @@ pub async fn run_server(
         }
         runtime.link_active.store(true, Ordering::Relaxed);
 
-        let _ = session(uart, &mut socket, bridge_config, runtime.link_active).await;
+        let _ = session(
+            uart,
+            &mut socket,
+            &mut uart_frame,
+            bridge_config,
+            runtime.link_active,
+        )
+        .await;
         socket.abort();
         let _ = socket.flush().await;
         runtime.link_active.store(false, Ordering::Relaxed);
@@ -214,11 +238,12 @@ pub async fn run_server(
 async fn session(
     uart: &mut BufferedUart,
     socket: &mut TcpSocket<'_>,
+    uart_frame: &mut UartFrame,
     bridge_config: BridgeConfig,
     link_active: &AtomicBool,
 ) -> Result<(), ()> {
-    let mut uart_frame = UartFrame::new();
     let mut net_buf = [0u8; UART_PAYLOAD_MAX];
+    let mut net_reader = bridge_frame_reader();
     let mut tx_chunk = [0u8; UART_EGRESS_CHUNK_BYTES];
     let mut egress_ring = UartEgressRing::new();
     let mut tx_chunk_len = 0usize;
@@ -250,8 +275,8 @@ async fn session(
         } else {
             consecutive_tx_chunks = 0;
             match select(
-                read_bridge_frame(socket, &mut net_buf),
-                read_uart_frame_lossy(uart_rx, &mut uart_frame),
+                read_bridge_frame(&mut net_reader, socket, &mut net_buf),
+                read_uart_frame_lossy(uart_rx, uart_frame),
             )
             .await
             {
@@ -261,7 +286,7 @@ async fn session(
                 Either::First(Err(_)) => return Err(()),
                 Either::Second(()) => {
                     handle_uart_request(
-                        &uart_frame,
+                        uart_frame,
                         Some(socket),
                         bridge_config,
                         link_active,
@@ -396,38 +421,12 @@ async fn write_uart_chunk_lossy(uart_tx: &mut impl Write, chunk: &[u8]) -> usize
 }
 
 async fn read_uart_request_frame(uart_rx: &mut impl Read, frame: &mut UartFrame) -> Result<(), ()> {
-    let mut byte = [0u8; 1];
-
-    loop {
-        uart_rx.read_exact(&mut byte).await.map_err(|_| ())?;
-        if matches!(byte[0], REQ_DATA_MAGIC | REQ_COMMAND_MAGIC) {
-            break;
-        }
-    }
-
-    let first = byte[0];
-    uart_rx.read_exact(&mut byte).await.map_err(|_| ())?;
-    let kind = match (first, byte[0]) {
-        (REQ_DATA_MAGIC, RESP_DATA_MAGIC) => UartFrameKind::Data,
-        (REQ_COMMAND_MAGIC, RESP_COMMAND_MAGIC) => UartFrameKind::Command,
-        _ => return Err(()),
+    let (magic, len) = frame.reader.read(uart_rx, &mut frame.payload).await?;
+    frame.kind = if magic == REQ_DATA_MAGIC {
+        UartFrameKind::Data
+    } else {
+        UartFrameKind::Command
     };
-
-    let mut len_bytes = [0u8; 2];
-    uart_rx.read_exact(&mut len_bytes).await.map_err(|_| ())?;
-    let len = u16::from_le_bytes(len_bytes) as usize;
-    if len > UART_PAYLOAD_MAX {
-        return Err(());
-    }
-
-    if len != 0 {
-        uart_rx
-            .read_exact(&mut frame.payload[..len])
-            .await
-            .map_err(|_| ())?;
-    }
-    frame.kind = kind;
     frame.len = len;
-
     Ok(())
 }

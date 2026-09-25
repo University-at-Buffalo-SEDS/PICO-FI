@@ -4,6 +4,24 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use heapless::Deque;
+use portable_atomic::{AtomicU32, Ordering};
+use core::fmt::Write;
+
+// Aggregate lifetime counters across mailbox queues and UART rings. These are
+// diagnostic only; eviction remains an explicit bounded, lossy policy.
+static MAILBOX_DROPPED: AtomicU32 = AtomicU32::new(0);
+static UART_DROPPED: AtomicU32 = AtomicU32::new(0);
+static REJECTED: AtomicU32 = AtomicU32::new(0);
+static MAILBOX_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+static UART_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+pub fn render_diagnostics() -> heapless::String<192> {
+    let mut out = heapless::String::new();
+    let _ = write!(out, "queues mailbox_drop={} uart_drop={} reject={} mailbox_peak={} uart_peak={}",
+        MAILBOX_DROPPED.load(Ordering::Relaxed), UART_DROPPED.load(Ordering::Relaxed),
+        REJECTED.load(Ordering::Relaxed), MAILBOX_HIGH_WATER.load(Ordering::Relaxed),
+        UART_HIGH_WATER.load(Ordering::Relaxed));
+    out
+}
 
 // I2C packets carry a 4 KiB inline payload, so keep this depth bounded to avoid
 // exhausting RP2040 RAM under burst traffic.
@@ -45,7 +63,8 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
 
     pub fn push_overwrite(&self, item: T) -> bool {
         let item_len = item.queued_len();
-        if item_len > MAX_BYTES {
+        if item_len > MAX_BYTES || N == 0 {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -56,6 +75,7 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
                 {
                     match state.queue.pop_front() {
                         Some(dropped) => {
+                            MAILBOX_DROPPED.fetch_add(1, Ordering::Relaxed);
                             state.queued_bytes =
                                 state.queued_bytes.saturating_sub(dropped.queued_len());
                         }
@@ -65,6 +85,7 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
 
                 if state.queue.push_back(item).is_ok() {
                     state.queued_bytes = state.queued_bytes.saturating_add(item_len);
+                    MAILBOX_HIGH_WATER.fetch_max(state.queue.len() as u32, Ordering::Relaxed);
                     true
                 } else {
                     false
@@ -92,6 +113,7 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
             self.state.lock_mut(|state| {
                 let mut latest = state.queue.pop_front()?;
                 while let Some(next) = state.queue.pop_front() {
+                    MAILBOX_DROPPED.fetch_add(1, Ordering::Relaxed);
                     latest = next;
                 }
                 state.queued_bytes = 0;
@@ -152,12 +174,25 @@ impl<const N: usize, const M: usize> OverwriteBytePacketRing<N, M> {
     }
 
     pub fn push_overwrite_slices(&mut self, slices: &[&[u8]]) {
+        // Never silently truncate a framed stream packet.
+        let total = slices.iter().try_fold(0usize, |n, s| n.checked_add(s.len()));
+        if N == 0 || total.is_none_or(|n| n > M) {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let packet = BytePacket::from_slices(slices);
         if packet.len == 0 {
             return;
         }
 
         if self.queue.is_full() {
+            if self.front_offset != 0 && self.queue.len() == 1 {
+                // The head is already on the wire. Dropping its suffix would
+                // corrupt framing; reject the new packet instead.
+                REJECTED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            UART_DROPPED.fetch_add(1, Ordering::Relaxed);
             if self.front_offset == 0 {
                 let _ = self.queue.pop_front();
             } else if self.queue.len() > 1 {
@@ -173,6 +208,7 @@ impl<const N: usize, const M: usize> OverwriteBytePacketRing<N, M> {
         }
 
         let _ = self.queue.push_back(packet);
+        UART_HIGH_WATER.fetch_max(self.queue.len() as u32, Ordering::Relaxed);
     }
 
     pub fn peek_into(&self, buf: &mut [u8]) -> usize {
@@ -220,11 +256,60 @@ impl<const N: usize, const M: usize> OverwriteBytePacketRing<N, M> {
     }
 
     pub fn clear(&mut self) {
+        UART_DROPPED.fetch_add(self.queue.len() as u32, Ordering::Relaxed);
         self.queue.clear();
         self.front_offset = 0;
     }
 
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[derive(Debug, PartialEq)]
+    struct Item(u8, usize);
+    impl QueueItem for Item { fn queued_len(&self) -> usize { self.1 } }
+    #[test]
+    fn mailbox_enforces_count_bytes_and_fifo() {
+        let q = OverwriteQueue::<Item, 2, 5>::new();
+        assert!(q.push_overwrite(Item(1, 2)));
+        assert!(q.push_overwrite(Item(2, 2)));
+        assert!(q.push_overwrite(Item(3, 4)));
+        assert_eq!(q.try_pop(), Some(Item(3, 4)));
+        assert_eq!(q.try_pop(), None);
+        assert!(!q.push_overwrite(Item(4, 6)));
+        assert!(q.push_overwrite(Item(5, 1)));
+        assert!(q.push_overwrite(Item(6, 1)));
+        assert_eq!(q.try_pop(), Some(Item(5, 1)));
+        assert_eq!(q.try_pop(), Some(Item(6, 1)));
+    }
+    #[test]
+    fn uart_preserves_partially_transmitted_head() {
+        let mut q = OverwriteBytePacketRing::<2, 8>::new();
+        q.push_overwrite_slices(&[b"abcd"]);
+        q.consume(2);
+        q.push_overwrite_slices(&[b"old"]);
+        q.push_overwrite_slices(&[b"new"]);
+        let mut buf = [0; 16];
+        let n = q.peek_into(&mut buf);
+        assert_eq!(&buf[..n], b"cdnew");
+        q.consume(n);
+        assert!(q.is_empty());
+    }
+    #[test]
+    fn uart_rejects_oversize_and_never_truncates_active_frame() {
+        let mut q = OverwriteBytePacketRing::<1, 4>::new();
+        q.push_overwrite_slices(&[b"abcde"]);
+        assert!(q.is_empty());
+        q.push_overwrite_slices(&[b"abcd"]);
+        q.consume(1);
+        q.push_overwrite_slices(&[b"new"]);
+        let mut buf = [0; 8];
+        let n = q.peek_into(&mut buf);
+        assert_eq!(&buf[..n], b"bcd");
+        assert!(render_diagnostics().contains("reject="));
     }
 }

@@ -53,10 +53,22 @@ fn main() {
     println!("cargo:rerun-if-changed=pico-fi-client.json");
     println!("cargo:rerun-if-changed=scripts/build-uf2.sh");
     println!("cargo:rerun-if-env-changed=PICO_FI_CONFIG");
+    println!("cargo:rerun-if-env-changed=PICO_FI_UART_BAUD_RATE");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
     fs::copy("memory.x", out_dir.join("memory.x")).expect("failed to copy memory.x to OUT_DIR");
-    let generated = render_generated_config(load_json_config());
+    let uart_baud: u32 = env::var("PICO_FI_UART_BAUD_RATE")
+        .unwrap_or_else(|_| "115200".to_owned())
+        .parse()
+        .expect("PICO_FI_UART_BAUD_RATE must be a positive integer");
+    assert!(
+        (1200..=1_000_000).contains(&uart_baud),
+        "UART baud must be 1200..=1000000"
+    );
+    let generated = format!(
+        "{}\npub const COMPILED_UART_BAUD_RATE: u32 = {uart_baud};\n",
+        render_generated_config(load_json_config())
+    );
     fs::write(out_dir.join("generated_config.rs"), generated)
         .expect("failed to write generated config");
 

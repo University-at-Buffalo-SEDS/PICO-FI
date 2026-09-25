@@ -9,7 +9,8 @@ use crate::bridge::spi_diag;
 use crate::bridge::spi_frame::SpiFrame;
 use crate::config::BridgeConfig;
 use crate::net::{
-    connect_with_timeout, exchange_link_handshake, read_bridge_frame, write_bridge_frame,
+    bridge_frame_reader, connect_with_timeout, exchange_link_handshake, read_bridge_frame,
+    write_bridge_frame,
 };
 use crate::protocol::i2c::{
     RESP_COMMAND_MAGIC, RESP_DATA_MAGIC, RequestFrame, parse_request_bytes,
@@ -174,9 +175,15 @@ async fn session(
     spi_tx: &'static OverwriteQueue<SpiFrame, SPI_PACKET_QUEUE_DEPTH, SPI_PACKET_QUEUE_BYTES>,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; 256];
+    let mut net_reader = bridge_frame_reader();
 
     loop {
-        match select(read_bridge_frame(socket, &mut net_buf), spi_rx.pop()).await {
+        match select(
+            read_bridge_frame(&mut net_reader, socket, &mut net_buf),
+            spi_rx.pop(),
+        )
+        .await
+        {
             Either::First(Ok(net_n)) => {
                 let response = SpiFrame::response(RESP_DATA_MAGIC, &net_buf[..net_n]);
                 let preview = response.as_slice();

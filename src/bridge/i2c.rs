@@ -8,7 +8,8 @@ use crate::bridge::overwrite_queue::{
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{
-    connect_with_timeout, exchange_link_handshake, read_bridge_frame, write_bridge_frame,
+    bridge_frame_reader, connect_with_timeout, exchange_link_handshake, read_bridge_frame,
+    write_bridge_frame,
 };
 use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
@@ -140,9 +141,15 @@ async fn session(
     i2c_tx: &'static OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>,
 ) -> Result<(), ()> {
     let mut net_buf = [0u8; I2C_PACKET_MAX];
+    let mut net_reader = bridge_frame_reader();
 
     loop {
-        match select(i2c_rx.pop(), read_bridge_frame(socket, &mut net_buf)).await {
+        match select(
+            i2c_rx.pop(),
+            read_bridge_frame(&mut net_reader, socket, &mut net_buf),
+        )
+        .await
+        {
             Either::First(packet) => {
                 handle_i2c_request(packet, Some(socket), bridge_config, link_active, i2c_tx)
                     .await?;

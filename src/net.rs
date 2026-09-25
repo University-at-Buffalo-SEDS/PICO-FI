@@ -2,6 +2,7 @@
 
 use crate::Irqs;
 use crate::config::{AddressMode, BridgeConfig};
+use crate::protocol::stream::FrameReader;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
@@ -253,22 +254,16 @@ pub async fn write_bridge_frame(socket: &mut TcpSocket<'_>, payload: &[u8]) -> R
     write_socket(socket, payload).await
 }
 
-/// Reads one length-prefixed bridge payload from the TCP stream into `buf`.
+/// Keep this reader for the lifetime of a TCP session, alongside its payload buffer.
+pub const fn bridge_frame_reader() -> FrameReader {
+    FrameReader::new([[BRIDGE_FRAME_MAGIC0, BRIDGE_FRAME_MAGIC1]; 2], false)
+}
+
+/// Cancellation-safe when `reader` and `buf` survive the cancelled call.
 pub async fn read_bridge_frame(
+    reader: &mut FrameReader,
     socket: &mut TcpSocket<'_>,
     buf: &mut [u8],
 ) -> Result<usize, ()> {
-    let mut header = [0u8; BRIDGE_FRAME_HEADER_SIZE];
-    read_socket_exact(socket, &mut header).await?;
-    if header[0] != BRIDGE_FRAME_MAGIC0 || header[1] != BRIDGE_FRAME_MAGIC1 {
-        return Err(());
-    }
-
-    let len = u16::from_le_bytes([header[2], header[3]]) as usize;
-    if len > buf.len() {
-        return Err(());
-    }
-
-    read_socket_exact(socket, &mut buf[..len]).await?;
-    Ok(len)
+    reader.read(socket, buf).await.map(|(_, len)| len)
 }

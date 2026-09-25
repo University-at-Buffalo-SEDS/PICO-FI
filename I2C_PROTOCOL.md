@@ -1,190 +1,135 @@
-# I2C Protocol
+# I2C packet protocol v2
 
-This document describes the current Pico-Fi I2C upstream transport as implemented by:
+The GroundStation-side Pico remains an I2C slave at `0x55`. V2 carries one
+complete bridge packet immediately, without a timer, aggregation, or 32-byte
+padding. Ethernet and gateway-side UART framing do not change.
 
-- [src/bridge/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c.rs)
-- [src/bridge/i2c_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c_task.rs)
-- [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
-- [host/python/i2c/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/test.py)
+## Wire contract
 
-Unlike UART and SPI, I2C does not use one contiguous wire frame. It uses chunked `32` byte slots that are reassembled
-into logical packets. Those logical packets carry the same `4` byte request/response header used by UART and SPI.
+Every packet has a four-byte header: `[0xD2, kind, length_lo, length_hi]`.
+The length counts payload bytes only and is limited to 4092. Kinds are idle
+`0`, data `1`, local command `2`, explicit USB bootloader request `0x7e`, and
+error `0x7f`. Idle requires length zero. Application packets are nonempty.
+DATA payloads are opaque SEDSnet transport units, including compact frames
+and discovery chunks; the former nested four-byte UART envelope is removed.
+SEDSnet validates its own packet integrity.
 
-## Electrical Setup
+The host selects v2 by writing `[0xD2, 0, 0, 0]`, then verifies a v2 header.
+A legacy reply is an explicit firmware mismatch, not an empty mailbox. A Pico
+starts in v1 mode and still accepts the existing 32-byte slot protocol. V1
+writes select v1 again. Stop the host before changing protocol versions.
 
-Default bus role:
+- **Write:** one transaction containing the header and exactly `length` bytes.
+- **Read:** read four bytes to peek at the next packet's kind/length, then read
+  `4 + length` bytes in a second transaction. That transaction repeats the same
+  header followed by the payload. Validate that both headers match.
+- **Idle:** a four-byte idle header; there is no second transaction.
+- **Aborted read:** retain the mailbox packet. Only a completed payload read
+  consumes it. Every subsequent transaction starts with a fresh header.
+- **Restart:** the host reselects v2 after an I/O or header error. Selection does
+  not discard a staged v2 packet. The bridge queues remain bounded; this is not
+  an end-to-end lossless delivery guarantee under overload.
+- **USB bootloader:** an explicit kind `0x7e` write with payload `BOOTSEL`
+  enters the RP2040 ROM USB loader. It requires this firmware already installed.
 
-- Linux host: I2C master
-- Pico: `I2C0` slave
-- default address: `0x55`
+A 35-byte message costs 43 I2C data bytes to receive (4-byte peek + 39-byte
+packet), versus 96 with v1 even before its nested UART envelope. I2C address,
+ACK, START/STOP, clock stretching, and Linux scheduling add overhead. The
+change does **not** establish 5,000 messages/s; measure the actual traffic mix.
 
-Pico pins:
+## Build
 
-- `GPIO0`: `I2C0 SDA`
-- `GPIO1`: `I2C0 SCL`
+From pico-fi:
 
-Typical Pi wiring:
-
-- Pi `SDA` -> Pico `GPIO0`
-- Pi `SCL` -> Pico `GPIO1`
-- Pi `GND` -> Pico `GND`
-
-## Slot Format
-
-Each on-wire transfer is one `32` byte slot.
-
-Constants from [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py):
-
-- slot size: `32`
-- header size: `18`
-- payload bytes per slot: `14`
-- magic: `0x49 0x32`
-- version: `1`
-
-Per-slot layout:
-
-- bytes `0..1`: magic
-- byte `2`: version
-- byte `3`: kind
-- byte `4`: flags
-- byte `5`: reserved
-- bytes `6..9`: payload offset, little-endian
-- bytes `10..13`: total transfer length, little-endian
-- bytes `14..15`: slot payload length, little-endian
-- bytes `16..17`: transfer id, little-endian
-- bytes `18..31`: slot payload bytes
-
-Flags:
-
-- `FLAG_START = 0x01`
-- `FLAG_END = 0x02`
-
-Large logical messages are split across multiple slots and reassembled by transfer id plus offset.
-
-## Packet Kinds
-
-Current host and firmware kinds:
-
-- `KIND_IDLE = 0x00`
-- `KIND_DATA = 0x01`
-- `KIND_COMMAND = 0x02`
-- `KIND_ERROR = 0x7F`
-
-Semantics:
-
-- `KIND_DATA`: bridged data
-- `KIND_COMMAND`: local Pico commands such as `/ping`, `/show`, `/link`
-- `KIND_ERROR`: protocol or parsing error
-
-An empty `KIND_DATA` payload is the I2C-side equivalent of a poll / empty acknowledgement.
-
-## Current Firmware Behavior
-
-When the bridge session is active:
-
-- non-empty `KIND_DATA` payloads are forwarded across the bridge
-- incoming network data is queued back to the I2C host as `KIND_DATA`
-- `KIND_COMMAND` is handled locally on the Pico
-- the TCP leg wraps each logical payload in a `0xB5 0x4E + u16 length` bridge frame so I2C packet boundaries remain
-  stable across Ethernet
-
-When the bridge session is not active:
-
-- `KIND_COMMAND` still works locally
-- non-empty `KIND_DATA` may receive only an empty acknowledgement
-
-Unknown kinds are answered with:
-
-- `KIND_ERROR`
-- payload `error invalid i2c frame`
-
-Queue behavior:
-
-- I2C ingress and response queues drop whole logical packets, never individual bytes
-- each queue is capped at `8` packets and `8192` queued payload bytes
-- if a new packet would exceed the byte cap, old packets are dropped until it fits
-- if a single packet is larger than the byte cap, that packet is dropped
-
-## Minimal Driver Algorithm
-
-To send a logical packet:
-
-1. Split the payload into `14` byte chunks.
-2. Emit one or more `32` byte slots with:
-3. matching transfer id
-4. offset increasing by chunk length
-5. `FLAG_START` on the first slot
-6. `FLAG_END` on the last slot
-
-To receive a logical packet:
-
-1. Read `32` byte slots from the slave.
-2. Ignore all-zero / all-`0xFF` / `KIND_IDLE` slots.
-3. Start a new assembly when `FLAG_START` is set.
-4. Append payload bytes while validating:
-5. same kind
-6. same transfer id
-7. matching offset
-8. stop when `FLAG_END` arrives and total length matches
-
-The reference implementation for this is already in:
-
-- [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
-
-If you are implementing another driver, copy that state machine behavior.
-
-## Example Host Usage
-
-Current `host/python/i2c/test.py` supports:
-
-```bash
-python3 host/python/i2c/test.py --bus 1 --addr 0x55 probe --count 3
-python3 host/python/i2c/test.py --bus 1 --addr 0x55 command /ping
-python3 host/python/i2c/test.py --bus 1 --addr 0x55 command /link
+```sh
+PICO_FI_CONFIG=pico-fi-server.json PICO_FI_UART_BAUD_RATE=1000000 cargo build --release
+cargo host-test
+elf2uf2-rs target/thumbv6m-none-eabi/release/pico-fi pico-fi-i2c-v2.uf2
 ```
 
-Current note:
+The UART setting is unchanged and does not set I2C speed. The Pi is the I2C
+clock master. Both controllers support Fast-mode Plus; request 1 MHz on the Pi
+and verify operation with the actual wiring. The supported maximum is 1 MHz.
 
-- the I2C test helper does not yet expose standalone `send` / `recv` subcommands like UART and SPI
-- the interactive terminal and telemetry router are the easiest current ways to drive bridged I2C payloads
+## Paired deployment from GroundStation's Pi
 
-Interactive terminal:
+First rebuild GroundStation with this change. Missing `protocol_version`
+continues to mean v1, so the rebuilt backend can run with the old firmware.
+The deploy helper is `backend/tools/pico_i2c.py` in GroundStation26.
 
-```bash
-python3 host/python/i2c/link_terminal.py --bus 1 --addr 0x55
+1. Stop both the backend and frontend before direct bus access. On the current
+   Pi installation, the backend is a separate system service:
+
+   ```sh
+   sudo systemctl stop sed-ground-station.service
+   systemctl --user stop seds-gs-app.service
+   ```
+
+   Stopping only the frontend leaves the backend using I2C. Killing the backend
+   process alone lets its service restart it automatically.
+2. Connect the GroundStation-side Pico by **USB data cable to the Pi** and enter
+   BOOTSEL. The first upgrade requires the physical BOOTSEL procedure or SWD;
+   the old firmware cannot service the new software bootloader command.
+3. Flash the validated RP2040 UF2 from the Pi, using either installed picotool
+   or the mounted bootloader drive:
+
+   ```sh
+   sudo python3 backend/tools/pico_i2c.py flash /path/pico-fi-i2c-v2.uf2
+   # Alternative when RPI-RP2 is mounted:
+   python3 backend/tools/pico_i2c.py flash /path/pico-fi-i2c-v2.uf2 --mount /media/rylan/RPI-RP2
+   ```
+
+4. With GroundStation still stopped, verify v2 at the existing clock and then
+   prepare the paired backend configuration and 1 MHz Pi clock:
+
+   ```sh
+   sudo python3 backend/tools/pico_i2c.py probe
+   sudo python3 backend/tools/pico_i2c.py configure --comms-config backend/comms/comms.json --clock-hz 1000000
+   ```
+
+   `configure` verifies v2 first, saves backups, sets fill_box protocol_version
+   to 2, and changes `/boot/firmware/config.txt`. It does not reboot automatically.
+   Serial `baud_rate` has no effect on I2C and is removed from that link config.
+5. Reboot the Pi to apply the clock, start the backend and frontend services,
+   and measure delivery
+   rate, gaps, and transport errors. If 1 MHz is unreliable, configure 400000
+   and reboot; v2 still provides the framing improvement at 400 kHz.
+
+Future updates can enter BOOTSEL from the stopped GroundStation host with:
+
+```sh
+sudo python3 backend/tools/pico_i2c.py bootloader
 ```
 
-Telemetry note:
+A USB data connection is still required to transfer firmware. This is USB
+flashing initiated over I2C, not a firmware upload over the I2C data protocol.
 
-- the current telemetry terminal only supports UART and SPI
-- for I2C telemetry validation today,
-  use [host/python/i2c/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/sedsprintf_router.py)
-  or add an I2C backend that
-  reuses [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
+## Tests and simulator
 
-## sedsprintf Router
+Pico host tests exercise the exact codec/mailbox used by firmware, including
+oversized/malformed packets, short reads, repeated peeks, and exact consumption.
+GroundStation Linux tests exercise its actual read/write implementation over a
+mock transaction socket for small, 1 KiB, and maximum-size packets and reject
+legacy firmware before sending application data. Its v2 socket test interface
+uses `w`/`r` followed by a u16 transaction length; v1 `W`/`R` stays unchanged.
+The existing full-board simulator uses v1 unless updated to this interface.
 
-The I2C router wraps UDP datagrams in `sedsprintf_rs_2026` packets and sends those serialized bytes inside logical
-`KIND_DATA` packets.
+## Paired firmware for throughput testing
 
-Example:
+Run `sh tools/build-paired-i2c.sh` to build both roles with an explicit
+1,000,000 baud UART setting. It saves separate ELF images in `target/` and
+does not flash either device. Build the gateway with its `Pico1M` CMake
+preset (`cmake --preset Pico1M && cmake --build --preset Pico1M`). The Pi
+still needs protocol version 2 and its separately configured 1 MHz I²C bus.
+The protocol does not change the Pi clock automatically.
 
-```bash
-python3 host/python/i2c/sedsprintf_router.py \
-  --bus 1 \
-  --addr 0x55 \
-  --listen-port 9000 \
-  --forward-port 9001 \
-  --sender i2c-end
-```
+`/queues` reports aggregate mailbox/UART packet drops, rejected oversize
+packets, and queue high-water marks since boot. Mailbox overflow still
+evicts the oldest complete packet; it is bounded and intentionally lossy.
+UART overflow preserves a partially transmitted head packet. Neither queue
+policy promises lossless traffic under sustained overload. These counters
+are aggregate across queues of each kind, not successful-delivery counts.
 
-Again, this does not change the I2C slot format. It only changes the bytes carried in the logical data packet.
-
-## References
-
-- [host/python/i2c/protocol.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/protocol.py)
-- [host/python/i2c/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/test.py)
-- [host/python/i2c/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/link_terminal.py)
-- [host/python/i2c/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/i2c/sedsprintf_router.py)
-- [src/bridge/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c.rs)
-- [src/bridge/i2c_task.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/i2c_task.rs)
+The DAQ test default is 250 reports/s per loadcell (500 combined). This
+preserves separate packets; neither firmware waits to batch samples.
+1 MHz I²C and 1 Mbaud UART do not support 5,000 typical telemetry packets/s.
