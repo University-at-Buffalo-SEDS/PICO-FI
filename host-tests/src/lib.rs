@@ -13,3 +13,24 @@ pub mod overwrite_queue;
 
 #[path = "../../src/protocol/duplex.rs"]
 pub mod duplex;
+
+#[path = "../../src/protocol/discovery.rs"]
+pub mod discovery;
+
+#[path = "../../src/protocol/ipv4ll.rs"]
+pub mod ipv4ll;
+
+mod protocol {
+    pub use crate::ipv4ll;
+}
+#[path = "../../src/arp_guard.rs"]
+pub mod arp_guard;
+
+#[path = "../../src/config.rs"]
+pub mod config;
+#[cfg(test)]
+#[path = "../../src/config_record.rs"]
+pub mod config_record;
+
+#[path = "../../src/protocol/auto_address.rs"]
+pub mod auto_address;

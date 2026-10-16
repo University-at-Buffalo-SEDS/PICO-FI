@@ -3,8 +3,11 @@
 
 //! Firmware entry point and high-level bridge role selection.
 
+mod arp_guard;
 mod bridge;
 mod config;
+mod config_record;
+mod lan_discovery;
 mod net;
 mod protocol;
 mod shell;
@@ -285,13 +288,18 @@ async fn app(spawner: Spawner) {
         ),
     };
     let mut uart = Some(uart);
-    let bridge_config = configuration_shell(
+    let mut bridge_config = configuration_shell(
         uart.as_mut()
             .expect("configuration shell requires the boot UART"),
         &mut config_storage,
         initial_config,
     )
     .await;
+    if bridge_config.mac_address == [0; 6] {
+        bridge_config.mac_address = config_storage
+            .hardware_mac()
+            .expect("physical flash UID unavailable");
+    }
     if let Some(uart) = uart.as_mut() {
         let _ = drain_uart_rx(uart, 10, 100).await;
     }

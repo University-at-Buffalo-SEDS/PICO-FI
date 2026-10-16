@@ -27,7 +27,8 @@ pub async fn write_banner(uart: &mut BufferedUart) -> Result<(), ()> {
     writeln_line(uart, "booting with compiled config").await?;
     writeln_line(uart, "commands available before network starts:").await?;
     writeln_line(uart, "  show").await?;
-    writeln_line(uart, "  set dhcp").await?;
+    writeln_line(uart, "  set auto | set dhcp").await?;
+    writeln_line(uart, "  set discover | set discovery on/off").await?;
     writeln_line(uart, "  set static <ip>/<prefix> <gateway> <dns>").await?;
     writeln_line(uart, "  set client <dest-ip> <port>").await?;
     writeln_line(uart, "  set server <listen-port>").await?;

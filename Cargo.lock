@@ -1055,6 +1055,7 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
+ "embassy-net-driver",
  "embassy-net-wiznet",
  "embassy-rp",
  "embassy-sync",

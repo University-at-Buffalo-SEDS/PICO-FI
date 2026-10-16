@@ -18,6 +18,8 @@ pub struct Ipv4Config {
 /// Supported interface address assignment modes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressMode {
+    /// DHCP with probed IPv4 link-local fallback and idle DHCP recovery.
+    Auto,
     /// Requests an address from DHCP.
     Dhcp,
     /// Uses the explicitly provided static IPv4 settings.
@@ -67,6 +69,8 @@ pub enum UartPort {
 /// Full runtime bridge configuration assembled from compiled defaults and shell overrides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
+    /// Discover compatible LAN hosts; an unspecified client IP selects discovery.
+    pub discovery: bool,
     /// Ethernet MAC address presented by the W5500.
     pub mac_address: [u8; 6],
     /// IP address assignment strategy.
@@ -109,6 +113,10 @@ pub enum Command {
     Start,
     /// Switches the interface to DHCP mode.
     SetDhcp,
+    /// DHCP with conflict-checked link-local fallback.
+    SetAuto,
+    /// Enable or disable LAN discovery.
+    SetDiscovery(bool),
     /// Switches the interface to static IPv4 mode.
     SetStatic(Ipv4Config),
     /// Selects TCP client bridge mode.
@@ -136,6 +144,13 @@ pub fn parse_command(line: &str) -> Result<Command, &'static str> {
         ["help"] => Ok(Command::Help),
         ["show"] => Ok(Command::Show),
         ["start"] => Ok(Command::Start),
+        ["set", "auto"] => Ok(Command::SetAuto),
+        ["set", "discovery", "on"] => Ok(Command::SetDiscovery(true)),
+        ["set", "discovery", "off"] => Ok(Command::SetDiscovery(false)),
+        ["set", "discover"] => Ok(Command::SetClient {
+            host: [0; 4],
+            port: 9000,
+        }),
         ["set", "dhcp"] => Ok(Command::SetDhcp),
         ["set", "static", cidr, gateway, dns] => {
             Ok(Command::SetStatic(parse_static(cidr, gateway, dns)?))
@@ -171,6 +186,14 @@ pub fn apply_command(config: &mut BridgeConfig, cmd: Command) -> bool {
     match cmd {
         Command::Help | Command::Show => false,
         Command::Start => true,
+        Command::SetAuto => {
+            config.address_mode = AddressMode::Auto;
+            false
+        }
+        Command::SetDiscovery(enabled) => {
+            config.discovery = enabled;
+            false
+        }
         Command::SetDhcp => {
             config.address_mode = AddressMode::Dhcp;
             false
@@ -181,6 +204,9 @@ pub fn apply_command(config: &mut BridgeConfig, cmd: Command) -> bool {
         }
         Command::SetClient { host, port } => {
             config.bridge_mode = BridgeMode::TcpClient { host, port };
+            if host == [0; 4] {
+                config.discovery = true;
+            }
             false
         }
         Command::SetServer { port } => {
@@ -202,7 +228,13 @@ pub fn render_config(config: &BridgeConfig) -> String<160> {
     push_mac(&mut out, config.mac_address);
     let _ = out.push(' ');
 
+    if config.discovery {
+        let _ = out.push_str("discovery=on ");
+    }
     match config.address_mode {
+        AddressMode::Auto => {
+            let _ = out.push_str("ip=auto ");
+        }
         AddressMode::Dhcp => {
             let _ = out.push_str("ip=dhcp ");
         }
@@ -443,5 +475,29 @@ mod tests {
     fn parses_upstream_usb() {
         let cmd = parse_command("set upstream usb").expect("upstream mode command should parse");
         assert_eq!(cmd, Command::SetUpstream(UpstreamMode::Usb));
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    #[test]
+    fn shell_enables_automatic_address_and_host_discovery_independently() {
+        let mut config = BridgeConfig::default();
+        apply_command(&mut config, parse_command("set dhcp").unwrap());
+        assert_eq!(config.address_mode, AddressMode::Dhcp);
+        apply_command(&mut config, parse_command("set auto").unwrap());
+        assert_eq!(config.address_mode, AddressMode::Auto);
+        apply_command(&mut config, parse_command("set discovery off").unwrap());
+        assert!(!config.discovery);
+        apply_command(&mut config, parse_command("set discover").unwrap());
+        assert!(config.discovery);
+        assert_eq!(
+            config.bridge_mode,
+            BridgeMode::TcpClient {
+                host: [0; 4],
+                port: 9000
+            }
+        );
     }
 }

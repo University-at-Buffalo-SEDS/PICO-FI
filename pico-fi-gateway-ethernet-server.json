@@ -1,0 +1,15 @@
+{
+  "network": {
+    "mac": "auto",
+    "mode": "auto"
+  },
+  "bridge": {
+    "role": "server",
+    "discovery": true,
+    "listen_port": 9000
+  },
+  "upstream": {
+    "transport": "uart",
+    "uart": "uart1"
+  }
+}

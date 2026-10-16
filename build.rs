@@ -23,6 +23,8 @@ struct JsonNetworkConfig {
 
 #[derive(Deserialize)]
 struct JsonBridgeConfig {
+    #[serde(default)]
+    discovery: bool,
     role: String,
     listen_port: Option<u16>,
     remote_ip: Option<String>,
@@ -88,18 +90,22 @@ fn render_generated_config(config: JsonConfig) -> String {
     let mac_address = render_mac_address(&config.network);
     let address_mode = render_address_mode(&config.network);
     let bridge_mode = render_bridge_mode(&config.bridge);
+    let discovery = config.bridge.discovery;
     let upstream = render_upstream_mode(&config.upstream);
     let uart_port = render_uart_port(&config.upstream);
     let usb_names = render_usb_names(config.upstream.usb.as_ref());
 
     format!(
-        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n    uart_port: {uart_port},\n}};\n\
+        "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    discovery: {discovery},\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n    uart_port: {uart_port},\n}};\n\
 pub const COMPILED_USB_DEVICE_NAMES: UsbDeviceNames = {usb_names};\n"
     )
 }
 
 fn render_mac_address(network: &JsonNetworkConfig) -> String {
     let value = network.mac.as_deref().unwrap_or("02:00:00:12:34:56");
+    if value == "auto" {
+        return "[0; 6]".to_owned();
+    }
     let mut octets = [0u8; 6];
     let mut count = 0usize;
 
@@ -119,6 +125,7 @@ fn render_mac_address(network: &JsonNetworkConfig) -> String {
 
 fn render_address_mode(network: &JsonNetworkConfig) -> String {
     match network.mode.as_str() {
+        "auto" => "AddressMode::Auto".to_owned(),
         "dhcp" => "AddressMode::Dhcp".to_owned(),
         "static" => {
             let ip = parse_ipv4(network.ip.as_deref(), "network.ip");
@@ -145,10 +152,13 @@ fn render_bridge_mode(bridge: &JsonBridgeConfig) -> String {
             format!("BridgeMode::TcpServer {{ port: {port} }}")
         }
         "client" => {
-            let host = parse_ipv4(bridge.remote_ip.as_deref(), "bridge.remote_ip");
-            let port = bridge
-                .remote_port
-                .expect("bridge.remote_port is required for client role");
+            let host =
+                if bridge.discovery && bridge.remote_ip.as_deref().is_none_or(|ip| ip == "auto") {
+                    "[0; 4]".to_owned()
+                } else {
+                    parse_ipv4(bridge.remote_ip.as_deref(), "bridge.remote_ip")
+                };
+            let port = bridge.remote_port.unwrap_or(9000);
             format!("BridgeMode::TcpClient {{ host: {host}, port: {port} }}")
         }
         other => panic!("unsupported bridge.role: {other}"),

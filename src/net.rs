@@ -33,6 +33,8 @@ pub type WizRunner = embassy_net_wiznet::Runner<
 >;
 
 /// Shared network stack resources used by Embassy.
+static ADDRESS_PROBE: StaticCell<crate::arp_guard::ProbeState> = StaticCell::new();
+
 static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
 /// Shared W5500 driver state.
@@ -47,7 +49,9 @@ const BRIDGE_FRAME_MAGIC1: u8 = 0x4E;
 
 /// Runs the background Embassy network stack task.
 #[embassy_executor::task]
-pub async fn net_task(mut runner: Runner<'static, embassy_net_wiznet::Device<'static>>) {
+pub async fn net_task(
+    mut runner: Runner<'static, crate::arp_guard::ArpGuard<embassy_net_wiznet::Device<'static>>>,
+) {
     runner.run().await;
 }
 
@@ -93,7 +97,7 @@ pub async fn bring_up_network(
         .map_err(|_| "w5500 init failed")?;
 
     let net_config = match bridge_config.address_mode {
-        AddressMode::Dhcp => NetConfig::dhcpv4(Default::default()),
+        AddressMode::Dhcp | AddressMode::Auto => NetConfig::dhcpv4(Default::default()),
         AddressMode::Static(static_ip) => {
             let mut dns_servers = Vec::<Ipv4Address, 3>::new();
             dns_servers
@@ -126,7 +130,18 @@ pub async fn bring_up_network(
         }
     };
 
-    let seed = 0x0012_3456_89ab_cdef;
+    let probe = ADDRESS_PROBE.init(crate::arp_guard::ProbeState::new(bridge_config.mac_address));
+    let device = crate::arp_guard::ArpGuard::new(device, probe);
+    let seed = u64::from_le_bytes([
+        bridge_config.mac_address[0],
+        bridge_config.mac_address[1],
+        bridge_config.mac_address[2],
+        bridge_config.mac_address[3],
+        bridge_config.mac_address[4],
+        bridge_config.mac_address[5],
+        0x51,
+        0x9e,
+    ]);
     let (stack, net_runner) = embassy_net::new(
         device,
         net_config,
@@ -141,12 +156,27 @@ pub async fn bring_up_network(
         Timer::after_millis(250).await;
     }
 
-    if matches!(bridge_config.address_mode, AddressMode::Dhcp) {
+    if matches!(bridge_config.address_mode, AddressMode::Auto) {
+        spawner.spawn(
+            auto_address_task(stack, bridge_config.mac_address, probe)
+                .map_err(|_| "auto IP task spawn failed")?,
+        );
+    }
+    if matches!(
+        bridge_config.address_mode,
+        AddressMode::Dhcp | AddressMode::Auto
+    ) {
         while stack.config_v4().is_none() {
             Timer::after_millis(250).await;
         }
     }
 
+    if bridge_config.discovery {
+        spawner.spawn(
+            crate::lan_discovery::discovery_task(stack, bridge_config)
+                .map_err(|_| "LAN discovery task spawn failed")?,
+        );
+    }
     Ok(stack)
 }
 
@@ -192,6 +222,11 @@ pub async fn connect_with_timeout(
     port: u16,
     timeout_ms: u64,
 ) -> Result<(), ()> {
+    let (remote, port) = if remote.is_unspecified() {
+        crate::lan_discovery::peer().ok_or(())?
+    } else {
+        (remote, port)
+    };
     match select(
         socket.connect((remote, port)),
         Timer::after_millis(timeout_ms),
@@ -266,4 +301,48 @@ pub async fn read_bridge_frame(
     buf: &mut [u8],
 ) -> Result<usize, ()> {
     reader.read(socket, buf).await.map(|(_, len)| len)
+}
+
+/// DHCP first. Only claim IPv4LL after three transmitted probes; abandon conflicts.
+#[embassy_executor::task]
+async fn auto_address_task(
+    stack: Stack<'static>,
+    mac: [u8; 6],
+    probe: &'static crate::arp_guard::ProbeState,
+) {
+    use crate::protocol::auto_address::{Action, AutoAddress};
+    use embassy_net::ConfigV4;
+    let mut policy = AutoAddress::new(mac);
+    loop {
+        let action = policy.tick(
+            embassy_time::Instant::now().as_millis(),
+            stack.is_link_up(),
+            stack.config_v4().is_some(),
+            crate::LINK_ACTIVE.load(portable_atomic::Ordering::Acquire),
+            probe.pending(),
+            probe.conflicted(),
+        );
+        match action {
+            Action::None => {}
+            Action::Clear => {
+                probe.clear();
+                crate::lan_discovery::clear_peer();
+                stack.set_config_v4(ConfigV4::None);
+            }
+            Action::Dhcp => {
+                probe.clear();
+                crate::lan_discovery::clear_peer();
+                stack.set_config_v4(ConfigV4::Dhcp(Default::default()));
+            }
+            Action::Candidate(ip) => probe.candidate(ip),
+            Action::Probe => probe.request(false),
+            Action::Claim(ip) => stack.set_config_v4(ConfigV4::Static(StaticConfigV4 {
+                address: Ipv4Cidr::new(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]), 16),
+                gateway: None,
+                dns_servers: Vec::new(),
+            })),
+            Action::Announce => probe.request(true),
+        }
+        Timer::after_millis(20).await;
+    }
 }
