@@ -1,0 +1,20 @@
+{
+  "network": {
+    "mac": "02:00:00:12:34:57",
+    "mode": "static",
+    "ip": "192.168.3.20",
+    "prefix_len": 24,
+    "gateway": "192.168.3.1",
+    "dns": "1.1.1.1"
+  },
+  "bridge": {
+    "role": "server",
+    "listen_port": 9000,
+    "remote_ip": "192.168.3.7",
+    "remote_port": 9000
+  },
+  "upstream": {
+    "transport": "uart",
+    "uart": "uart1"
+  }
+}
