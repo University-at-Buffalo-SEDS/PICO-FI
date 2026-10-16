@@ -124,10 +124,10 @@ still needs protocol version 2 and its separately configured 1 MHz I²C bus.
 The protocol does not change the Pi clock automatically.
 
 `/queues` reports aggregate mailbox/UART packet drops, rejected oversize
-packets, and queue high-water marks since boot. Mailbox overflow still
-evicts the oldest complete packet; it is bounded and intentionally lossy.
-UART overflow preserves a partially transmitted head packet. Neither queue
-policy promises lossless traffic under sustained overload. These counters
+packets, and queue high-water marks since boot. Network-to-bus replies apply
+backpressure before reading another TCP frame, preserving accepted packets.
+Bus-originated overflow can still evict old complete requests. UART egress
+refuses new work when full and preserves accepted frames. These counters
 are aggregate across queues of each kind, not successful-delivery counts.
 
 The DAQ test default is 250 reports/s per loadcell (500 combined). This
@@ -140,9 +140,13 @@ V1 and v2 stage complete responses in FIFO order. Polling a mailbox no longer
 keeps only the newest response and discards the rest: different command ACKs,
 sensor reports and SEDSnet template/chunk frames are independent packets.
 An active multi-slot response still finishes before another packet is staged.
-The existing eight-packet / 8192-byte queue remains bounded; overwrite/drop
-counters describe overflow, not ordinary reads. SPI response staging follows
-the same FIFO rule.
+I2C queues now retain up to 128 packets within an 8192-byte payload ring;
+SPI keeps 32 packets within the same byte ceiling. Only actual packet bytes
+are stored, rather than a 4 KiB inline object per slot. This saves roughly
+48 KiB across the two I2C queues while absorbing short-frame bursts. Network
+readers pause before consuming a packet that cannot fit and continue servicing
+bus-to-network requests while paused. Accepted reply templates, data and ACKs
+are not evicted. SPI follows the same response retention and backpressure rule.
 
 Regression coverage includes distinct ACKs followed by telemetry, bounded
 overflow and preservation of a partially read response. The linked simulator
@@ -158,3 +162,8 @@ network frame arriving alongside acknowledgements. UART egress rejects a full
 queue instead of overwriting bytes already staged for transmission; the TCP
 session reports failure so the network can reconnect and retry. The 512-byte
 hardware RX buffer and existing queue capacities are unchanged.
+
+The packed-mailbox burst regression reproduces the old eight-slot template
+eviction with short frames. It also checks wrapped storage, byte/count limits,
+refused ownership and FIFO recovery. Rebuild the GroundStation-side Pico for
+this change; a backend-only update cannot change its mailbox storage.

@@ -1,4 +1,4 @@
-//! Bounded bridge buffers: lossy mailboxes and backpressured UART egress.
+//! Byte-backed mailboxes with explicit loss policy and backpressured network replies.
 
 use core::fmt::Write;
 use embassy_sync::blocking_mutex::Mutex;
@@ -8,7 +8,8 @@ use heapless::Deque;
 use portable_atomic::{AtomicU32, Ordering};
 
 // Aggregate lifetime counters across mailbox queues and UART rings. These are
-// diagnostic only. Mailboxes evict explicitly; full UART rings reject new frames.
+// diagnostic only. Bus-originated mailboxes may evict; network replies and
+// full UART rings preserve accepted frames.
 static MAILBOX_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART_DROPPED: AtomicU32 = AtomicU32::new(0);
 static REJECTED: AtomicU32 = AtomicU32::new(0);
@@ -28,91 +29,154 @@ pub fn render_diagnostics() -> heapless::String<192> {
     out
 }
 
-// I2C packets carry a 4 KiB inline payload, so keep this depth bounded to avoid
-// exhausting RP2040 RAM under burst traffic.
-pub const I2C_PACKET_QUEUE_DEPTH: usize = 8;
+// Store only actual bytes, rather than N inline 4 KiB packet objects. This
+// absorbs short telemetry bursts while using less RP2040 RAM than eight slots.
+pub const I2C_PACKET_QUEUE_DEPTH: usize = 128;
 pub const I2C_PACKET_QUEUE_BYTES: usize = 8192;
 pub const SPI_PACKET_QUEUE_DEPTH: usize = 32;
 pub const SPI_PACKET_QUEUE_BYTES: usize = 8192;
 
 pub trait QueueItem {
     fn queued_len(&self) -> usize;
+    fn copy_queued_slice(&self, start: usize, target: &mut [u8]);
+    fn from_queued_slices(first: &[u8], second: &[u8]) -> Option<Self>
+    where
+        Self: Sized;
 }
 
-struct QueueState<T, const N: usize> {
-    queue: Deque<T, N>,
-    queued_bytes: usize,
+struct QueueState<const N: usize, const B: usize> {
+    lengths: Deque<usize, N>,
+    bytes: [u8; B],
+    head: usize,
+    used: usize,
 }
-
-impl<T, const N: usize> QueueState<T, N> {
+impl<const N: usize, const B: usize> QueueState<N, B> {
     const fn new() -> Self {
         Self {
-            queue: Deque::new(),
-            queued_bytes: 0,
+            lengths: Deque::new(),
+            bytes: [0; B],
+            head: 0,
+            used: 0,
         }
+    }
+    fn fits(&self, len: usize) -> bool {
+        len > 0 && !self.lengths.is_full() && len <= B.saturating_sub(self.used)
+    }
+    fn discard_front(&mut self) -> Option<()> {
+        let len = self.lengths.pop_front()?;
+        self.head = (self.head + len) % B;
+        self.used -= len;
+        Some(())
+    }
+    fn insert<T: QueueItem>(&mut self, item: &T) {
+        let len = item.queued_len();
+        let tail = (self.head + self.used) % B;
+        let first = len.min(B - tail);
+        item.copy_queued_slice(0, &mut self.bytes[tail..tail + first]);
+        item.copy_queued_slice(first, &mut self.bytes[..len - first]);
+        self.lengths.push_back(len).ok().unwrap();
+        self.used += len;
+        MAILBOX_HIGH_WATER.fetch_max(self.lengths.len() as u32, Ordering::Relaxed);
     }
 }
 
 pub struct OverwriteQueue<T, const N: usize, const MAX_BYTES: usize> {
-    state: Mutex<CriticalSectionRawMutex, QueueState<T, N>>,
+    state: Mutex<CriticalSectionRawMutex, QueueState<N, MAX_BYTES>>,
     ready: Signal<CriticalSectionRawMutex, ()>,
+    space: Signal<CriticalSectionRawMutex, ()>,
+    item: core::marker::PhantomData<T>,
 }
-
 impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, MAX_BYTES> {
     pub const fn new() -> Self {
         Self {
             state: Mutex::new(QueueState::new()),
             ready: Signal::new(),
+            space: Signal::new(),
+            item: core::marker::PhantomData,
         }
     }
-
-    pub fn push_overwrite(&self, item: T) -> bool {
-        let item_len = item.queued_len();
-        if item_len > MAX_BYTES || N == 0 {
-            REJECTED.fetch_add(1, Ordering::Relaxed);
-            return false;
+    pub fn has_space_for(&self, len: usize) -> bool {
+        unsafe { self.state.lock_mut(|state| state.fits(len)) }
+    }
+    pub async fn wait_for_space(&self, len: usize) {
+        loop {
+            if self.has_space_for(len) {
+                return;
+            }
+            self.space.wait().await;
         }
-
+    }
+    /// Network streams must use this path: refusing new work preserves every
+    /// accepted dictionary template, dependent frame and acknowledgement.
+    pub fn try_push(&self, item: T) -> Result<(), T> {
         let pushed = unsafe {
             self.state.lock_mut(|state| {
-                while state.queue.is_full()
-                    || state.queued_bytes.saturating_add(item_len) > MAX_BYTES
-                {
-                    match state.queue.pop_front() {
-                        Some(dropped) => {
-                            MAILBOX_DROPPED.fetch_add(1, Ordering::Relaxed);
-                            state.queued_bytes =
-                                state.queued_bytes.saturating_sub(dropped.queued_len());
-                        }
-                        None => break,
-                    }
+                if !state.fits(item.queued_len()) {
+                    return false;
                 }
-
-                if state.queue.push_back(item).is_ok() {
-                    state.queued_bytes = state.queued_bytes.saturating_add(item_len);
-                    MAILBOX_HIGH_WATER.fetch_max(state.queue.len() as u32, Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
+                state.insert(&item);
+                true
             })
         };
         if pushed {
             self.ready.signal(());
+            Ok(())
+        } else {
+            Err(item)
         }
-        pushed
     }
-
-    pub fn try_pop(&self) -> Option<T> {
+    pub async fn push(&self, mut item: T) -> Result<(), T> {
+        let len = item.queued_len();
+        if len == 0 || len > MAX_BYTES || N == 0 {
+            return Err(item);
+        }
+        loop {
+            self.wait_for_space(len).await;
+            match self.try_push(item) {
+                Ok(()) => return Ok(()),
+                Err(returned) => item = returned,
+            }
+        }
+    }
+    /// Explicit lossy policy retained for bus-originated work.
+    pub fn push_overwrite(&self, item: T) -> bool {
+        let len = item.queued_len();
+        if len == 0 || len > MAX_BYTES || N == 0 {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         unsafe {
             self.state.lock_mut(|state| {
-                let item = state.queue.pop_front()?;
-                state.queued_bytes = state.queued_bytes.saturating_sub(item.queued_len());
-                Some(item)
+                while !state.fits(len) {
+                    if state.discard_front().is_none() {
+                        return;
+                    }
+                    MAILBOX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+                state.insert(&item);
             })
-        }
+        };
+        self.ready.signal(());
+        true
     }
-
+    pub fn try_pop(&self) -> Option<T> {
+        let item = unsafe {
+            self.state.lock_mut(|state| {
+                let len = *state.lengths.front()?;
+                let first = len.min(MAX_BYTES - state.head);
+                let item = T::from_queued_slices(
+                    &state.bytes[state.head..state.head + first],
+                    &state.bytes[..len - first],
+                );
+                state.discard_front();
+                item
+            })
+        };
+        if item.is_some() {
+            self.space.signal(());
+        }
+        item
+    }
     pub async fn pop(&self) -> T {
         loop {
             if let Some(item) = self.try_pop() {
@@ -245,6 +309,15 @@ mod tests {
         fn queued_len(&self) -> usize {
             self.1
         }
+        fn copy_queued_slice(&self, _: usize, target: &mut [u8]) {
+            target.fill(self.0);
+        }
+        fn from_queued_slices(first: &[u8], second: &[u8]) -> Option<Self> {
+            Some(Self(
+                *first.first().or(second.first())?,
+                first.len() + second.len(),
+            ))
+        }
     }
     #[test]
     fn mailbox_enforces_count_bytes_and_fifo() {
@@ -259,6 +332,56 @@ mod tests {
         assert!(q.push_overwrite(Item(6, 1)));
         assert_eq!(q.try_pop(), Some(Item(5, 1)));
         assert_eq!(q.try_pop(), Some(Item(6, 1)));
+    }
+    #[test]
+    fn blocked_network_reply_wakes_only_when_the_complete_packet_fits() {
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let q = OverwriteQueue::<Item, 2, 5>::new();
+        q.try_push(Item(1, 2)).unwrap();
+        q.try_push(Item(2, 2)).unwrap();
+        let mut pending = std::boxed::Box::pin(q.push(Item(3, 4)));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(q.try_pop(), Some(Item(1, 2)));
+        assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(q.try_pop(), Some(Item(2, 2)));
+        assert!(matches!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(q.try_pop(), Some(Item(3, 4)));
+    }
+    #[test]
+    fn short_frame_burst_retains_template_and_every_dependent_frame() {
+        let q = OverwriteQueue::<Item, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES>::new();
+        // The captured old eight-slot mailbox evicted SDT templates during a
+        // short burst despite leaving most of its 8 KiB byte budget unused.
+        for id in 0..128 {
+            assert!(q.try_push(Item(id, 32)).is_ok());
+        }
+        assert!(q.try_push(Item(250, 32)).is_err());
+        for id in 0..128 {
+            assert_eq!(q.try_pop(), Some(Item(id, 32)));
+        }
+        assert_eq!(q.try_pop(), None);
+        assert!(core::mem::size_of_val(&q) < 10 * 1024);
+    }
+    #[test]
+    fn packed_mailbox_wraps_and_preserves_refused_ownership() {
+        let q = OverwriteQueue::<Item, 4, 11>::new();
+        q.try_push(Item(1, 7)).unwrap();
+        q.try_push(Item(2, 3)).unwrap();
+        assert_eq!(q.try_push(Item(3, 2)), Err(Item(3, 2)));
+        assert_eq!(q.try_pop(), Some(Item(1, 7)));
+        q.try_push(Item(4, 8)).unwrap();
+        assert_eq!(q.try_pop(), Some(Item(2, 3)));
+        assert_eq!(q.try_pop(), Some(Item(4, 8)));
+        assert_eq!(q.try_pop(), None);
+        assert!(q.try_push(Item(0, 0)).is_err());
+        assert!(q.try_push(Item(0, 12)).is_err());
     }
     #[test]
     fn uart_full_queue_never_invalidates_a_staged_transmit_chunk() {

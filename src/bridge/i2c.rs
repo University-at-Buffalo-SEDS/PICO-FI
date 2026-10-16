@@ -144,6 +144,15 @@ async fn session(
     let mut net_reader = bridge_frame_reader();
 
     loop {
+        if !i2c_tx.has_space_for(I2C_PACKET_MAX + 1) {
+            if let Either::First(packet) =
+                select(i2c_rx.pop(), i2c_tx.wait_for_space(I2C_PACKET_MAX + 1)).await
+            {
+                handle_i2c_request(packet, Some(socket), bridge_config, link_active, i2c_tx)
+                    .await?;
+            }
+            continue;
+        }
         match select(
             i2c_rx.pop(),
             read_bridge_frame(&mut net_reader, socket, &mut net_buf),
@@ -155,7 +164,9 @@ async fn session(
                     .await?;
             }
             Either::Second(Ok(net_n)) => {
-                i2c_tx.push_overwrite(make_packet(KIND_DATA, &net_buf[..net_n])?);
+                i2c_tx
+                    .try_push(make_packet(KIND_DATA, &net_buf[..net_n])?)
+                    .map_err(|_| ())?;
             }
             Either::Second(Err(_)) => return Err(()),
         }
@@ -189,11 +200,17 @@ async fn handle_i2c_request(
         KIND_COMMAND => {
             let line = trim_ascii_line(packet.payload.as_slice());
             let response = render_local_bridge_command(bridge_config, link_active, line);
-            i2c_tx.push_overwrite(make_packet(KIND_COMMAND, response.as_bytes())?);
+            i2c_tx
+                .push(make_packet(KIND_COMMAND, response.as_bytes())?)
+                .await
+                .map_err(|_| ())?;
             Ok(())
         }
         _ => {
-            i2c_tx.push_overwrite(make_packet(KIND_ERROR, b"error invalid i2c frame")?);
+            i2c_tx
+                .push(make_packet(KIND_ERROR, b"error invalid i2c frame")?)
+                .await
+                .map_err(|_| ())?;
             Ok(())
         }
     }

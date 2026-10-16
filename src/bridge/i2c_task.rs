@@ -51,6 +51,29 @@ impl QueueItem for I2cPacket {
     fn queued_len(&self) -> usize {
         1 + self.payload.len()
     }
+    fn copy_queued_slice(&self, start: usize, target: &mut [u8]) {
+        if target.is_empty() {
+            return;
+        }
+        if start == 0 {
+            target[0] = self.kind;
+            let len = target.len() - 1;
+            target[1..].copy_from_slice(&self.payload[..len]);
+        } else {
+            target.copy_from_slice(&self.payload[start - 1..start - 1 + target.len()]);
+        }
+    }
+    fn from_queued_slices(first: &[u8], second: &[u8]) -> Option<Self> {
+        let kind = *first.first().or(second.first())?;
+        let mut payload = Vec::new();
+        if first.is_empty() {
+            payload.extend_from_slice(&second[1..]).ok()?;
+        } else {
+            payload.extend_from_slice(&first[1..]).ok()?;
+            payload.extend_from_slice(second).ok()?;
+        }
+        Some(Self { kind, payload })
+    }
 }
 
 #[derive(Clone, Copy)]

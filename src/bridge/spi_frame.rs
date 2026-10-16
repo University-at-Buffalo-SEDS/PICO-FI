@@ -43,4 +43,13 @@ impl QueueItem for SpiFrame {
     fn queued_len(&self) -> usize {
         self.data.len()
     }
+    fn copy_queued_slice(&self, start: usize, target: &mut [u8]) {
+        target.copy_from_slice(&self.data[start..start + target.len()]);
+    }
+    fn from_queued_slices(first: &[u8], second: &[u8]) -> Option<Self> {
+        let mut data = Vec::new();
+        data.extend_from_slice(first).ok()?;
+        data.extend_from_slice(second).ok()?;
+        Some(Self { data })
+    }
 }

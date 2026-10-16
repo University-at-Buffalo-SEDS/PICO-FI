@@ -178,6 +178,17 @@ async fn session(
     let mut net_reader = bridge_frame_reader();
 
     loop {
+        if !spi_tx.has_space_for(crate::protocol::i2c::FRAME_SIZE) {
+            if let Either::First(frame) = select(
+                spi_rx.pop(),
+                spi_tx.wait_for_space(crate::protocol::i2c::FRAME_SIZE),
+            )
+            .await
+            {
+                handle_spi_request(frame, Some(socket), bridge_config, link_active, spi_tx).await?;
+            }
+            continue;
+        }
         match select(
             read_bridge_frame(&mut net_reader, socket, &mut net_buf),
             spi_rx.pop(),
@@ -188,7 +199,7 @@ async fn session(
                 let response = SpiFrame::response(RESP_DATA_MAGIC, &net_buf[..net_n]);
                 let preview = response.as_slice();
                 spi_diag::record_queued_response(preview[0], preview[1]);
-                let _ = spi_tx.push_overwrite(response);
+                spi_tx.try_push(response).map_err(|_| ())?;
             }
             Either::First(Err(_)) => return Err(()),
             Either::Second(frame) => {
@@ -213,7 +224,7 @@ async fn handle_spi_request(
                 let line = trim_ascii_line(payload);
                 let response = render_local_bridge_command(bridge_config, link_active, line);
                 let frame = SpiFrame::response(RESP_COMMAND_MAGIC, response.as_bytes());
-                let _ = spi_tx.push_overwrite(frame);
+                spi_tx.push(frame).await.map_err(|_| ())?;
                 return Ok(());
             }
             if let Some(socket) = socket {
@@ -226,7 +237,7 @@ async fn handle_spi_request(
                 } else {
                     SpiFrame::response(RESP_COMMAND_MAGIC, b"error spi data no socket")
                 };
-                let _ = spi_tx.push_overwrite(response);
+                spi_tx.push(response).await.map_err(|_| ())?;
             }
             Ok(())
         }
@@ -235,7 +246,7 @@ async fn handle_spi_request(
             if line.starts_with('/') {
                 let response = render_local_bridge_command(bridge_config, link_active, line);
                 let frame = SpiFrame::response(RESP_COMMAND_MAGIC, response.as_bytes());
-                let _ = spi_tx.push_overwrite(frame);
+                spi_tx.push(frame).await.map_err(|_| ())?;
             } else if let Some(socket) = socket {
                 if !payload.is_empty() {
                     write_bridge_frame(socket, payload).await?;
@@ -246,13 +257,13 @@ async fn handle_spi_request(
                 } else {
                     SpiFrame::response(RESP_COMMAND_MAGIC, b"error spi data no socket")
                 };
-                let _ = spi_tx.push_overwrite(response);
+                spi_tx.push(response).await.map_err(|_| ())?;
             }
             Ok(())
         }
         None => {
             let response = SpiFrame::response(RESP_COMMAND_MAGIC, b"error invalid spi frame");
-            let _ = spi_tx.push_overwrite(response);
+            spi_tx.push(response).await.map_err(|_| ())?;
             Ok(())
         }
     }
