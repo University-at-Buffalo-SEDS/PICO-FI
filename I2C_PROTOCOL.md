@@ -133,3 +133,28 @@ are aggregate across queues of each kind, not successful-delivery counts.
 The DAQ test default is 250 reports/s per loadcell (500 combined). This
 preserves separate packets; neither firmware waits to batch samples.
 1 MHz I²C and 1 Mbaud UART do not support 5,000 typical telemetry packets/s.
+
+## Packet retention in both versions
+
+V1 and v2 stage complete responses in FIFO order. Polling a mailbox no longer
+keeps only the newest response and discards the rest: different command ACKs,
+sensor reports and SEDSnet template/chunk frames are independent packets.
+An active multi-slot response still finishes before another packet is staged.
+The existing eight-packet / 8192-byte queue remains bounded; overwrite/drop
+counters describe overflow, not ordinary reads. SPI response staging follows
+the same FIFO rule.
+
+Regression coverage includes distinct ACKs followed by telemetry, bounded
+overflow and preservation of a partially read response. The linked simulator
+uses the same staging policy. Rebuild the GroundStation-side Pico to install
+the v1 staging repair; changing only the backend cannot fix an old Pico's
+discard policy.
+
+### UART duplex service
+
+The UART bridge services incoming frames while a buffered transmit waits for
+space. Partial RX and TX progress survive each service turn, including a long
+network frame arriving alongside acknowledgements. UART egress rejects a full
+queue instead of overwriting bytes already staged for transmission; the TCP
+session reports failure so the network can reconnect and retry. The 512-byte
+hardware RX buffer and existing queue capacities are unchanged.

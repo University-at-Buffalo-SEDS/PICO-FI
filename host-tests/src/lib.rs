@@ -10,3 +10,6 @@ pub mod i2c_packet;
 #[allow(unsafe_code)]
 #[path = "../../src/bridge/overwrite_queue.rs"]
 pub mod overwrite_queue;
+
+#[path = "../../src/protocol/duplex.rs"]
+pub mod duplex;

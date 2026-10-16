@@ -444,7 +444,7 @@ fn pull_queued_response(
     if let Some(resp) = pending_pull_response {
         return *resp;
     }
-    if let Some(resp) = rx_resp.try_pop_latest() {
+    if let Some(resp) = rx_resp.try_pop() {
         let frame = resp.as_frame();
         *pending_pull_response = Some(frame);
         return frame;

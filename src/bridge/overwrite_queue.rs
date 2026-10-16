@@ -1,14 +1,14 @@
-//! Small overwrite-on-full buffers for lossy bridge egress paths.
+//! Bounded bridge buffers: lossy mailboxes and backpressured UART egress.
 
+use core::fmt::Write;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use heapless::Deque;
 use portable_atomic::{AtomicU32, Ordering};
-use core::fmt::Write;
 
 // Aggregate lifetime counters across mailbox queues and UART rings. These are
-// diagnostic only; eviction remains an explicit bounded, lossy policy.
+// diagnostic only. Mailboxes evict explicitly; full UART rings reject new frames.
 static MAILBOX_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART_DROPPED: AtomicU32 = AtomicU32::new(0);
 static REJECTED: AtomicU32 = AtomicU32::new(0);
@@ -16,10 +16,15 @@ static MAILBOX_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 static UART_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 pub fn render_diagnostics() -> heapless::String<192> {
     let mut out = heapless::String::new();
-    let _ = write!(out, "queues mailbox_drop={} uart_drop={} reject={} mailbox_peak={} uart_peak={}",
-        MAILBOX_DROPPED.load(Ordering::Relaxed), UART_DROPPED.load(Ordering::Relaxed),
-        REJECTED.load(Ordering::Relaxed), MAILBOX_HIGH_WATER.load(Ordering::Relaxed),
-        UART_HIGH_WATER.load(Ordering::Relaxed));
+    let _ = write!(
+        out,
+        "queues mailbox_drop={} uart_drop={} reject={} mailbox_peak={} uart_peak={}",
+        MAILBOX_DROPPED.load(Ordering::Relaxed),
+        UART_DROPPED.load(Ordering::Relaxed),
+        REJECTED.load(Ordering::Relaxed),
+        MAILBOX_HIGH_WATER.load(Ordering::Relaxed),
+        UART_HIGH_WATER.load(Ordering::Relaxed)
+    );
     out
 }
 
@@ -108,20 +113,6 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
         }
     }
 
-    pub fn try_pop_latest(&self) -> Option<T> {
-        unsafe {
-            self.state.lock_mut(|state| {
-                let mut latest = state.queue.pop_front()?;
-                while let Some(next) = state.queue.pop_front() {
-                    MAILBOX_DROPPED.fetch_add(1, Ordering::Relaxed);
-                    latest = next;
-                }
-                state.queued_bytes = 0;
-                Some(latest)
-            })
-        }
-    }
-
     pub async fn pop(&self) -> T {
         loop {
             if let Some(item) = self.try_pop() {
@@ -160,12 +151,12 @@ impl<const M: usize> BytePacket<M> {
     }
 }
 
-pub struct OverwriteBytePacketRing<const N: usize, const M: usize> {
+pub struct BytePacketRing<const N: usize, const M: usize> {
     queue: Deque<BytePacket<M>, N>,
     front_offset: usize,
 }
 
-impl<const N: usize, const M: usize> OverwriteBytePacketRing<N, M> {
+impl<const N: usize, const M: usize> BytePacketRing<N, M> {
     pub const fn new() -> Self {
         Self {
             queue: Deque::new(),
@@ -173,42 +164,21 @@ impl<const N: usize, const M: usize> OverwriteBytePacketRing<N, M> {
         }
     }
 
-    pub fn push_overwrite_slices(&mut self, slices: &[&[u8]]) {
-        // Never silently truncate a framed stream packet.
-        let total = slices.iter().try_fold(0usize, |n, s| n.checked_add(s.len()));
-        if N == 0 || total.is_none_or(|n| n > M) {
+    /// Admit a complete framed packet without evicting accepted stream bytes.
+    pub fn try_push_slices(&mut self, slices: &[&[u8]]) -> Result<(), ()> {
+        let total = slices
+            .iter()
+            .try_fold(0usize, |n, s| n.checked_add(s.len()));
+        if N == 0 || total.is_none_or(|n| n > M) || self.queue.is_full() {
             REJECTED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Err(());
         }
         let packet = BytePacket::from_slices(slices);
-        if packet.len == 0 {
-            return;
+        if packet.len != 0 {
+            self.queue.push_back(packet).map_err(|_| ())?;
+            UART_HIGH_WATER.fetch_max(self.queue.len() as u32, Ordering::Relaxed);
         }
-
-        if self.queue.is_full() {
-            if self.front_offset != 0 && self.queue.len() == 1 {
-                // The head is already on the wire. Dropping its suffix would
-                // corrupt framing; reject the new packet instead.
-                REJECTED.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            UART_DROPPED.fetch_add(1, Ordering::Relaxed);
-            if self.front_offset == 0 {
-                let _ = self.queue.pop_front();
-            } else if self.queue.len() > 1 {
-                let mut front = self.queue.pop_front();
-                let _ = self.queue.pop_front();
-                if let Some(front) = front.take() {
-                    let _ = self.queue.push_front(front);
-                }
-            } else {
-                let _ = self.queue.pop_back();
-                self.front_offset = 0;
-            }
-        }
-
-        let _ = self.queue.push_back(packet);
-        UART_HIGH_WATER.fetch_max(self.queue.len() as u32, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn peek_into(&self, buf: &mut [u8]) -> usize {
@@ -271,7 +241,11 @@ mod tests {
     use super::*;
     #[derive(Debug, PartialEq)]
     struct Item(u8, usize);
-    impl QueueItem for Item { fn queued_len(&self) -> usize { self.1 } }
+    impl QueueItem for Item {
+        fn queued_len(&self) -> usize {
+            self.1
+        }
+    }
     #[test]
     fn mailbox_enforces_count_bytes_and_fifo() {
         let q = OverwriteQueue::<Item, 2, 5>::new();
@@ -287,26 +261,46 @@ mod tests {
         assert_eq!(q.try_pop(), Some(Item(6, 1)));
     }
     #[test]
+    fn uart_full_queue_never_invalidates_a_staged_transmit_chunk() {
+        let mut q = BytePacketRing::<2, 8>::new();
+        q.try_push_slices(&[b"header", b"12"]).unwrap();
+        q.try_push_slices(&[b"second"]).unwrap();
+        let mut before = [0; 16];
+        let n = q.peek_into(&mut before);
+        assert!(q.try_push_slices(&[b"command"]).is_err());
+        let mut after = [0; 16];
+        assert_eq!(q.peek_into(&mut after), n);
+        assert_eq!(
+            before, after,
+            "even an unstarted staged frame must stay byte-identical"
+        );
+        q.consume(3);
+        assert!(q.try_push_slices(&[b"command"]).is_err());
+        let n = q.peek_into(&mut after);
+        assert_eq!(&after[..n], b"der12second");
+    }
+
+    #[test]
     fn uart_preserves_partially_transmitted_head() {
-        let mut q = OverwriteBytePacketRing::<2, 8>::new();
-        q.push_overwrite_slices(&[b"abcd"]);
+        let mut q = BytePacketRing::<2, 8>::new();
+        q.try_push_slices(&[b"abcd"]).unwrap();
         q.consume(2);
-        q.push_overwrite_slices(&[b"old"]);
-        q.push_overwrite_slices(&[b"new"]);
+        q.try_push_slices(&[b"old"]).unwrap();
+        assert!(q.try_push_slices(&[b"new"]).is_err());
         let mut buf = [0; 16];
         let n = q.peek_into(&mut buf);
-        assert_eq!(&buf[..n], b"cdnew");
+        assert_eq!(&buf[..n], b"cdold");
         q.consume(n);
         assert!(q.is_empty());
     }
     #[test]
     fn uart_rejects_oversize_and_never_truncates_active_frame() {
-        let mut q = OverwriteBytePacketRing::<1, 4>::new();
-        q.push_overwrite_slices(&[b"abcde"]);
+        let mut q = BytePacketRing::<1, 4>::new();
+        assert!(q.try_push_slices(&[b"abcde"]).is_err());
         assert!(q.is_empty());
-        q.push_overwrite_slices(&[b"abcd"]);
+        q.try_push_slices(&[b"abcd"]).unwrap();
         q.consume(1);
-        q.push_overwrite_slices(&[b"new"]);
+        assert!(q.try_push_slices(&[b"new"]).is_err());
         let mut buf = [0; 8];
         let n = q.peek_into(&mut buf);
         assert_eq!(&buf[..n], b"bcd");

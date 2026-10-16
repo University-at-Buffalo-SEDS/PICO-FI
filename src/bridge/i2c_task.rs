@@ -520,7 +520,7 @@ fn stage_response_packet(
         return;
     }
 
-    if let Some(resp) = rx_resp.try_pop_latest() {
+    if let Some(resp) = rx_resp.try_pop() {
         tx_packet.stage_bridge_packet(transfer_id, resp);
         return;
     }

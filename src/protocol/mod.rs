@@ -3,3 +3,5 @@
 pub mod i2c;
 
 pub mod stream;
+
+pub mod duplex;

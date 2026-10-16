@@ -8,6 +8,7 @@ path = "src/lib.rs"
 
 [dependencies]
 embedded-io-async = "0.7.0"
+embassy-futures = "0.1.2"
 
 embassy-sync = { version = "0.8.0", features = ["std"] }
 critical-section = { version = "1", features = ["std"] }

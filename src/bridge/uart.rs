@@ -1,13 +1,14 @@
 //! UART upstream bridge implementation using framed request/response packets.
 
 use crate::bridge::commands::{render_local_bridge_command, trim_ascii_line};
-use crate::bridge::overwrite_queue::OverwriteBytePacketRing;
+use crate::bridge::overwrite_queue::BytePacketRing;
 use crate::bridge::runtime::BridgeRuntime;
 use crate::config::BridgeConfig;
 use crate::net::{
     bridge_frame_reader, connect_with_timeout, exchange_link_handshake, read_bridge_frame,
     write_bridge_frame,
 };
+use crate::protocol::duplex::{UartStep, uart_step};
 use crate::protocol::i2c::{
     FRAME_HEADER_SIZE, REQ_COMMAND_MAGIC, REQ_DATA_MAGIC, RESP_COMMAND_MAGIC, RESP_DATA_MAGIC,
 };
@@ -32,7 +33,7 @@ const UART_FLUSH_BATCH_CHUNKS: usize = 4;
 const UART_PRECONNECT_NET_SLICE_MS: u64 = 50;
 const UART_PRECONNECT_UART_SLICE_MS: u64 = 1;
 
-type UartEgressRing = OverwriteBytePacketRing<UART_EGRESS_RING_PACKETS, UART_EGRESS_PACKET_BYTES>;
+type UartEgressRing = BytePacketRing<UART_EGRESS_RING_PACKETS, UART_EGRESS_PACKET_BYTES>;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum UartFrameKind {
@@ -258,10 +259,37 @@ async fn session(
         }
 
         if tx_chunk_pos < tx_chunk_len {
-            let written =
-                write_uart_chunk_lossy(uart_tx, &tx_chunk[tx_chunk_pos..tx_chunk_len]).await;
-            egress_ring.consume(written);
-            tx_chunk_pos = (tx_chunk_pos + written).min(tx_chunk_len);
+            match uart_step(
+                uart_tx,
+                &tx_chunk[tx_chunk_pos..tx_chunk_len],
+                uart_rx,
+                &mut uart_frame.reader,
+                &mut uart_frame.payload,
+            )
+            .await
+            {
+                Ok(UartStep::Written(written)) => {
+                    egress_ring.consume(written);
+                    tx_chunk_pos = (tx_chunk_pos + written).min(tx_chunk_len);
+                }
+                Ok(UartStep::Received(magic, length)) => {
+                    uart_frame.kind = if magic == REQ_DATA_MAGIC {
+                        UartFrameKind::Data
+                    } else {
+                        UartFrameKind::Command
+                    };
+                    uart_frame.len = length;
+                    handle_uart_request(
+                        uart_frame,
+                        Some(socket),
+                        bridge_config,
+                        link_active,
+                        &mut egress_ring,
+                    )
+                    .await?;
+                }
+                Err(()) => Timer::after_millis(UART_RETRY_DELAY_MS).await,
+            }
             consecutive_tx_chunks += 1;
             if tx_chunk_pos >= tx_chunk_len {
                 tx_chunk_pos = 0;
@@ -281,7 +309,7 @@ async fn session(
             .await
             {
                 Either::First(Ok(net_n)) => {
-                    push_uart_frame(&mut egress_ring, UartFrameKind::Data, &net_buf[..net_n]);
+                    push_uart_frame(&mut egress_ring, UartFrameKind::Data, &net_buf[..net_n])?;
                 }
                 Either::First(Err(_)) => return Err(()),
                 Either::Second(()) => {
@@ -322,13 +350,17 @@ async fn handle_uart_request(
             let payload = frame.payload();
             let line = trim_ascii_line(payload);
             let response = render_local_bridge_command(bridge_config, link_active, line);
-            push_uart_frame(egress_ring, UartFrameKind::Command, response.as_bytes());
+            push_uart_frame(egress_ring, UartFrameKind::Command, response.as_bytes())?;
             Ok(())
         }
     }
 }
 
-fn push_uart_frame(egress_ring: &mut UartEgressRing, kind: UartFrameKind, payload: &[u8]) {
+fn push_uart_frame(
+    egress_ring: &mut UartEgressRing,
+    kind: UartFrameKind,
+    payload: &[u8],
+) -> Result<(), ()> {
     let len = payload.len().min(UART_PAYLOAD_MAX);
     let mut header = [0u8; UART_FRAME_HEADER_SIZE];
     match kind {
@@ -342,7 +374,7 @@ fn push_uart_frame(egress_ring: &mut UartEgressRing, kind: UartFrameKind, payloa
         }
     }
     header[2..4].copy_from_slice(&(len as u16).to_le_bytes());
-    egress_ring.push_overwrite_slices(&[&header, &payload[..len]]);
+    egress_ring.try_push_slices(&[&header, &payload[..len]])
 }
 
 async fn flush_uart_egress(uart_tx: &mut impl Write, egress_ring: &mut UartEgressRing) {
@@ -406,17 +438,6 @@ async fn read_uart_frame_lossy(uart_rx: &mut impl Read, frame: &mut UartFrame) {
             return;
         }
         Timer::after_millis(UART_RETRY_DELAY_MS).await;
-    }
-}
-
-async fn write_uart_chunk_lossy(uart_tx: &mut impl Write, chunk: &[u8]) -> usize {
-    loop {
-        match uart_tx.write(chunk).await {
-            Ok(written) if written != 0 => return written,
-            Ok(_) | Err(_) => {
-                Timer::after_millis(UART_RETRY_DELAY_MS).await;
-            }
-        }
     }
 }
 
