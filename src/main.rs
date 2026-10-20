@@ -436,24 +436,37 @@ async fn app(spawner: Spawner) {
         }
     }
 
-    let result = run_bridge_mode(
-        uart.as_mut(),
-        stack,
-        bridge_config,
-        upstream_i2c.as_ref(),
-        upstream_spi.as_ref(),
-        upstream_usb.as_ref(),
-        upstream_usb_sender.as_mut(),
-        upstream_usb_receiver.as_mut(),
-        status_led.as_mut(),
-        &I2C_FRAME_QUEUE,
-        &I2C_RESPONSE_QUEUE,
-        &SPI_FRAME_QUEUE,
-        &SPI_RESPONSE_QUEUE,
-    )
-    .await;
-
-    let _ = result;
+    loop {
+        stack.wait_link_up().await;
+        stack.wait_config_up().await;
+        let Some(address) = stack.config_v4().map(|c| c.address) else {
+            continue;
+        };
+        let result = embassy_futures::select::select(
+            run_bridge_mode(
+                uart.as_mut(),
+                stack,
+                bridge_config,
+                upstream_i2c.as_ref(),
+                upstream_spi.as_ref(),
+                upstream_usb.as_ref(),
+                upstream_usb_sender.as_mut(),
+                upstream_usb_receiver.as_mut(),
+                status_led.as_mut(),
+                &I2C_FRAME_QUEUE,
+                &I2C_RESPONSE_QUEUE,
+                &SPI_FRAME_QUEUE,
+                &SPI_RESPONSE_QUEUE,
+            ),
+            net::wait_address_change(stack, address),
+        )
+        .await;
+        LINK_ACTIVE.store(false, Ordering::Release);
+        lan_discovery::clear_peer();
+        if matches!(result, embassy_futures::select::Either::First(_)) {
+            break;
+        }
+    }
 
     loop {
         Timer::after_secs(1).await;

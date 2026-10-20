@@ -10,3 +10,5 @@ pub mod discovery;
 pub mod ipv4ll;
 
 pub mod auto_address;
+
+pub mod dhcp_probe;

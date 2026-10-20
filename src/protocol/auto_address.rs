@@ -10,6 +10,8 @@ pub enum Action {
     Probe,
     Claim([u8; 4]),
     Announce,
+    DhcpProbe(u32),
+    StopDhcpProbe,
 }
 #[derive(Clone, Copy, Debug)]
 enum Phase {
@@ -43,6 +45,10 @@ pub struct AutoAddress {
     phase: Phase,
     attempt: u32,
     address: [u8; 4],
+    next_dhcp_probe: u64,
+    dhcp_probe_until: Option<u64>,
+    migrating: bool,
+    failed_migrations: u8,
 }
 impl AutoAddress {
     pub fn new(mac: [u8; 6]) -> Self {
@@ -51,7 +57,28 @@ impl AutoAddress {
             phase: Phase::Down,
             attempt: 0,
             address: [0; 4],
+            next_dhcp_probe: 0,
+            dhcp_probe_until: None,
+            migrating: false,
+            failed_migrations: 0,
         }
+    }
+    /// A driver-validated offer for our current transaction is the only reason
+    /// to interrupt a healthy IPv4LL session to run normal DHCP acquisition.
+    pub fn dhcp_offered(&mut self, now: u64) -> Action {
+        if matches!(self.phase, Phase::Online { fallback: true, .. })
+            && self.dhcp_probe_until.is_some_and(|until| now < until)
+        {
+            self.dhcp_probe_until = None;
+            self.migrating = true;
+            self.phase = Phase::StartDhcp;
+            Action::Clear
+        } else {
+            Action::None
+        }
+    }
+    fn probe_interval(&self) -> u64 {
+        (15_000u64 << self.failed_migrations.min(4)) + u64::from(self.mac[5]) * 4
     }
     pub fn tick(
         &mut self,
@@ -71,6 +98,7 @@ impl AutoAddress {
         }
         match self.phase {
             Phase::Down | Phase::StartDhcp => {
+                self.dhcp_probe_until = None;
                 self.phase = Phase::Dhcp {
                     until: now + 10_000,
                 };
@@ -78,12 +106,18 @@ impl AutoAddress {
             }
             Phase::Dhcp { until } => {
                 if configured {
+                    self.migrating = false;
+                    self.failed_migrations = 0;
                     self.phase = Phase::Online {
                         fallback: false,
                         idle_since: now,
                         announce_at: None,
                     };
                 } else if now >= until {
+                    if self.migrating {
+                        self.failed_migrations = self.failed_migrations.saturating_add(1);
+                        self.migrating = false;
+                    }
                     self.phase = Phase::Choose { after: now };
                     return Action::Clear;
                 }
@@ -128,6 +162,8 @@ impl AutoAddress {
                 Action::None
             }
             Phase::ClaimDelay { until } if now >= until => {
+                self.next_dhcp_probe = now + self.probe_interval();
+                self.dhcp_probe_until = None;
                 self.phase = Phase::Online {
                     fallback: true,
                     idle_since: now,
@@ -167,6 +203,24 @@ impl AutoAddress {
                     idle_since,
                     announce_at,
                 };
+                if fallback {
+                    if self.dhcp_probe_until.is_some_and(|until| now >= until) {
+                        self.dhcp_probe_until = None;
+                        return Action::StopDhcpProbe;
+                    }
+                    if self.dhcp_probe_until.is_none() && now >= self.next_dhcp_probe && !pending {
+                        self.next_dhcp_probe = now + self.probe_interval();
+                        self.dhcp_probe_until = Some(now + 4000);
+                        let xid = (now as u32).wrapping_mul(1664525)
+                            ^ u32::from_be_bytes([
+                                self.mac[2],
+                                self.mac[3],
+                                self.mac[4],
+                                self.mac[5],
+                            ]);
+                        return Action::DhcpProbe(xid.max(1));
+                    }
+                }
                 Action::None
             }
             _ => Action::None,
@@ -318,5 +372,83 @@ mod tests {
             tick(&mut p, now + 60000, false, false, false),
             Action::Candidate(_)
         ));
+    }
+    #[test]
+    fn live_link_local_checks_for_dhcp_without_dropping_the_connection() {
+        let mut p = AutoAddress::new(MAC);
+        let (_, now) = fallback(&mut p);
+        tick(&mut p, now + 20, true, false, false);
+        tick(&mut p, now + 2020, true, false, false);
+        let first = now + p.probe_interval();
+        assert!(matches!(p.tick(first,true,true,true,false,false),Action::DhcpProbe(x) if x!=0));
+        assert_eq!(
+            p.tick(first + 3999, true, true, true, false, false),
+            Action::None
+        );
+        assert_eq!(
+            p.tick(first + 4000, true, true, true, false, false),
+            Action::StopDhcpProbe
+        );
+        assert_eq!(p.dhcp_offered(first + 4001), Action::None);
+        assert!(matches!(
+            p.tick(first + p.probe_interval(), true, true, true, false, false),
+            Action::DhcpProbe(_)
+        ));
+    }
+    #[test]
+    fn client_and_server_migrate_only_on_a_fresh_matching_offer() {
+        for _role in ["client", "server"] {
+            let mut p = AutoAddress::new(MAC);
+            let (_, now) = fallback(&mut p);
+            assert_eq!(p.dhcp_offered(now), Action::None);
+            tick(&mut p, now + 20, true, false, false);
+            tick(&mut p, now + 2020, true, false, false);
+            let check = now + p.probe_interval();
+            assert!(matches!(
+                p.tick(check, true, true, true, false, false),
+                Action::DhcpProbe(_)
+            ));
+            assert_eq!(p.dhcp_offered(check + 100), Action::Clear);
+            assert_eq!(
+                p.tick(check + 120, true, false, false, false, false),
+                Action::Dhcp
+            );
+            assert_eq!(
+                p.tick(check + 200, true, true, false, false, false),
+                Action::None
+            );
+            for at in [check + 1000, check + 90000, check + 900000] {
+                assert_eq!(p.tick(at, true, true, true, false, false), Action::None);
+            }
+            // Lease expiry returns to DHCP first and can fall back again.
+            assert_eq!(
+                p.tick(check + 900001, true, false, false, false, false),
+                Action::Clear
+            );
+            assert_eq!(
+                p.tick(check + 900020, true, false, false, false, false),
+                Action::Dhcp
+            );
+            assert_eq!(
+                p.tick(check + 910020, true, false, false, false, false),
+                Action::Clear
+            );
+        }
+    }
+    #[test]
+    fn failed_offer_to_lease_transition_backs_off_the_next_probe() {
+        let mut p = AutoAddress::new(MAC);
+        let (_, now) = fallback(&mut p);
+        tick(&mut p, now + 20, true, false, false);
+        tick(&mut p, now + 2020, true, false, false);
+        let check = now + p.probe_interval();
+        p.tick(check, true, true, true, false, false);
+        assert_eq!(p.dhcp_offered(check + 100), Action::Clear);
+        p.tick(check + 120, true, false, false, false, false);
+        assert_eq!(
+            p.tick(check + 10120, true, false, false, false, false),
+            Action::Clear
+        );
+        assert!(p.probe_interval() >= 30000);
     }
 }

@@ -1,4 +1,5 @@
 //! Observe address conflicts and send bounded ARP probes through the actual driver.
+use crate::protocol::dhcp_probe;
 use crate::protocol::ipv4ll::{arp_conflict, arp_probe};
 use core::task::Context;
 use embassy_net_driver::{Capabilities, Driver, HardwareAddress, LinkState, RxToken, TxToken};
@@ -10,6 +11,9 @@ pub struct ProbeState {
     candidate: AtomicU32,
     command: AtomicU8,
     conflict: AtomicBool,
+    dhcp_xid: AtomicU32,
+    dhcp_pending: AtomicBool,
+    dhcp_offer: AtomicBool,
     wake: AtomicWaker,
 }
 impl ProbeState {
@@ -19,6 +23,9 @@ impl ProbeState {
             candidate: AtomicU32::new(0),
             command: AtomicU8::new(0),
             conflict: AtomicBool::new(false),
+            dhcp_xid: AtomicU32::new(0),
+            dhcp_pending: AtomicBool::new(false),
+            dhcp_offer: AtomicBool::new(false),
             wake: AtomicWaker::new(),
         }
     }
@@ -28,6 +35,7 @@ impl ProbeState {
             .store(u32::from_be_bytes(ip), Ordering::Release);
     }
     pub fn clear(&self) {
+        self.stop_dhcp_probe();
         self.command.store(0, Ordering::Release);
         self.candidate.store(0, Ordering::Release);
         self.conflict.store(false, Ordering::Release);
@@ -43,7 +51,28 @@ impl ProbeState {
     pub fn conflicted(&self) -> bool {
         self.conflict.load(Ordering::Acquire)
     }
+    pub fn request_dhcp_probe(&self, xid: u32) {
+        self.dhcp_offer.store(false, Ordering::Release);
+        self.dhcp_xid.store(xid, Ordering::Release);
+        self.dhcp_pending.store(true, Ordering::Release);
+        self.wake.wake();
+    }
+    pub fn stop_dhcp_probe(&self) {
+        self.dhcp_xid.store(0, Ordering::Release);
+        self.dhcp_pending.store(false, Ordering::Release);
+        self.dhcp_offer.store(false, Ordering::Release);
+    }
+    pub fn take_dhcp_offer(&self) -> bool {
+        self.dhcp_offer.swap(false, Ordering::AcqRel)
+    }
     fn inspect(&self, bytes: &[u8]) {
+        let xid = self.dhcp_xid.load(Ordering::Acquire);
+        if xid != 0
+            && !self.dhcp_pending.load(Ordering::Acquire)
+            && dhcp_probe::is_offer(bytes, self.mac, xid)
+        {
+            self.dhcp_offer.store(true, Ordering::Release);
+        }
         let ip = self.candidate.load(Ordering::Acquire);
         if ip != 0 && arp_conflict(bytes, self.mac, ip.to_be_bytes()) {
             self.conflict.store(true, Ordering::Release);
@@ -64,13 +93,24 @@ impl<D: Driver> ArpGuard<D> {
         self.state.wake.register(cx.waker());
         let command = self.state.command.load(Ordering::Acquire);
         let ip = self.state.candidate.load(Ordering::Acquire);
-        if command == 0 || ip == 0 || self.inner.link_state(cx) != LinkState::Up {
+        if self.inner.link_state(cx) != LinkState::Up {
             return;
         }
-        if let Some(tx) = self.inner.transmit(cx) {
-            let frame = arp_probe(self.state.mac, ip.to_be_bytes(), command == 2);
-            tx.consume(frame.len(), |bytes| bytes.copy_from_slice(&frame));
-            self.state.command.store(0, Ordering::Release);
+        if command != 0 && ip != 0 {
+            if let Some(tx) = self.inner.transmit(cx) {
+                let frame = arp_probe(self.state.mac, ip.to_be_bytes(), command == 2);
+                tx.consume(frame.len(), |bytes| bytes.copy_from_slice(&frame));
+                self.state.command.store(0, Ordering::Release);
+            }
+        } else if self.state.dhcp_pending.load(Ordering::Acquire) {
+            if let Some(tx) = self.inner.transmit(cx) {
+                let frame = dhcp_probe::discover(
+                    self.state.mac,
+                    self.state.dhcp_xid.load(Ordering::Acquire),
+                );
+                tx.consume(frame.len(), |bytes| bytes.copy_from_slice(&frame));
+                self.state.dhcp_pending.store(false, Ordering::Release);
+            }
         }
     }
 }
@@ -241,5 +281,46 @@ mod tests {
         assert!(state.conflicted());
         state.clear();
         assert!(!state.conflicted());
+    }
+    #[test]
+    fn dhcp_probe_waits_for_tx_and_only_matching_offers_are_observed_without_mutation() {
+        let mac = [2, 1, 2, 3, 4, 5];
+        let xid = 1234;
+        let state = Box::leak(Box::new(ProbeState::new(mac)));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut guard = ArpGuard::new(
+            Fake {
+                ready: false,
+                link: LinkState::Up,
+                rx: None,
+                sent: sent.clone(),
+            },
+            state,
+        );
+        let waker = Waker::from(Arc::new(WakeCount(AtomicU32::new(0))));
+        let mut cx = Context::from_waker(&waker);
+        state.request_dhcp_probe(xid);
+        guard.transmit(&mut cx);
+        assert!(sent.lock().unwrap().is_empty());
+        // A reply cannot be accepted before our actual transmission.
+        state.inspect(&dhcp_probe::offer_fixture(mac, xid));
+        assert!(!state.take_dhcp_offer());
+        guard.inner.ready = true;
+        guard.transmit(&mut cx);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![dhcp_probe::discover(mac, xid).to_vec()]
+        );
+        state.inspect(&dhcp_probe::offer_fixture(mac, xid + 1));
+        assert!(!state.take_dhcp_offer());
+        let frame = dhcp_probe::offer_fixture(mac, xid).to_vec();
+        guard.inner.rx = Some(frame.clone());
+        let (rx, _) = guard.receive(&mut cx).unwrap();
+        assert_eq!(rx.consume(|b| b.to_vec()), frame);
+        assert!(state.take_dhcp_offer());
+        assert!(!state.take_dhcp_offer());
+        state.stop_dhcp_probe();
+        state.inspect(&frame);
+        assert!(!state.take_dhcp_offer());
     }
 }

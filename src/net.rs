@@ -314,14 +314,22 @@ async fn auto_address_task(
     use embassy_net::ConfigV4;
     let mut policy = AutoAddress::new(mac);
     loop {
-        let action = policy.tick(
-            embassy_time::Instant::now().as_millis(),
-            stack.is_link_up(),
-            stack.config_v4().is_some(),
-            crate::LINK_ACTIVE.load(portable_atomic::Ordering::Acquire),
-            probe.pending(),
-            probe.conflicted(),
-        );
+        let now = embassy_time::Instant::now().as_millis();
+        let mut action = if probe.take_dhcp_offer() {
+            policy.dhcp_offered(now)
+        } else {
+            Action::None
+        };
+        if action == Action::None {
+            action = policy.tick(
+                now,
+                stack.is_link_up(),
+                stack.config_v4().is_some(),
+                crate::LINK_ACTIVE.load(portable_atomic::Ordering::Acquire),
+                probe.pending(),
+                probe.conflicted(),
+            );
+        }
         match action {
             Action::None => {}
             Action::Clear => {
@@ -342,6 +350,19 @@ async fn auto_address_task(
                 dns_servers: Vec::new(),
             })),
             Action::Announce => probe.request(true),
+            Action::DhcpProbe(xid) => probe.request_dhcp_probe(xid),
+            Action::StopDhcpProbe => probe.stop_dhcp_probe(),
+        }
+        Timer::after_millis(20).await;
+    }
+}
+
+/// End both client and server sessions when the bound network changes. A DHCP
+/// renewal retaining the same address/prefix does not interrupt a working link.
+pub async fn wait_address_change(stack: Stack<'static>, expected: Ipv4Cidr) {
+    loop {
+        if !stack.is_link_up() || stack.config_v4().map(|c| c.address) != Some(expected) {
+            return;
         }
         Timer::after_millis(20).await;
     }

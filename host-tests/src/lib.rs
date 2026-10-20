@@ -20,8 +20,11 @@ pub mod discovery;
 #[path = "../../src/protocol/ipv4ll.rs"]
 pub mod ipv4ll;
 
+#[path = "../../src/protocol/dhcp_probe.rs"]
+pub mod dhcp_probe;
+
 mod protocol {
-    pub use crate::ipv4ll;
+    pub use crate::{ipv4ll, dhcp_probe};
 }
 #[path = "../../src/arp_guard.rs"]
 pub mod arp_guard;
