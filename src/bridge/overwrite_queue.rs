@@ -109,21 +109,28 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
     /// Network streams must use this path: refusing new work preserves every
     /// accepted dictionary template, dependent frame and acknowledgement.
     pub fn try_push(&self, item: T) -> Result<(), T> {
+        if self.try_push_ref(&item) {
+            Ok(())
+        } else {
+            Err(item)
+        }
+    }
+    /// Copy only occupied payload bytes into the mailbox. The producer keeps
+    /// its reusable packet buffer; no packet-sized Result/argument is moved.
+    pub fn try_push_ref(&self, item: &T) -> bool {
         let pushed = unsafe {
             self.state.lock_mut(|state| {
                 if !state.fits(item.queued_len()) {
                     return false;
                 }
-                state.insert(&item);
+                state.insert(item);
                 true
             })
         };
         if pushed {
             self.ready.signal(());
-            Ok(())
-        } else {
-            Err(item)
         }
+        pushed
     }
     pub async fn push(&self, mut item: T) -> Result<(), T> {
         let len = item.queued_len();
@@ -187,11 +194,13 @@ impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, 
     }
 }
 
+#[cfg(test)]
 struct BytePacket<const M: usize> {
     len: usize,
     data: [u8; M],
 }
 
+#[cfg(test)]
 impl<const M: usize> BytePacket<M> {
     const fn new() -> Self {
         Self {
@@ -215,11 +224,13 @@ impl<const M: usize> BytePacket<M> {
     }
 }
 
+#[cfg(test)]
 pub struct BytePacketRing<const N: usize, const M: usize> {
     queue: Deque<BytePacket<M>, N>,
     front_offset: usize,
 }
 
+#[cfg(test)]
 impl<const N: usize, const M: usize> BytePacketRing<N, M> {
     pub const fn new() -> Self {
         Self {

@@ -12,4 +12,5 @@ pub mod spi_hw_task;
 pub mod spi_pio;
 pub mod test;
 pub mod uart;
+pub mod uart_mailbox;
 pub mod usb;

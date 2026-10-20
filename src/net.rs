@@ -132,16 +132,12 @@ pub async fn bring_up_network(
 
     let probe = ADDRESS_PROBE.init(crate::arp_guard::ProbeState::new(bridge_config.mac_address));
     let device = crate::arp_guard::ArpGuard::new(device, probe);
-    let seed = u64::from_le_bytes([
-        bridge_config.mac_address[0],
-        bridge_config.mac_address[1],
-        bridge_config.mac_address[2],
-        bridge_config.mac_address[3],
-        bridge_config.mac_address[4],
-        bridge_config.mac_address[5],
-        0x51,
-        0x9e,
-    ]);
+    // A MAC-only seed repeats TCP ports/sequence state after a reboot and
+    // can collide with the host's still-established previous connection.
+    let seed = crate::protocol::discovery::boot_network_seed(
+        bridge_config.mac_address,
+        embassy_rp::clocks::RoscRng.next_u64(),
+    );
     let (stack, net_runner) = embassy_net::new(
         device,
         net_config,

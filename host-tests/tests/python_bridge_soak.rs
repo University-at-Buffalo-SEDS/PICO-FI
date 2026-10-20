@@ -48,6 +48,7 @@ fn host_bridge_framing_tests_pass() {
             "host.python.test_telemetry_cli",
             "host.python.test_bridge_framing",
             "host.python.test_transport_framing_roundtrip",
+            "host.python.test_stack_budget",
         ],
     );
 }

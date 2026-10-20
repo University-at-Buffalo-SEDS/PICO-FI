@@ -62,15 +62,23 @@ bind_interrupts!(struct Irqs {
 static UART_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 
 /// Static RX buffer used by the boot/control UART.
-static UART_RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+static UART_RX_BUF: StaticCell<[u8; 4096]> = StaticCell::new();
 static USB_CONFIG_DESC_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 static USB_BOS_DESC_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 static USB_MSOS_DESC_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 static USB_CONTROL_BUF: StaticCell<[u8; 128]> = StaticCell::new();
 static USB_CDC_STATE: StaticCell<UsbCdcState<'static>> = StaticCell::new();
 
-/// Single-core Embassy executor used by the firmware.
+/// Core 0 owns Ethernet, discovery and network sessions.
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+static UART_EXECUTOR: StaticCell<Executor> = StaticCell::new();
+const CORE1_STACK_BYTES: usize = 32 * 1024;
+static CORE1_STACK: StaticCell<embassy_rp::multicore::Stack<CORE1_STACK_BYTES>> = StaticCell::new();
+
+#[embassy_executor::task]
+async fn uart_core_task(uart: BufferedUart, config: BridgeConfig) {
+    bridge::uart::uart_worker(uart, config).await
+}
 
 /// Channel for I2C frames from polling task to bridge session.
 static I2C_FRAME_QUEUE: OverwriteQueue<I2cPacket, I2C_PACKET_QUEUE_DEPTH, I2C_PACKET_QUEUE_BYTES> =
@@ -274,7 +282,7 @@ async fn app(spawner: Spawner) {
             p.PIN_1,
             Irqs,
             UART_TX_BUF.init([0; 512]),
-            UART_RX_BUF.init([0; 512]),
+            UART_RX_BUF.init([0; 4096]),
             uart_config,
         ),
         UartPort::Uart1 => BufferedUart::new(
@@ -283,7 +291,7 @@ async fn app(spawner: Spawner) {
             p.PIN_5,
             Irqs,
             UART_TX_BUF.init([0; 512]),
-            UART_RX_BUF.init([0; 512]),
+            UART_RX_BUF.init([0; 4096]),
             uart_config,
         ),
     };
@@ -408,6 +416,31 @@ async fn app(spawner: Spawner) {
         None
     };
 
+    if matches!(bridge_config.upstream_mode, UpstreamMode::Uart) {
+        let uart_owned = uart.take().expect("UART ownership for core 1");
+        let irq = match bridge_config.uart_port {
+            UartPort::Uart0 => embassy_rp::interrupt::Interrupt::UART0_IRQ,
+            UartPort::Uart1 => embassy_rp::interrupt::Interrupt::UART1_IRQ,
+        };
+        // NVIC state is per core. Remove core 0 ownership before enabling on 1.
+        irq.disable();
+        embassy_rp::multicore::spawn_core1(
+            p.CORE1,
+            CORE1_STACK.init_with(embassy_rp::multicore::Stack::new),
+            move || {
+                unsafe {
+                    irq.enable();
+                }
+                UART_EXECUTOR.init(Executor::new()).run(|spawner| {
+                    spawner.spawn(
+                        uart_core_task(uart_owned, bridge_config)
+                            .expect("UART core task allocation"),
+                    );
+                })
+            },
+        );
+    }
+
     let stack = match net::bring_up_network(
         spawner,
         p.SPI0,
@@ -501,25 +534,10 @@ async fn run_bridge_mode(
 
     match (bridge_config.bridge_mode, bridge_config.upstream_mode) {
         (BridgeMode::TcpClient { host, port }, UpstreamMode::Uart) => {
-            bridge::uart::run_client(
-                uart.expect("uart mode requires an active UART"),
-                stack,
-                host,
-                port,
-                bridge_config,
-                runtime,
-            )
-            .await
+            bridge::uart::run(stack, Some(host), port, runtime).await
         }
         (BridgeMode::TcpServer { port }, UpstreamMode::Uart) => {
-            bridge::uart::run_server(
-                uart.expect("uart mode requires an active UART"),
-                stack,
-                port,
-                bridge_config,
-                runtime,
-            )
-            .await
+            bridge::uart::run(stack, None, port, runtime).await
         }
         (BridgeMode::TcpClient { host, port }, UpstreamMode::I2c) => match upstream_i2c_enabled {
             Some(_) => {

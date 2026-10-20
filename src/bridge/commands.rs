@@ -49,7 +49,7 @@ pub fn render_local_bridge_command(
     match line {
         "/help" => {
             let _ = out.push_str(
-                "pico commands: /help /show /ping /link /spi /queues /led <on|off|toggle|auto|status>",
+                "pico commands: /help /show /ping /link /spi /queues /cores /led <on|off|toggle|auto|status>",
             );
         }
         "/show" => {
@@ -65,6 +65,20 @@ pub fn render_local_bridge_command(
             } else {
                 let _ = out.push_str("link down");
             }
+        }
+        "/cores" => {
+            use super::uart_mailbox::*;
+            use core::fmt::Write;
+            let _ = write!(
+                out,
+                "uart_core={} net_core={} rx={} tx={} drop={} error={}",
+                UART_CORE_ID.load(Ordering::Acquire),
+                NET_CORE_ID.load(Ordering::Acquire),
+                RX_FRAMES.load(Ordering::Relaxed),
+                TX_FRAMES.load(Ordering::Relaxed),
+                RX_DROPPED.load(Ordering::Relaxed),
+                RX_ERRORS.load(Ordering::Relaxed)
+            );
         }
         "/queues" => {
             let _ = out.push_str(super::overwrite_queue::render_diagnostics().as_str());

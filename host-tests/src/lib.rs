@@ -24,7 +24,7 @@ pub mod ipv4ll;
 pub mod dhcp_probe;
 
 mod protocol {
-    pub use crate::{ipv4ll, dhcp_probe};
+    pub use crate::{ipv4ll, dhcp_probe, stream};
 }
 #[path = "../../src/arp_guard.rs"]
 pub mod arp_guard;
@@ -37,3 +37,7 @@ pub mod config_record;
 
 #[path = "../../src/protocol/auto_address.rs"]
 pub mod auto_address;
+
+mod bridge { pub use crate::overwrite_queue; }
+#[path = "../../src/bridge/uart_mailbox.rs"]
+pub mod uart_mailbox;

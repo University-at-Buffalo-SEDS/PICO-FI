@@ -94,6 +94,9 @@ def main() -> int:
     if not elf.is_file():
         fail(f"expected ELF was not created: {elf}")
 
+    print("[build] Checking compiler stack budgets...", flush=True)
+    run([sys.executable, str(ROOT / "tools/check_stack_budget.py"), str(elf)], cwd=ROOT)
+
     print("[build] Converting ELF to UF2...", flush=True)
     run([elf2uf2, str(elf), str(uf2)], cwd=ROOT)
 

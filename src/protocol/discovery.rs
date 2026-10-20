@@ -140,3 +140,25 @@ mod tests {
         assert!(Message::decode(&offer.encode()).is_none());
     }
 }
+
+/// Fresh TCP/DHCP random state per boot, while hardware MAC/IP identity stays
+/// stable. This seed is transport entropy, not a cryptographic credential.
+pub fn boot_network_seed(mac: [u8; 6], entropy: u64) -> u64 {
+    (u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0x51, 0x9e]) ^ entropy)
+        .max(1)
+}
+
+#[cfg(test)]
+mod boot_seed_tests {
+    use super::*;
+    #[test]
+    fn restarting_same_device_does_not_reuse_tcp_seed_or_change_hardware_identity() {
+        let mac = hardware_mac(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_ne!(
+            boot_network_seed(mac, 0x1234),
+            boot_network_seed(mac, 0x5678)
+        );
+        assert_eq!(mac, hardware_mac(&[1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_ne!(boot_network_seed(mac, u64::MAX), 0);
+    }
+}

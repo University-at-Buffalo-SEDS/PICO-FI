@@ -42,3 +42,58 @@ probe-rs reset --probe 2e8a:000c --chip RP2040 --protocol swd --speed 100 --non-
 
 Use a full probe serial selector when multiple matching Debug Probes are attached.
 `--speed 100` is SWD clock speed in kHz; it does not affect the 1 Mbaud UART.
+
+## UART / Ethernet dual-core bridge
+
+UART transport now uses both RP2040 cores by default in client and server roles.
+Core 0 owns W5500 SPI/DMA, TCP, DHCP/link-local and discovery. Core 1 owns UART
+framing, RX/TX and the selected UART interrupt. The boot configuration shell
+runs first, then UART ownership and its interrupt move to core 1. Other upstream
+transports retain their existing execution path.
+
+The cores exchange complete frames through two 16 KiB byte-backed, 128-frame
+mailboxes protected by the RP2040 multicore critical-section implementation.
+Accepted frames remain FIFO; there is no heap allocation or eviction of accepted
+frames. A full UART-to-network mailbox rejects new whole frames and counts the
+loss while UART reception continues. The reverse direction applies TCP
+backpressure. TCP RX and TX run concurrently, so blocking either direction does
+not block the other. UART RX buffering is 4 KiB. Ordinary small packets still
+write immediately without a batching delay.
+
+The compiled UART speed is unchanged by using two cores. Keep the 1 Mbaud build
+command above for the gateway. `/cores` on the local framed UART command channel
+reports core ownership and frame/drop/error counters; `/queues` reports shared
+mailbox diagnostics. These are local bridge commands and do not enter SEDSnet.
+A sustained upstream rate above available Ethernet/UART capacity can still lose
+data; dual-core execution cannot repair CAN packets already dropped at gateway.
+
+Host qualification includes 20,000 concurrent producer/consumer transfers,
+maximum-sized packets across ring wrap, full-queue preservation, and production
+TCP-pump tests with blocked upload, blocked downlink and deliberately partial
+writes. Run `python3 build.py --test`. Physical installation and sustained
+end-to-end results are recorded separately; a host test is not proof of board
+IRQ wiring or radio-link performance.
+
+
+### Stack and reconnect qualification
+
+Core 1 reserves 32 KiB. `build.py` checks the linked Cortex-M0+ task prologue
+before producing a UF2: the UART task's fixed frame plus 8 KiB of headroom must
+fit, and the largest other linked frame plus headroom must fit the main stack
+space above BSS. This is a regression guard, not a full call-graph stack proof.
+The original 16 KiB reservation failed on hardware because the compiler's UART
+poll frame exceeded it. Borrowed enqueue avoids full-size packet return copies;
+the qualified build uses a 21,344-byte UART frame. Tests include the original
+oversized ARM prologue and fail the old reservation.
+
+TCP/DHCP state receives fresh RP2040 oscillator entropy each boot, keeping the
+hardware-derived MAC and link-local identity stable. GroundStation must include
+its half-open-session replacement fix: a validated new PICOFI1 connection replaces
+an old connection that a restarted bridge could not close.
+
+The 2026-10-20 gateway-role image was programmed and verified through the Debug
+Probe at 1 Mbaud UART. Earlier read-only RAM captures confirmed network core 0
+and UART core 1 were running; host qualification passed 50 Rust tests plus the
+Python framing/stack/soak wrappers. These checks do not establish zero gateway
+CAN loss or sustained end-to-end throughput; measure those separately after the
+matching GroundStation service is restarted.

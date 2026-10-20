@@ -2,7 +2,7 @@
 
 This document describes the current Pico-Fi UART upstream transport as implemented by:
 
-- [src/bridge/uart.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/uart.rs)
+- [src/bridge/uart.rs](src/bridge/uart.rs)
 - [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)
 - [host/python/uart/test.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/test.py)
 
@@ -210,5 +210,5 @@ That means:
 - [host/python/uart/link_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/link_terminal.py)
 - [host/python/uart/sedsprintf_router.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/uart/sedsprintf_router.py)
 - [host/python/telemetry_terminal.py](/Users/rylan/Documents/GitKraken/pico-fi/host/python/telemetry_terminal.py)
-- [src/bridge/uart.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/bridge/uart.rs)
+- [src/bridge/uart.rs](src/bridge/uart.rs)
 - [src/protocol/i2c.rs](/Users/rylan/Documents/GitKraken/pico-fi/src/protocol/i2c.rs)
