@@ -12,21 +12,23 @@ The UART runtime protocol is a variable-length binary frame protocol. It is not 
 
 Default settings:
 
-- `UART0`
-- `115200` baud
+- `UART1`
+- `1000000` baud (override at build time with `PICO_FI_UART_BAUD_RATE`)
 - `8N1`
 - no RTS/CTS
 - no XON/XOFF
 
 Pins:
 
-- `GPIO0`: Pico TX
-- `GPIO1`: Pico RX
+- `GPIO4`: Pico TX
+- `GPIO5`: Pico RX
+
+The explicit UART0 profile uses GPIO0 (TX) and GPIO1 (RX).
 
 USB-UART wiring:
 
-- adapter `TX` -> Pico `GPIO1`
-- adapter `RX` -> Pico `GPIO0`
+- adapter `TX` -> Pico `GPIO5`
+- adapter `RX` -> Pico `GPIO4`
 - adapter `GND` -> Pico `GND`
 
 On macOS, use `/dev/cu.*` for host-initiated traffic rather than `/dev/tty.*`.

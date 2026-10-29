@@ -60,7 +60,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
     fs::copy("memory.x", out_dir.join("memory.x")).expect("failed to copy memory.x to OUT_DIR");
     let uart_baud: u32 = env::var("PICO_FI_UART_BAUD_RATE")
-        .unwrap_or_else(|_| "115200".to_owned())
+        .unwrap_or_else(|_| "1000000".to_owned())
         .parse()
         .expect("PICO_FI_UART_BAUD_RATE must be a positive integer");
     assert!(
