@@ -2,7 +2,7 @@
 
 use core::fmt::Write;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, RawMutex};
 use embassy_sync::signal::Signal;
 use heapless::Deque;
 use portable_atomic::{AtomicU32, Ordering};
@@ -80,13 +80,13 @@ impl<const N: usize, const B: usize> QueueState<N, B> {
     }
 }
 
-pub struct OverwriteQueue<T, const N: usize, const MAX_BYTES: usize> {
-    state: Mutex<CriticalSectionRawMutex, QueueState<N, MAX_BYTES>>,
+pub struct OverwriteQueue<T, const N: usize, const MAX_BYTES: usize, M: RawMutex = CriticalSectionRawMutex> {
+    state: Mutex<M, QueueState<N, MAX_BYTES>>,
     ready: Signal<CriticalSectionRawMutex, ()>,
     space: Signal<CriticalSectionRawMutex, ()>,
     item: core::marker::PhantomData<T>,
 }
-impl<T: QueueItem, const N: usize, const MAX_BYTES: usize> OverwriteQueue<T, N, MAX_BYTES> {
+impl<T: QueueItem, const N: usize, const MAX_BYTES: usize, M: RawMutex> OverwriteQueue<T, N, MAX_BYTES, M> {
     pub const fn new() -> Self {
         Self {
             state: Mutex::new(QueueState::new()),

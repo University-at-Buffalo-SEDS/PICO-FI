@@ -1,8 +1,9 @@
 //! Bounded cross-core frame storage. Never evict accepted stream frames.
 use super::overwrite_queue::{OverwriteQueue, QueueItem};
+use super::task_mutex::TaskSpinRawMutex;
 use portable_atomic::{AtomicU32, Ordering};
 pub const MAX_PAYLOAD: usize = 4096;
-pub type Mailbox = OverwriteQueue<Packet, 128, 16384>;
+pub type Mailbox = OverwriteQueue<Packet, 128, 16384, TaskSpinRawMutex>;
 pub static TO_NETWORK: Mailbox = Mailbox::new();
 pub static TO_UART: Mailbox = Mailbox::new();
 pub static UART_CORE_ID: AtomicU32 = AtomicU32::new(u32::MAX);

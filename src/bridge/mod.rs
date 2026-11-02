@@ -14,3 +14,4 @@ pub mod test;
 pub mod uart;
 pub mod uart_mailbox;
 pub mod usb;
+pub mod task_mutex;

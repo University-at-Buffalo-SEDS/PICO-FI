@@ -43,3 +43,7 @@ pub mod uart_mailbox;
 
 #[path = "../../src/protocol/strict_uart.rs"]
 pub mod strict_uart;
+
+#[allow(unsafe_code)]
+#[path = "../../src/bridge/task_mutex.rs"]
+pub mod task_mutex;
