@@ -96,3 +96,7 @@ and UART core 1 were running; host qualification passed 50 Rust tests plus the
 Python framing/stack/soak wrappers. These checks do not establish zero gateway
 CAN loss or sustained end-to-end throughput; measure those separately after the
 matching GroundStation service is restarted.
+
+## Host software tests
+
+With Cargo 1.91 or newer, `python3 build.py --test` and `cargo host-test` select the active computer through [Cargo's `host-tuple` target](https://doc.rust-lang.org/cargo/reference/config.html#buildtarget). They do not build the RP2040 target or flash a device. Cargo test arguments can be appended, for example `cargo host-test -- --nocapture`.
