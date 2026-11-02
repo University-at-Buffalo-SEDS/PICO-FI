@@ -10,6 +10,7 @@
   },
   "upstream": {
     "transport": "uart",
-    "uart": "uart1"
+    "uart": "uart1",
+    "data_integrity": "sedsnet_crc32"
   }
 }

@@ -38,6 +38,8 @@ pub mod config_record;
 #[path = "../../src/protocol/auto_address.rs"]
 pub mod auto_address;
 
-mod bridge { pub use crate::overwrite_queue; }
 #[path = "../../src/bridge/uart_mailbox.rs"]
 pub mod uart_mailbox;
+
+#[path = "../../src/protocol/strict_uart.rs"]
+pub mod strict_uart;

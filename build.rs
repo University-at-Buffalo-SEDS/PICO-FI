@@ -36,6 +36,7 @@ struct JsonUpstreamConfig {
     transport: String,
     uart: Option<String>,
     usb: Option<JsonUsbConfig>,
+    data_integrity: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -48,6 +49,7 @@ struct JsonUsbConfig {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(pico_uart_sedsnet_crc32)");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=pico-fi.json");
@@ -67,9 +69,15 @@ fn main() {
         (1200..=1_000_000).contains(&uart_baud),
         "UART baud must be 1200..=1000000"
     );
+    let config = load_json_config();
+    if config.upstream.transport == "uart"
+        && config.upstream.data_integrity.as_deref() == Some("sedsnet_crc32")
+    {
+        println!("cargo:rustc-cfg=pico_uart_sedsnet_crc32");
+    }
     let generated = format!(
         "{}\npub const COMPILED_UART_BAUD_RATE: u32 = {uart_baud};\n",
-        render_generated_config(load_json_config())
+        render_generated_config(config)
     );
     fs::write(out_dir.join("generated_config.rs"), generated)
         .expect("failed to write generated config");
@@ -81,6 +89,7 @@ fn main() {
 
 fn load_json_config() -> JsonConfig {
     let config_path = env::var("PICO_FI_CONFIG").unwrap_or_else(|_| "pico-fi.json".to_owned());
+    println!("cargo:rerun-if-changed={config_path}");
     let text =
         fs::read_to_string(&config_path).unwrap_or_else(|_| panic!("failed to read {config_path}"));
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("failed to parse {config_path}"))
@@ -94,9 +103,26 @@ fn render_generated_config(config: JsonConfig) -> String {
     let upstream = render_upstream_mode(&config.upstream);
     let uart_port = render_uart_port(&config.upstream);
     let usb_names = render_usb_names(config.upstream.usb.as_ref());
+    let integrity = match config
+        .upstream
+        .data_integrity
+        .as_deref()
+        .unwrap_or("opaque")
+    {
+        "opaque" => "UartDataIntegrity::Opaque",
+        "sedsnet_crc32" => {
+            assert!(
+                config.upstream.transport == "uart",
+                "sedsnet_crc32 requires UART upstream"
+            );
+            "UartDataIntegrity::SedsnetCrc32"
+        }
+        other => panic!("invalid upstream.data_integrity: {other}"),
+    };
 
     format!(
         "pub const COMPILED_CONFIG: BridgeConfig = BridgeConfig {{\n    discovery: {discovery},\n    mac_address: {mac_address},\n    address_mode: {address_mode},\n    bridge_mode: {bridge_mode},\n    upstream_mode: {upstream},\n    uart_port: {uart_port},\n}};\n\
+pub const COMPILED_UART_DATA_INTEGRITY: UartDataIntegrity = {integrity};\n\
 pub const COMPILED_USB_DEVICE_NAMES: UsbDeviceNames = {usb_names};\n"
     )
 }

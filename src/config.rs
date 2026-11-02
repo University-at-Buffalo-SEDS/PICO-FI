@@ -66,6 +66,13 @@ pub enum UartPort {
     Uart1,
 }
 
+/// Compiled UART framing integrity policy; independent of persisted config.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UartDataIntegrity {
+    Opaque,
+    SedsnetCrc32,
+}
+
 /// Full runtime bridge configuration assembled from compiled defaults and shell overrides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {

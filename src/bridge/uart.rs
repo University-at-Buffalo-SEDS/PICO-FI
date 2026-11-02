@@ -4,6 +4,7 @@ use super::runtime::BridgeRuntime;
 use super::uart_mailbox::*;
 use crate::config::BridgeConfig;
 use crate::net::{connect_with_timeout, exchange_link_handshake};
+#[cfg(not(pico_uart_sedsnet_crc32))]
 use crate::protocol::stream::FrameReader;
 use embassy_futures::{join::join, yield_now};
 use embassy_net::{Ipv4Address, Stack, tcp::TcpSocket};
@@ -11,6 +12,20 @@ use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read, Write};
 use portable_atomic::Ordering;
+
+// Build-time policy and selected implementation must agree without changing NVM.
+const _: () = assert!(
+    crate::config::COMPILED_UART_DATA_INTEGRITY as u8
+        == if cfg!(pico_uart_sedsnet_crc32) {
+            crate::config::UartDataIntegrity::SedsnetCrc32 as u8
+        } else {
+            crate::config::UartDataIntegrity::Opaque as u8
+        }
+);
+
+#[cfg(pico_uart_sedsnet_crc32)]
+static STRICT_UART_READER: static_cell::StaticCell<crate::protocol::strict_uart::StrictReader> =
+    static_cell::StaticCell::new();
 
 pub async fn uart_worker(mut uart: BufferedUart, config: BridgeConfig) -> ! {
     UART_CORE_ID.store(
@@ -21,12 +36,57 @@ pub async fn uart_worker(mut uart: BufferedUart, config: BridgeConfig) -> ! {
     join(uart_receive(rx, config), uart_transmit(tx)).await;
     unreachable!()
 }
+#[cfg(not(pico_uart_sedsnet_crc32))]
 async fn uart_receive(rx: &mut impl Read, config: BridgeConfig) {
+    debug_assert!(matches!(
+        crate::config::COMPILED_UART_DATA_INTEGRITY,
+        crate::config::UartDataIntegrity::Opaque
+    ));
     let mut reader = FrameReader::new([[0xa5, 0x5a], [0xa6, 0x5b]], true);
     let mut packet = Packet::new(0xa5);
     loop {
         match reader.read(rx, packet.buffer()).await {
             Ok((kind, len)) => {
+                packet.finish(kind, len);
+                if kind == 0xa6 {
+                    let reply = render_local_bridge_command(
+                        config,
+                        &crate::LINK_ACTIVE,
+                        trim_ascii_line(packet.payload()),
+                    );
+                    let mut response = Packet::new(0xa6);
+                    response.buffer()[..reply.len()].copy_from_slice(reply.as_bytes());
+                    response.finish(0xa6, reply.len());
+                    // A blocked local reply must not stop upstream reception.
+                    if !TO_UART.try_push_ref(&response) {
+                        RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if crate::LINK_ACTIVE.load(Ordering::Acquire) {
+                    admit_uart(&packet);
+                }
+            }
+            Err(()) => {
+                RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+                Timer::after_millis(1).await;
+            }
+        }
+        yield_now().await;
+    }
+}
+#[cfg(pico_uart_sedsnet_crc32)]
+async fn uart_receive(rx: &mut impl Read, config: BridgeConfig) {
+    debug_assert!(matches!(
+        crate::config::COMPILED_UART_DATA_INTEGRITY,
+        crate::config::UartDataIntegrity::SedsnetCrc32
+    ));
+    // Spawned once, never returns: sole UART-core-1 ownership survives all
+    // core-0 TCP reconnects. No cross-core or diagnostic aliases.
+    let reader = STRICT_UART_READER.init_with(crate::protocol::strict_uart::StrictReader::default);
+    let mut packet = Packet::new(0xa5);
+    loop {
+        match reader.read(rx, packet.buffer()).await {
+            Ok((kind, len)) => {
+                debug_assert!(reader.buffered() <= 4100 && !reader.recovering());
                 packet.finish(kind, len);
                 if kind == 0xa6 {
                     let reply = render_local_bridge_command(
