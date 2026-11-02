@@ -17,6 +17,7 @@ pub struct Metrics {
 }
 /// Explicit SedsnetCrc32 UART Data profile; Opaque FrameReader is untouched.
 /// IEEE CRC integrity is not SDK admission, schema validation or authentication.
+/// Unknown header bytes also enter recovery.
 /// Persist this reader across cancellation. In recovery, local Command frames
 /// are unavailable until a CRC-valid Data frame re-establishes alignment.
 pub struct StrictReader {
@@ -127,7 +128,11 @@ impl StrictReader {
                     if self.tainted {
                         self.cursor += 1;
                     } else {
-                        self.discard(1);
+                        // A damaged Data header may expose embedded local
+                        // commands. Only verified Data can restore alignment.
+                        self.tainted = true;
+                        self.cursor = 1;
+                        self.first_incomplete = None;
                     }
                     continue;
                 }

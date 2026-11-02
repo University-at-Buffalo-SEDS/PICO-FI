@@ -1,6 +1,6 @@
 # Gateway Ethernet bridge
 
-The default `pico-fi.json` and `pico-fi-gateway-ethernet.json` connect UART1 to GroundStation over the main Ethernet LAN. GroundStation hosts TCP on an automatically selected port; Pico-Fi discovers it. No static address is needed. These three station presets select `sedsnet_crc32` UART Data integrity at build time. Other presets, and configurations omitting `upstream.data_integrity`, keep generic opaque framing. Local ASCII Command frames keep their existing format; after damaged Data, commands (including diagnostics) are quarantined until CRC-valid Data restores framing. The policy is compiled and does not change saved network settings or GPIO commands.
+The default `pico-fi.json` and `pico-fi-gateway-ethernet.json` connect UART1 to GroundStation over the main Ethernet LAN. GroundStation hosts TCP on an automatically selected port; Pico-Fi discovers it. No static address is needed. These three station presets select `sedsnet_crc32` UART Data integrity at build time. Other presets, and configurations omitting `upstream.data_integrity`, keep generic opaque framing. Local ASCII Command frames keep their existing format; after damaged Data or header noise, commands (including diagnostics) are quarantined until CRC-valid Data restores framing. The policy is compiled and does not change saved network settings or GPIO commands.
 
 ```sh
 python3 build.py --config pico-fi-gateway-ethernet.json --release

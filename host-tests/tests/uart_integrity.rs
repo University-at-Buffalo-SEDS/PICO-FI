@@ -98,3 +98,26 @@ fn empty_pending_input_does_not_rescan_or_recheck() {
     for _ in 0..256 {assert!(poll(reader.read(&mut input,&mut out)).is_pending());}
     assert_eq!(counts,(reader.metrics.scanned_headers,reader.metrics.crc_bytes));
 }
+
+#[test]
+fn corrupted_data_magic_cannot_route_embedded_local_command() {
+    let hidden = wire(0xa6, b"reset");
+    let mut parent = vec![0x31;16];
+    parent.extend(hidden);
+    parent.extend(vec![0x32;16]);
+    let parent = data(parent);
+    let anchor = data(vec![0x33;32]);
+    for corrupt in [0usize,1] {
+        let mut damaged = wire(0xa5, &parent);
+        damaged[corrupt] ^= 1;
+        let bytes = [wire(0xa6,b"status before"),damaged,wire(0xa5,&anchor),wire(0xa6,b"status after")].concat();
+        for chunk in [1,7,31,4100] {
+            let(frames,reader)=drain(bytes.clone(),chunk);
+            let commands=frames.iter().filter(|(kind,_)|*kind==0xa6).map(|(_,body)|body.clone()).collect::<Vec<_>>();
+            eprintln!("magic_byte={corrupt} chunk={chunk} command_spy={commands:?}");
+            assert_eq!(frames,vec![(0xa6,b"status before".to_vec()),(0xa5,anchor.clone()),(0xa6,b"status after".to_vec())]);
+            assert!(!reader.recovering());
+            assert!(reader.metrics.quarantined_command_headers>=1);
+        }
+    }
+}
