@@ -1,2 +1,8 @@
 /target
 /host-tests/target/
+
+*.pyc
+
+.idea/
+
+.DS_Store
