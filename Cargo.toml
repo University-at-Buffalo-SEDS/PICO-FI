@@ -45,3 +45,7 @@ codegen-units = 1
 debug = 2
 lto = true
 opt-level = 3
+
+# Keep the existing PIO/Embassy API versions; fix Rust E0365 at its source.
+[patch.crates-io]
+proc-macro-error2 = { path = "vendor/proc-macro-error2" }
