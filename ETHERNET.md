@@ -36,33 +36,31 @@ Raspberry Pi Debug Probe D port and power the board separately. Validate with:
 ```sh
 probe-rs info --probe 2e8a:000c --chip RP2040 --protocol swd --speed 100 --non-interactive
 python3 build.py --config pico-fi-gateway-ethernet.json --release
-probe-rs download target/pico-fi-gateway-ethernet/thumbv6m-none-eabi/release/pico-fi --probe 2e8a:000c --chip RP2040 --protocol swd --speed 100 --non-interactive --verify
-probe-rs reset --probe 2e8a:000c --chip RP2040 --protocol swd --speed 100 --non-interactive
+probe-rs download target/pico-fi-gateway-ethernet/thumbv6m-none-eabi/release/pico-fi --probe 2e8a:000c --chip RP2040 --protocol swd --speed 100 --non-interactive --verify --reset
 ```
 
-The role helper also supports an explicit SWD speed and probe selection:
+Both build entry points support probe selection and SWD speed:
 
 ```sh
-PICO_FI_CONFIG=pico-fi-gateway-ethernet.json ./build-role.sh --flash --release --probe 2e8a:000c:YOUR_PROBE_SERIAL --speed 100 client
+./build.py --config pico-fi-gateway-ethernet.json --release --flash --probe 2e8a:000c:YOUR_PROBE_SERIAL
+PICO_FI_CONFIG=pico-fi-gateway-ethernet.json ./build-role.sh --flash --release --probe 2e8a:000c:YOUR_PROBE_SERIAL client
 ```
 
-`PROBE_RS_PROBE` and `PROBE_RS_SPEED` supply defaults for these two options;
-explicit arguments take precedence. Omitting `--speed` keeps probe-rs's default.
-The helper requests SWD, noninteractive probe selection and post-download
-readback verification (`--verify`), then issues a reset using the same probe and
-speed. It streams all probe diagnostics and stops on a nonzero download or reset
-exit status. A successful command that emits warnings is reported with those
-diagnostics, rather than as an unqualified successful flash. Verification checks
-the downloaded ELF, not firmware startup or Ethernet/UART connectivity. No
-automatic retry, power cycle or connect-under-reset is performed.
-The helper also reports its probe-rs executable/version and distinguishes a
-zero-exit reset followed by session-cleanup warnings. See
-[RP2040 reset-session diagnostics](DEBUGGING.md#rp2040-reset-session-cleanup-diagnostics)
-for the upstream limitation; this is not a claimed physical SWD repair.
+Both default to **100 kHz SWD**. `PROBE_RS_PROBE` and `PROBE_RS_SPEED`
+supply defaults; explicit `--probe` and `--speed` arguments take precedence.
+The shared helper uses SWD and noninteractive selection, then runs
+`probe-rs download --verify --reset` in one session. It streams diagnostics
+and preserves nonzero exit status. No automatic retry, power cycle or
+connect-under-reset is performed.
 
-A target that does not respond, breakpoint-cleanup warning or DP-switch warning
-needs separate probe/target investigation. A lower SWD speed is a selectable
-troubleshooting setting; it is not proof of a particular hardware fault.
+On the attached RP2040 with probe-rs 0.32.0, the default probe speed reproduced
+`Could not clear all hardware breakpoints` for the secondary debug port, even
+with a combined download/reset. The combined command at 100 kHz completed
+without that warning. This is a tested setting for this installation, not a
+repair to probe-rs's session teardown. Warnings remain visible and are
+classified in the final summary. Readback verification checks the ELF;
+firmware startup and Ethernet/UART connectivity require separate checks.
+See [reset-session diagnostics](DEBUGGING.md#rp2040-reset-session-cleanup-diagnostics).
 
 Use a full probe serial selector when multiple matching Debug Probes are attached.
 `--speed 100` is SWD clock speed in kHz; it does not affect the 1 Mbaud UART.

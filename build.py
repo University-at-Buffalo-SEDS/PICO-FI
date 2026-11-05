@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import subprocess
 from pathlib import Path
 
 import sys
+
+from build_support import DEFAULT_SWD_SPEED, fail, find_tool, flash_with_probe, positive_speed, run
 
 ROOT = Path(__file__).resolve().parent
 TARGET = "thumbv6m-none-eabi"
@@ -104,35 +104,9 @@ def main() -> int:
     print(f"UF2: {uf2}", flush=True)
 
     if flash:
-        flash_with_probe(elf, probe)
+        flash_with_probe(elf, probe, args.speed)
 
     return 0
-
-
-def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
-    try:
-        subprocess.run(cmd, cwd=cwd, env=env, check=True)
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(exc.returncode) from exc
-
-
-def find_tool(name: str) -> str | None:
-    direct = shutil.which(name)
-    if direct:
-        return direct
-
-    cargo_home = os.environ.get("CARGO_HOME")
-    home = os.environ.get("HOME")
-    candidates = []
-    if cargo_home:
-        candidates.append(Path(cargo_home) / "bin" / name)
-    if home:
-        candidates.append(Path(home) / ".cargo" / "bin" / name)
-
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None
 
 
 def find_repo_python() -> str:
@@ -155,28 +129,6 @@ def find_repo_python() -> str:
 def validate_test_args(args: argparse.Namespace, cargo_args: list[str], mode: str) -> None:
     if args.flash or args.probe or args.role or args.config or cargo_args:
         fail(f"{mode} cannot be combined with build/flash/config arguments")
-
-
-def flash_with_probe(elf: Path, probe: str | None) -> None:
-    probe_rs = find_tool("probe-rs")
-    if probe_rs is None:
-        fail(
-            "`probe-rs` not found.\n"
-            "Install it with: cargo install probe-rs --features cli"
-        )
-
-    cmd = [probe_rs, "download", str(elf), "--chip", "RP2040"]
-    if probe:
-        cmd.extend(["--probe", probe])
-
-    run(cmd, cwd=ROOT)
-
-    reset_cmd = [probe_rs, "reset", "--chip", "RP2040"]
-    if probe:
-        reset_cmd.extend(["--probe", probe])
-
-    run(reset_cmd, cwd=ROOT)
-    print("Flashed over SWD with probe-rs.")
 
 
 def parse_args(args: list[str]) -> argparse.Namespace:
@@ -208,7 +160,10 @@ def parse_args(args: list[str]) -> argparse.Namespace:
         help="Deterministic RNG seed for --test-fuzz.",
     )
     parser.add_argument("--flash", action="store_true", help="Flash the built ELF with probe-rs.")
-    parser.add_argument("--probe", help="Specific probe selector, for example 2e8a:000c.")
+    parser.add_argument("--probe", default=os.environ.get("PROBE_RS_PROBE"),
+                        help="Probe selector (or PROBE_RS_PROBE).")
+    parser.add_argument("--speed", type=positive_speed, default=os.environ.get("PROBE_RS_SPEED", DEFAULT_SWD_SPEED),
+                        help="SWD speed in kHz (default: 100; or PROBE_RS_SPEED).")
     parser.add_argument("--role", choices=sorted(ROLE_CONFIG), help="Build using the named board profile.")
     parser.add_argument("--config", help="Build using an explicit JSON config file.")
     parsed, cargo_args = parser.parse_known_args(args)
@@ -228,10 +183,6 @@ def resolve_config_path(args: argparse.Namespace) -> str | None:
 
 def config_target_dir(config_path: str) -> str:
     return Path(config_path).stem
-
-
-def fail(message: str) -> None:
-    raise SystemExit(f"error: {message}")
 
 
 if __name__ == "__main__":

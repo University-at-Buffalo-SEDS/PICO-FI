@@ -78,17 +78,18 @@ sets SWD kHz; for example:
 PICO_FI_CONFIG=pico-fi-gateway-ethernet.json ./build-role.sh --flash --release --probe 2e8a:000c:YOUR_PROBE_SERIAL --speed 100 client
 ```
 
-This helper verifies the ELF download with probe-rs readback before requesting
-reset. Compiler and probe diagnostics remain visible. A reset command returning
+Both `build.py` and the role helper default to 100 kHz SWD and verify the ELF
+download before resetting in a single `probe-rs download --verify --reset` session. Compiler and probe diagnostics remain visible. A reset command returning
 success does not establish that the bridge started or connected; check its
 network/UART behavior separately. Probe warnings remain warnings in the final
 summary, and any nonzero probe command exits without a success summary.
 
 ## RP2040 reset-session cleanup diagnostics
 
-The role helper reports the exact probe-rs executable and its `--version` before
-using the probe. It distinguishes an ELF readback-verification failure, a nonzero
-reset command, and a zero-exit reset followed by a session-cleanup warning. Raw
+The shared flash helper reports the exact probe-rs executable and its `--version`
+before using the probe. Download, verification, or reset failures preserve the
+combined command's nonzero exit status; zero-exit cleanup warnings are reported
+separately. Raw
 probe diagnostics stay visible and their original exit status is preserved.
 
 `Could not clear all hardware breakpoints` after reset can come from probe-rs
@@ -106,6 +107,12 @@ firmware is running, nor does it prove that flashing failed. Preserve the full
 output and check the bridge's actual runtime behavior on the test hardware.
 This script change identifies the uncertain stage; it does not claim to repair
 the upstream/probe/target interaction without a hardware reproduction.
+
+The 2026-11-05 gateway client reproduction emitted the secondary-port cleanup
+warning at probe-rs's default speed. A combined verified download/reset at
+100 kHz completed cleanly on the attached Debug Probe. Both build scripts now
+use that conservative default and a single session. `--speed` or
+`PROBE_RS_SPEED` can override it; a clean flash does not qualify bridge runtime.
 
 Upstream references:
 - [Reset command and selected core](https://github.com/probe-rs/probe-rs/blob/v0.32.0/probe-rs-tools/src/bin/probe-rs/cmd/reset.rs)
