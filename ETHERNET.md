@@ -55,6 +55,10 @@ exit status. A successful command that emits warnings is reported with those
 diagnostics, rather than as an unqualified successful flash. Verification checks
 the downloaded ELF, not firmware startup or Ethernet/UART connectivity. No
 automatic retry, power cycle or connect-under-reset is performed.
+The helper also reports its probe-rs executable/version and distinguishes a
+zero-exit reset followed by session-cleanup warnings. See
+[RP2040 reset-session diagnostics](DEBUGGING.md#rp2040-reset-session-cleanup-diagnostics)
+for the upstream limitation; this is not a claimed physical SWD repair.
 
 A target that does not respond, breakpoint-cleanup warning or DP-switch warning
 needs separate probe/target investigation. A lower SWD speed is a selectable

@@ -25,11 +25,40 @@ class ProbeProcess:
 
 
 class BuildRoleCliTests(unittest.TestCase):
+    def setUp(self):
+        # --version is a local executable query; keep even that mocked here.
+        patcher = mock.patch.object(cli, "run")
+        self.version_run = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_flash(self, outputs, *, speed=100, probe='2e8a:000c:serial'):
         stream = io.StringIO()
         with mock.patch.object(cli, 'find_tool', return_value='/tool/probe-rs'), mock.patch.object(cli.subprocess, 'Popen', side_effect=outputs) as popen, contextlib.redirect_stdout(stream):
             cli.flash_with_probe(Path('/build/client.elf'), probe, speed)
         return popen.call_args_list, stream.getvalue()
+
+    def test_version_and_executable_are_reported_before_flash(self):
+        self.version_run.side_effect = lambda *args, **kwargs: print("probe-rs 0.32.0")
+        _, output = self.run_flash([ProbeProcess(), ProbeProcess()])
+        self.assertIn("probe-rs 0.32.0", output)
+        self.version_run.assert_called_once_with(['/tool/probe-rs', '--version'], cwd=cli.ROOT)
+        self.assertTrue(output.startswith('Using probe-rs executable: /tool/probe-rs'))
+
+    def test_zero_exit_reset_cleanup_warning_retains_status_and_raw_diagnostic(self):
+        for warning in ('Could not clear all hardware breakpoints: DP Multidrop(285223207)',
+                        'Failed to deconfigure device during shutdown: target did not respond'):
+            calls, output = self.run_flash([ProbeProcess('Verified\n'), ProbeProcess('WARN ' + warning + '\n')])
+            self.assertEqual(len(calls), 2, 'no retry or reflash')
+            self.assertIn(warning, output)
+            self.assertIn('cleanup failure after reset', output)
+            self.assertIn('reset command returned zero', output)
+            self.assertNotIn('ELF download verified; reset command returned success.', output)
+
+    def test_zero_exit_download_cleanup_warning_is_classified_separately(self):
+        calls, output = self.run_flash([ProbeProcess('WARN Could not clear all hardware breakpoints\n'), ProbeProcess()])
+        self.assertEqual(len(calls), 2)
+        self.assertIn('download-session cleanup reported a failure', output)
+        self.assertNotIn('cleanup failure after reset', output)
 
     def test_verified_download_and_reset_share_exact_probe_speed(self):
         calls, output = self.run_flash([ProbeProcess('Verified\n'), ProbeProcess('Reset complete\n')])
@@ -47,9 +76,9 @@ class BuildRoleCliTests(unittest.TestCase):
     def test_warning_on_either_stage_is_preserved_and_not_clean_success(self):
         for index in (0, 1):
             results = [ProbeProcess(), ProbeProcess()]
-            results[index] = ProbeProcess('\x1b[33mWARN\x1b[0m could not clear breakpoint; DP switch failed\n')
+            results[index] = ProbeProcess('\x1b[33mWARN\x1b[0m SWD speed was adjusted\n')
             _, output = self.run_flash(results)
-            self.assertIn('DP switch failed', output)
+            self.assertIn('SWD speed was adjusted', output)
             self.assertIn('emitted diagnostics above', output)
             self.assertNotIn('ELF download verified; reset command returned success.', output)
 

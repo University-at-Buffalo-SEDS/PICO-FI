@@ -52,7 +52,7 @@ def find_tool(name: str) -> str | None:
     return None
 
 
-def run_probe_command(cmd: list[str]) -> bool:
+def run_probe_command(cmd: list[str], *, cleanup_report: list[str] | None = None) -> bool:
     """Stream probe diagnostics and preserve failure status; return diagnostics seen."""
     diagnostic = False
     try:
@@ -65,6 +65,11 @@ def run_probe_command(cmd: list[str]) -> bool:
                 print(line, end="", flush=True)
                 plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
                 diagnostic |= bool(re.search(r"\b(?:warn(?:ing)?|error|failed|failure)\b", plain, re.I))
+                if cleanup_report is not None and re.search(
+                    r"could not clear all hardware breakpoints|failed to deconfigure device during shutdown",
+                    plain, re.I,
+                ):
+                    cleanup_report.append(plain.rstrip())
             code = process.wait()
     except OSError as exc:
         fail(f"could not run probe-rs: {exc}")
@@ -78,15 +83,28 @@ def flash_with_probe(elf: Path, probe: str | None, speed: int | None = None) -> 
     if probe_rs is None:
         fail("`probe-rs` not found. Install it first.")
 
+    print(f"Using probe-rs executable: {probe_rs}", flush=True)
+    run([probe_rs, "--version"], cwd=ROOT)
     options = ["--chip", CHIP, "--protocol", "swd", "--non-interactive"]
     if probe:
         options.extend(["--probe", probe])
     if speed is not None:
         options.extend(["--speed", str(speed)])
-    download_diagnostic = run_probe_command([probe_rs, "download", str(elf), *options, "--verify"])
+    download_cleanup: list[str] = []
+    reset_cleanup: list[str] = []
+    download_diagnostic = run_probe_command(
+        [probe_rs, "download", str(elf), *options, "--verify"], cleanup_report=download_cleanup,
+    )
     print("probe-rs verified the ELF download; requesting reset.", flush=True)
-    reset_diagnostic = run_probe_command([probe_rs, "reset", *options])
-    if download_diagnostic or reset_diagnostic:
+    reset_diagnostic = run_probe_command([probe_rs, "reset", *options], cleanup_report=reset_cleanup)
+    if reset_cleanup:
+        print("ELF download verified. The reset command returned zero, but probe-rs reported "
+              "a debug-session cleanup failure after reset. This does not prove a failed "
+              "flash or a working bridge; target execution remains unverified.")
+    elif download_cleanup:
+        print("ELF download verified and reset command returned zero, but download-session "
+              "cleanup reported a failure. Target execution remains unverified.")
+    elif download_diagnostic or reset_diagnostic:
         print("Download verification and reset commands returned success, but probe-rs emitted "
               "diagnostics above. Do not treat this as a clean connection or runtime check.")
     else:

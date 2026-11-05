@@ -83,3 +83,31 @@ reset. Compiler and probe diagnostics remain visible. A reset command returning
 success does not establish that the bridge started or connected; check its
 network/UART behavior separately. Probe warnings remain warnings in the final
 summary, and any nonzero probe command exits without a success summary.
+
+## RP2040 reset-session cleanup diagnostics
+
+The role helper reports the exact probe-rs executable and its `--version` before
+using the probe. It distinguishes an ELF readback-verification failure, a nonzero
+reset command, and a zero-exit reset followed by a session-cleanup warning. Raw
+probe diagnostics stay visible and their original exit status is preserved.
+
+`Could not clear all hardware breakpoints` after reset can come from probe-rs
+session teardown: it attempts cleanup on every target core, including the RP2040
+secondary debug port. `reset` already selects core 0 by default; adding `--core 0`
+does not restrict that later cleanup to core 0. No supported cleanup-skip CLI
+option was found in probe-rs 0.31.0, 0.32.0 or the inspected upstream Session API.
+The helper therefore keeps the real reset and does not invent a single-core chip
+definition, hide the warning, retry the flash or change target power/reset policy.
+
+probe-rs 0.32.0 fixes a separate *spurious* DP-switch warning when its quick
+connection fails but the fallback succeeds. It still reports genuine cleanup
+failures. A verified download plus this warning does not establish that the
+firmware is running, nor does it prove that flashing failed. Preserve the full
+output and check the bridge's actual runtime behavior on the test hardware.
+This script change identifies the uncertain stage; it does not claim to repair
+the upstream/probe/target interaction without a hardware reproduction.
+
+Upstream references:
+- [Reset command and selected core](https://github.com/probe-rs/probe-rs/blob/v0.32.0/probe-rs-tools/src/bin/probe-rs/cmd/reset.rs)
+- [Session cleanup on all cores](https://github.com/probe-rs/probe-rs/blob/v0.32.0/probe-rs/src/session.rs)
+- [0.32.0 changelog, RP2040 DP-switch warning fix #4133](https://github.com/probe-rs/probe-rs/blob/v0.32.0/CHANGELOG.md)
