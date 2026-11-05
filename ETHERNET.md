@@ -40,6 +40,26 @@ probe-rs download target/pico-fi-gateway-ethernet/thumbv6m-none-eabi/release/pic
 probe-rs reset --probe 2e8a:000c --chip RP2040 --protocol swd --speed 100 --non-interactive
 ```
 
+The role helper also supports an explicit SWD speed and probe selection:
+
+```sh
+PICO_FI_CONFIG=pico-fi-gateway-ethernet.json ./build-role.sh --flash --release --probe 2e8a:000c:YOUR_PROBE_SERIAL --speed 100 client
+```
+
+`PROBE_RS_PROBE` and `PROBE_RS_SPEED` supply defaults for these two options;
+explicit arguments take precedence. Omitting `--speed` keeps probe-rs's default.
+The helper requests SWD, noninteractive probe selection and post-download
+readback verification (`--verify`), then issues a reset using the same probe and
+speed. It streams all probe diagnostics and stops on a nonzero download or reset
+exit status. A successful command that emits warnings is reported with those
+diagnostics, rather than as an unqualified successful flash. Verification checks
+the downloaded ELF, not firmware startup or Ethernet/UART connectivity. No
+automatic retry, power cycle or connect-under-reset is performed.
+
+A target that does not respond, breakpoint-cleanup warning or DP-switch warning
+needs separate probe/target investigation. A lower SWD speed is a selectable
+troubleshooting setting; it is not proof of a particular hardware fault.
+
 Use a full probe serial selector when multiple matching Debug Probes are attached.
 `--speed 100` is SWD clock speed in kHz; it does not affect the 1 Mbaud UART.
 

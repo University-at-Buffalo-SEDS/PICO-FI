@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,23 +52,49 @@ def find_tool(name: str) -> str | None:
     return None
 
 
-def flash_with_probe(elf: Path, probe: str | None) -> None:
+def run_probe_command(cmd: list[str]) -> bool:
+    """Stream probe diagnostics and preserve failure status; return diagnostics seen."""
+    diagnostic = False
+    try:
+        with subprocess.Popen(
+            cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        ) as process:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+                diagnostic |= bool(re.search(r"\b(?:warn(?:ing)?|error|failed|failure)\b", plain, re.I))
+            code = process.wait()
+    except OSError as exc:
+        fail(f"could not run probe-rs: {exc}")
+    if code:
+        raise SystemExit(code)
+    return diagnostic
+
+
+def flash_with_probe(elf: Path, probe: str | None, speed: int | None = None) -> None:
     probe_rs = find_tool("probe-rs")
     if probe_rs is None:
         fail("`probe-rs` not found. Install it first.")
 
-    download_cmd = [probe_rs, "download", str(elf), "--chip", CHIP]
-    reset_cmd = [probe_rs, "reset", "--chip", CHIP]
+    options = ["--chip", CHIP, "--protocol", "swd", "--non-interactive"]
     if probe:
-        download_cmd.extend(["--probe", probe])
-        reset_cmd.extend(["--probe", probe])
+        options.extend(["--probe", probe])
+    if speed is not None:
+        options.extend(["--speed", str(speed)])
+    download_diagnostic = run_probe_command([probe_rs, "download", str(elf), *options, "--verify"])
+    print("probe-rs verified the ELF download; requesting reset.", flush=True)
+    reset_diagnostic = run_probe_command([probe_rs, "reset", *options])
+    if download_diagnostic or reset_diagnostic:
+        print("Download verification and reset commands returned success, but probe-rs emitted "
+              "diagnostics above. Do not treat this as a clean connection or runtime check.")
+    else:
+        print("ELF download verified; reset command returned success.")
+    print("Firmware startup and bridge connectivity have not been checked.")
 
-    run(download_cmd, cwd=ROOT)
-    run(reset_cmd, cwd=ROOT)
-    print("Flashed over SWD with probe-rs.")
 
-
-def build_role(role: str, *, release: bool, flash: bool, probe: str | None) -> int:
+def build_role(role: str, *, release: bool, flash: bool, probe: str | None, speed: int | None = None) -> int:
     cargo = find_tool("cargo")
     if cargo is None:
         fail("`cargo` not found. Install Rust/Cargo first.")
@@ -103,9 +130,19 @@ def build_role(role: str, *, release: bool, flash: bool, probe: str | None) -> i
     print(f"UF2: {uf2}")
 
     if flash:
-        flash_with_probe(elf, probe)
+        flash_with_probe(elf, probe, speed)
 
     return 0
+
+
+def positive_speed(value: str) -> int:
+    try:
+        speed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("SWD speed must be a positive integer in kHz") from exc
+    if speed <= 0:
+        raise argparse.ArgumentTypeError("SWD speed must be a positive integer in kHz")
+    return speed
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -115,7 +152,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("role", choices=sorted(ROLE_CONFIG))
     parser.add_argument("--release", action="store_true", help="Build release firmware instead of debug.")
     parser.add_argument("--flash", action="store_true", help="Flash the built ELF with probe-rs.")
-    parser.add_argument("--probe", help="Specific probe selector, for example 2e8a:000c:E664....")
+    parser.add_argument("--probe", default=os.environ.get("PROBE_RS_PROBE"),
+                        help="Probe selector, for example 2e8a:000c:E664... (or PROBE_RS_PROBE).")
+    parser.add_argument("--speed", type=positive_speed, default=os.environ.get("PROBE_RS_SPEED"),
+                        help="SWD clock speed in kHz (positive integer; or PROBE_RS_SPEED).")
     return parser.parse_args(argv)
 
 
@@ -125,7 +165,7 @@ def fail(message: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    return build_role(args.role, release=args.release, flash=args.flash, probe=args.probe)
+    return build_role(args.role, release=args.release, flash=args.flash, probe=args.probe, speed=args.speed)
 
 
 if __name__ == "__main__":

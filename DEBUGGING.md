@@ -68,3 +68,18 @@ working sequence is:
 
 If breakpoints do not bind, rebuild and reflash once and confirm the RustRover symbol file still points at
 `target/thumbv6m-none-eabi/debug/pico-fi`.
+
+## Role helper with verified SWD download
+
+For the role-based build command, `--probe` selects the debug probe and `--speed`
+sets SWD kHz; for example:
+
+```sh
+PICO_FI_CONFIG=pico-fi-gateway-ethernet.json ./build-role.sh --flash --release --probe 2e8a:000c:YOUR_PROBE_SERIAL --speed 100 client
+```
+
+This helper verifies the ELF download with probe-rs readback before requesting
+reset. Compiler and probe diagnostics remain visible. A reset command returning
+success does not establish that the bridge started or connected; check its
+network/UART behavior separately. Probe warnings remain warnings in the final
+summary, and any nonzero probe command exits without a success summary.
